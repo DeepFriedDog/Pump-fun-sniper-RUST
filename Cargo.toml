@@ -1,0 +1,29 @@
+[package]
+name = "pumpfun-sniper-rust"
+version = "1.2.0"
+edition = "2021"
+description = "Pumpfun sniper bot to snipe new tokens with urls checks and more."
+authors = ["@solanazdev <support@pumpfunsniper.net>"]
+license = "MIT"
+
+[dependencies]
+tokio = { version = "1.36.0", features = ["full"] }
+reqwest = { version = "0.11.24", features = ["json"] }
+serde = { version = "1.0.197", features = ["derive"] }
+serde_json = "1.0.114"
+dotenv = "0.15.0"
+rusqlite = { version = "0.30.0", features = ["bundled"] }
+chrono = "0.4.34"
+url = "2.5.0"
+log = "0.4.20"
+env_logger = "0.11.2"
+thiserror = "1.0.57"
+futures = "0.3.30"
+anyhow = "1.0.79"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

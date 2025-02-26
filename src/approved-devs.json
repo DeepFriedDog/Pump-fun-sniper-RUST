@@ -1,38 +1,10 @@
 [
   {
-    "address": "sJr1vRAkSWSqdYVnHDUqtSYhEMam5M8P7dGwZjcrjAm"
+    "address": "example_wallet_address_1", 
+    "name": "Example Developer 1"
   },
   {
-    "address": "46TniFsKFT38W5x1eun3qVcWAGoQCHEPbGP2vd7UxthA"
-  },
-  {
-    "address": "5ScjK6sror8M9iRMSC6KfqWPvjdhxSCmZvqpERbRiKMZ"
-  },
-  {
-    "address": "54u7WzSFRoaXQnxdm75U6AdycqR94fb8Yv8vNEUY3mnH"
-  },
-  {
-    "address": "EDZau9KiYhHbfwCFMfJvG7SHwsTKfQ5AF4PAzXtcEYh3"
-  },
-  {
-    "address": "Esckw5xdjhja4NqYpVJ68ByggRvPdETcPgQNw8CzBLeK"
-  },
-  {
-    "address": "2N7qg9a3N6DXgDBXvgZ5JGnXvxUnX1YhBEC5Y7waqxmi"
-  },
-  {
-    "address": "9P5rhn7EaozN7HGPkMGQgwgyF8eWXzrkNXNW3BQrD1DB"
-  },
-  {
-    "address": "Btxty83QiNskbHX5XPMWk9o54SYj9uNpKEKkbCu6gL3q"
-  },
-  {
-    "address": "KEN7s6mHAFpqmvppk7L9VaJW3htu3jz6z3dDjiaWdYT"
-  },
-  {
-    "address": "MfDuWeqSHEqTFVYZ7LoexgAK9dxk7cy4DFJWjWMGVWa"
-  },
-  {
-    "address": "81YYLTzsYynh132HGKfKTVrVrVtMuUCh9VPYKB24eQjw"
+    "address": "example_wallet_address_2",
+    "name": "Example Developer 2"
   }
 ] 

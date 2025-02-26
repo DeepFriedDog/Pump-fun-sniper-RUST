@@ -3,3 +3,8 @@ node_modules/
 *.log
 dist/
 database.db
+
+
+# Added by cargo
+
+/target
