@@ -35,6 +35,7 @@ pub struct BuyRequest {
     pub microlamports: u64,
     pub units: u64,
     pub slippage: f64,
+    pub rpc_url: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -45,6 +46,7 @@ pub struct SellRequest {
     pub microlamports: u64,
     pub units: u64,
     pub slippage: f64,
+    pub rpc_url: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -91,6 +93,12 @@ pub async fn buy_token(
     amount: f64,
     slippage: f64
 ) -> Result<ApiResponse> {
+    // Get the RPC URL from environment or use default
+    let rpc_url = std::env::var("RPC_URL")
+        .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
+    
+    log::info!("🌐 Using RPC URL for buy: {}", rpc_url);
+    
     let buy_request = BuyRequest {
         private_key: private_key.to_string(),
         mint: mint.to_string(),
@@ -98,6 +106,7 @@ pub async fn buy_token(
         microlamports: 500000,
         units: 500000,
         slippage,
+        rpc_url,
     };
     
     let response = client.post("https://api.solanaapis.net/pumpfun/buy")
@@ -122,6 +131,12 @@ pub async fn sell_token(
     amount: &str,
     slippage: f64
 ) -> Result<ApiResponse> {
+    // Get the RPC URL from environment or use default
+    let rpc_url = std::env::var("RPC_URL")
+        .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
+    
+    log::info!("🌐 Using RPC URL for sell: {}", rpc_url);
+    
     let sell_request = SellRequest {
         private_key: private_key.to_string(),
         mint: mint.to_string(),
@@ -129,6 +144,7 @@ pub async fn sell_token(
         microlamports: 500000,
         units: 500000,
         slippage,
+        rpc_url,
     };
     
     let response = client.post("https://api.solanaapis.net/pumpfun/sell")

@@ -61,6 +61,7 @@ struct BloxrouteBuyRequest {
     slippage: f64,
     protection: bool,
     tip: f64,
+    rpc_url: String,
 }
 
 #[derive(Deserialize, Debug)]
@@ -80,6 +81,7 @@ struct BloxrouteSellRequest {
     slippage: f64,
     protection: bool,
     tip: f64,
+    rpc_url: String,
 }
 
 // Configure client with optimized settings for low latency
@@ -370,29 +372,6 @@ async fn process_new_tokens(
     last_processed.insert(mint.clone(), now);
     drop(last_processed); // Release the lock
     
-    // Start liquidity check immediately
-    let liquidity_future = checks::check_minimum_liquidity(client, &token_data.dev, &mint);
-    
-    // Prepare buy parameters while liquidity check is running
-    let amount = std::env::var("BUY_AMOUNT")
-        .unwrap_or_else(|_| "0.1".to_string())
-        .parse::<f64>()
-        .unwrap_or(0.1);
-    
-    let slippage = std::env::var("SLIPPAGE")
-        .unwrap_or_else(|_| "50".to_string())
-        .parse::<f64>()
-        .unwrap_or(50.0);
-    
-    // Now await the liquidity check
-    let liquidity = match liquidity_future.await {
-        Ok(liq) => liq,
-        Err(e) => {
-            warn!("Failed to check liquidity for {}: {}", mint, e);
-            return Ok(Some(mint.clone()));
-        }
-    };
-    
     // Start a timer to measure processing speed
     let start_time = std::time::Instant::now();
     
@@ -411,23 +390,70 @@ async fn process_new_tokens(
     }
     
     // 2) If APPROVED_DEVS_ONLY=true, check if the developer is in the approved list (load from local file)
-    if approved_devs_only {
+    // This is now a fast path - if the dev is approved, we buy immediately without checking liquidity
+    let is_approved_dev = if approved_devs_only {
         match checks::check_approved_devs(&token_data.dev).await {
-            Ok(is_approved_dev) => {
-                if !is_approved_dev {
+            Ok(is_approved) => {
+                if !is_approved {
                     warn!("Developer not in approved list, skipping buy");
                     return Ok(Some(mint.clone()));
                 }
+                true
             },
             Err(e) => {
                 error!("Error checking approved developers: {}", e);
                 return Ok(Some(mint.clone()));
             }
         }
-    }
+    } else {
+        false
+    };
     
     // Log new token detection after passing initial checks
     info!("New mint detected: {}", mint);
+    
+    // Prepare buy parameters
+    let amount = std::env::var("AMOUNT")
+        .unwrap_or_else(|_| "0.1".to_string())
+        .parse::<f64>()
+        .unwrap_or(0.1);
+    
+    let slippage = std::env::var("SLIPPAGE")
+        .unwrap_or_else(|_| "50".to_string())
+        .parse::<f64>()
+        .unwrap_or(50.0);
+    
+    // Fast path for approved developers - skip liquidity check
+    if approved_devs_only && is_approved_dev {
+        info!("🚀 APPROVED DEVELOPER DETECTED! Skipping liquidity check and buying immediately");
+        
+        // Buy the token immediately
+        let buy_result = if use_bloxroute {
+            info!("🔄 Using standard API with fastest RPC endpoint for buying token {}", mint);
+            api::buy_token(client, private_key, &mint, amount, slippage).await
+        } else {
+            info!("🔄 USE_BLOXROUTE=false: Using standard API endpoint for buying token {}", mint);
+            api::buy_token(client, private_key, &mint, amount, slippage).await
+        };
+        
+        process_buy_result(buy_result, client, wallet, &mint, start_time).await;
+        return Ok(Some(mint.clone()));
+    }
+    
+    // For non-approved developers or when APPROVED_DEVS_ONLY=false, continue with liquidity check
+    // Start liquidity check
+    let liquidity = if check_min_liquidity {
+        match checks::check_minimum_liquidity(client, &token_data.dev, &mint).await {
+            Ok(liq) => liq,
+            Err(e) => {
+                warn!("Failed to check liquidity for {}: {}", mint, e);
+                return Ok(Some(mint.clone()));
+            }
+        }
+    } else {
+        // Skip liquidity check if not required
+        true
+    };
     
     // 3) If CHECK_MIN_LIQUIDITY=true, check if the token has sufficient liquidity
     if !liquidity {
@@ -437,31 +463,9 @@ async fn process_new_tokens(
     
     // 4) Buy the token immediately if we got this far - URL check can happen in parallel while buying
     let buy_result = if use_bloxroute {
-        info!("🔄 USE_BLOXROUTE=true: Using bloXroute optimized endpoint for buying token {}", mint);
-        // Try bloXroute first, but fall back to standard API if it fails
-        match buy_token_bloxroute(client, private_key, &mint, amount, slippage).await {
-            Ok(blox_response) => {
-                if blox_response.status == "success" {
-                    info!("✅ Successfully bought with bloXroute");
-                    Ok(api::ApiResponse {
-                        status: "success".to_string(),
-                        data: json!({
-                            "signature": blox_response.signature.unwrap_or_default()
-                        }),
-                    })
-                } else {
-                    let error_message = blox_response.message.unwrap_or_default();
-                    warn!("❌ bloXroute buy failed, error: {}. Falling back to standard API...", error_message);
-                    // Fall back to standard API
-                    api::buy_token(client, private_key, &mint, amount, slippage).await
-                }
-            },
-            Err(e) => {
-                warn!("❌ Error with bloXroute request: {}. Falling back to standard API...", e);
-                // Fall back to standard API
-                api::buy_token(client, private_key, &mint, amount, slippage).await
-            }
-        }
+        info!("🔄 Using standard API with fastest RPC endpoint for buying token {}", mint);
+        // Skip bloXroute and go straight to standard API with the fastest RPC
+        api::buy_token(client, private_key, &mint, amount, slippage).await
     } else {
         info!("🔄 USE_BLOXROUTE=false: Using standard API endpoint for buying token {}", mint);
         api::buy_token(client, private_key, &mint, amount, slippage).await
@@ -484,73 +488,8 @@ async fn process_new_tokens(
         warn!("URLs missing or invalid for token {}", mint);
     }
     
-    match buy_result {
-        Ok(buy_response) => {
-            if buy_response.status == "success" {
-                let mut usd_price = 0.0;
-                let mut tokens = "0".to_string();
-                
-                // Log buying speed
-                let buy_elapsed = start_time.elapsed();
-                info!("Token {} bought in {:.2} seconds", mint, buy_elapsed.as_secs_f64());
-                
-                // Fetch price and balance in parallel after buying
-                let price_future = api::retry_async(
-                    || async { api::get_price(client, &mint).await },
-                    5, // Max retries
-                    2000 // Delay in ms
-                );
-                
-                let balance_future = api::retry_async(
-                    || async { api::get_balance(client, wallet, &mint).await },
-                    5, // Max retries
-                    2000 // Delay in ms
-                );
-                
-                let (price_result, balance_result) = tokio::join!(price_future, balance_future);
-                
-                // Process price result
-                match price_result {
-                    Ok(price) => {
-                        usd_price = price;
-                        info!("Successfully fetched price for {}: {}", mint, usd_price);
-                    },
-                    Err(e) => {
-                        error!("Failed to fetch price for {} after 5 attempts: {}", mint, e);
-                    }
-                }
-                
-                // Process balance result
-                match balance_result {
-                    Ok(balance) => {
-                        // Floor the token amount to remove extra decimals
-                        if balance.contains('.') {
-                            tokens = balance.split('.').next().unwrap_or("0").to_string();
-                        } else {
-                            tokens = balance;
-                        }
-                        info!("Successfully fetched balance for {}: {}", mint, tokens);
-                    },
-                    Err(e) => {
-                        error!("Failed to fetch balance for {} after 5 attempts: {}", mint, e);
-                    }
-                }
-                
-                // After successful buy
-                let mint_owned = mint.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = db::insert_trade(&mint_owned, &tokens, usd_price) {
-                        error!("Failed to insert trade into DB: {}", e);
-                    }
-                });
-            } else {
-                warn!("Buy Failed For Mint: {}", mint);
-            }
-        },
-        Err(e) => {
-            error!("Error during buy request: {}", e);
-        }
-    }
+    // Process the buy result
+    process_buy_result(buy_result, client, wallet, &mint, start_time).await;
     
     Ok(Some(mint.clone()))
 }
@@ -733,31 +672,9 @@ async fn sell_token(
         .unwrap_or_else(|_| "false".to_string()) == "true";
     
     let sell_result = if use_bloxroute {
-        info!("🔄 USE_BLOXROUTE=true: Using bloXroute optimized endpoint for selling token {}", trade.mint);
-        // Try bloXroute first, but fall back to standard API if it fails
-        match sell_token_bloxroute(client, private_key, &trade.mint, &trade.tokens, slippage).await {
-            Ok(blox_response) => {
-                if blox_response.status == "success" {
-                    info!("✅ Successfully sold with bloXroute");
-                    Ok(api::ApiResponse {
-                        status: "success".to_string(),
-                        data: json!({
-                            "signature": blox_response.signature.unwrap_or_default()
-                        }),
-                    })
-                } else {
-                    let error_message = blox_response.message.unwrap_or_default();
-                    warn!("❌ bloXroute sell failed, error: {}. Falling back to standard API...", error_message);
-                    // Fall back to standard API
-                    api::sell_token(client, private_key, &trade.mint, &trade.tokens, slippage).await
-                }
-            },
-            Err(e) => {
-                warn!("❌ Error with bloXroute sell request: {}. Falling back to standard API...", e);
-                // Fall back to standard API
-                api::sell_token(client, private_key, &trade.mint, &trade.tokens, slippage).await
-            }
-        }
+        info!("🔄 Using standard API with fastest RPC endpoint for selling token {}", trade.mint);
+        // Skip bloXroute and go straight to standard API with the fastest RPC
+        api::sell_token(client, private_key, &trade.mint, &trade.tokens, slippage).await
     } else {
         info!("🔄 USE_BLOXROUTE=false: Using standard API endpoint for selling token {}", trade.mint);
         api::sell_token(client, private_key, &trade.mint, &trade.tokens, slippage).await
@@ -796,6 +713,84 @@ async fn sell_token(
     Ok(())
 }
 
+/// Process the result of a buy operation
+#[inline]
+async fn process_buy_result(
+    buy_result: Result<api::ApiResponse>,
+    client: &reqwest::Client,
+    wallet: &str,
+    mint: &str,
+    start_time: std::time::Instant,
+) {
+    match buy_result {
+        Ok(buy_response) => {
+            if buy_response.status == "success" {
+                let mut usd_price = 0.0;
+                let mut tokens = "0".to_string();
+                
+                // Log buying speed
+                let buy_elapsed = start_time.elapsed();
+                info!("Token {} bought in {:.2} seconds", mint, buy_elapsed.as_secs_f64());
+                
+                // Fetch price and balance in parallel after buying
+                let price_future = api::retry_async(
+                    || async { api::get_price(client, &mint).await },
+                    5, // Max retries
+                    2000 // Delay in ms
+                );
+                
+                let balance_future = api::retry_async(
+                    || async { api::get_balance(client, wallet, &mint).await },
+                    5, // Max retries
+                    2000 // Delay in ms
+                );
+                
+                let (price_result, balance_result) = tokio::join!(price_future, balance_future);
+                
+                // Process price result
+                match price_result {
+                    Ok(price) => {
+                        usd_price = price;
+                        info!("Successfully fetched price for {}: {}", mint, usd_price);
+                    },
+                    Err(e) => {
+                        error!("Failed to fetch price for {} after 5 attempts: {}", mint, e);
+                    }
+                }
+                
+                // Process balance result
+                match balance_result {
+                    Ok(balance) => {
+                        // Floor the token amount to remove extra decimals
+                        if balance.contains('.') {
+                            tokens = balance.split('.').next().unwrap_or("0").to_string();
+                        } else {
+                            tokens = balance;
+                        }
+                        info!("Successfully fetched balance for {}: {}", mint, tokens);
+                    },
+                    Err(e) => {
+                        error!("Failed to fetch balance for {} after 5 attempts: {}", mint, e);
+                    }
+                }
+                
+                // After successful buy
+                let mint_owned = mint.to_string();
+                tokio::spawn(async move {
+                    if let Err(e) = db::insert_trade(&mint_owned, &tokens, usd_price) {
+                        error!("Failed to insert trade into DB: {}", e);
+                    }
+                });
+            } else {
+                warn!("Buy Failed For Mint: {}", mint);
+            }
+        },
+        Err(e) => {
+            error!("Error during buy request: {}", e);
+        }
+    }
+}
+
 #[inline]
 async fn buy_token_bloxroute(
     client: &Client,
@@ -816,6 +811,11 @@ async fn buy_token_bloxroute(
     let protection = std::env::var("USE_MEV_PROTECTION")
         .unwrap_or_else(|_| "false".to_string()) == "true";
     
+    // Get the RPC URL from environment or use default
+    let rpc_url = std::env::var("RPC_URL")
+        .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
+    info!("🌐 Using RPC URL: {}", rpc_url);
+    
     // Create the request payload with settings from environment
     let request = BloxrouteBuyRequest {
         private_key: private_key.to_string(),
@@ -826,6 +826,7 @@ async fn buy_token_bloxroute(
         slippage,
         protection,
         tip,
+        rpc_url,
     };
     
     info!("📡 Sending request to bloXroute endpoint with tip: {}, protection: {}", request.tip, request.protection);
@@ -973,6 +974,11 @@ async fn sell_token_bloxroute(
     let protection = std::env::var("USE_MEV_PROTECTION")
         .unwrap_or_else(|_| "false".to_string()) == "true";
     
+    // Get the RPC URL from environment or use default
+    let rpc_url = std::env::var("RPC_URL")
+        .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
+    info!("🌐 Using RPC URL for sell: {}", rpc_url);
+    
     // Create the request payload with settings from environment
     let request = BloxrouteSellRequest {
         private_key: private_key.to_string(),
@@ -983,6 +989,7 @@ async fn sell_token_bloxroute(
         slippage,
         protection,
         tip,
+        rpc_url,
     };
     
     info!("📡 Sending sell request to bloXroute endpoint with tip: {}, protection: {}", request.tip, request.protection);

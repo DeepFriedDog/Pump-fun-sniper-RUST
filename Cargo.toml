@@ -5,6 +5,7 @@ edition = "2021"
 description = "Pumpfun sniper bot to snipe new tokens with urls checks and more."
 authors = ["@solanazdev <support@pumpfunsniper.net>"]
 license = "MIT"
+default-run = "pumpfun-sniper-rust"
 
 [dependencies]
 tokio = { version = "1.36.0", features = ["full"] }
@@ -25,22 +26,6 @@ lazy_static = "1.5.0"
 [[bin]]
 name = "pumpfun-sniper-rust"
 path = "src/main.rs"
-
-[[bin]]
-name = "rpc-test"
-path = "src/bin/rpc_test.rs"
-
-[[bin]]
-name = "compare-rpc"
-path = "src/bin/compare_rpc.rs"
-
-[[bin]]
-name = "compare-all"
-path = "src/bin/compare_all.rs"
-
-[[bin]]
-name = "test-pumpfun"
-path = "src/bin/test_pumpfun.rs"
 
 [profile.release]
 opt-level = 3

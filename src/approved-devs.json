@@ -1,10 +1,130 @@
 [
   {
-    "address": "example_wallet_address_1", 
-    "name": "Example Developer 1"
+    "address": "sJr1vRAkSWSqdYVnHDUqtSYhEMam5M8P7dGwZjcrjAm", 
+    "name": "Approved Developer 1"
   },
   {
-    "address": "example_wallet_address_2",
-    "name": "Example Developer 2"
+    "address": "46TniFsKFT38W5x1eun3qVcWAGoQCHEPbGP2vd7UxthA",
+    "name": "Approved Developer 2"
+  },
+  {
+    "address": "5ScjK6sror8M9iRMSC6KfqWPvjdhxSCmZvqpERbRiKMZ",
+    "name": "Approved Developer 3"
+  },
+  {
+    "address": "54u7WzSFRoaXQnxdm75U6AdycqR94fb8Yv8vNEUY3mnH",
+    "name": "Approved Developer 4"
+  },
+  {
+    "address": "EDZau9KiYhHbfwCFMfJvG7SHwsTKfQ5AF4PAzXtcEYh3",
+    "name": "Approved Developer 5"
+  },
+  {
+    "address": "Esckw5xdjhja4NqYpVJ68ByggRvPdETcPgQNw8CzBLeK",
+    "name": "Approved Developer 6"
+  },
+  {
+    "address": "2N7qg9a3N6DXgDBXvgZ5JGnXvxUnX1YhBEC5Y7waqxmi",
+    "name": "Approved Developer 7"
+  },
+  {
+    "address": "9P5rhn7EaozN7HGPkMGQgwgyF8eWXzrkNXNW3BQrD1DB",
+    "name": "Approved Developer 8"
+  },
+  {
+    "address": "Btxty83QiNskbHX5XPMWk9o54SYj9uNpKEKkbCu6gL3q",
+    "name": "Approved Developer 9"
+  },
+  {
+    "address": "KEN7s6mHAFpqmvppk7L9VaJW3htu3jz6z3dDjiaWdYT",
+    "name": "Approved Developer 10"
+  },
+  {
+    "address": "6mgU4qZyuL6JQyht7fkNEMBwvA5j2fJgZC36G3RieFmh",
+    "name": "Approved Developer 11"
+  },
+  {
+    "address": "5sJGhGy5JzCKhdnkskxqHuC5JbPbjircoBM7G1AXCPfu",
+    "name": "Approved Developer 12"
+  },
+  {
+    "address": "3crAAHL84RnG3WRgWqsgtMhs6EYLex7ULQM2BqtEsy7Q",
+    "name": "Approved Developer 13"
+  },
+  {
+    "address": "78CPBgbuvey49Hq4VWYjmvK2JZ1SwCm82RsGkHXdfihQ",
+    "name": "Approved Developer 14"
+  },
+  {
+    "address": "FSz5yWeoccnFtfEyPP3q9QE87Pj49f5pChED4BBDsYmn",
+    "name": "Approved Developer 15"
+  },
+  {
+    "address": "GBoXpXUJpwQm4HMsqtWoFZhYBCMz5DMLCM7zPGUDShRs",
+    "name": "Approved Developer 16"
+  },
+  {
+    "address": "131sV32wWWo7hm6qRojm9bjmts6ZFQF8PU7zgFGrxLTk",
+    "name": "Approved Developer 17"
+  },
+  {
+    "address": "8zLSEw1DYNB5B41XLyvica27AmMjsAZ3K7Pb2aG6AhEn",
+    "name": "Approved Developer 18"
+  },
+  {
+    "address": "4CnCqyUDKokUULMPuJbK8Ws2xGDLhmQpSY29Dj4LhjR6",
+    "name": "Approved Developer 19"
+  },
+  {
+    "address": "8RS9jNYiWJm3mzjch4qpHMpobVpjwxA5ScLmV8EULZBf",
+    "name": "Approved Developer 20"
+  },
+  {
+    "address": "BQN8zPJByhEBFZb2YecaLmaDHY5TCFa9AvujVGzSsjep",
+    "name": "Approved Developer 21"
+  },
+  {
+    "address": "GD8f9sYmg5KUQMkwtNffwQMHLMAeDGr6ANGog8CubDyg",
+    "name": "Approved Developer 22"
+  },
+  {
+    "address": "CKEfb2i4Z8Mb5qqt5J4LpgSqXPnbgmv4zP6Y2yHQWuUR",
+    "name": "Approved Developer 23"
+  },
+  {
+    "address": "79DAZgUjEFLitAGjjy2gGbZDJrWAckkFfaxHkbLYsxnx",
+    "name": "Approved Developer 24"
+  },
+  {
+    "address": "2yQy9q5fQdayfjCRap44HR3sh1Skk4xnoDHMNmvgfvGc",
+    "name": "Approved Developer 25"
+  },
+  {
+    "address": "2keaRYY2tc1evtoXqi2YibMyDZZm4Foo4Hxy974dMZfe",
+    "name": "Approved Developer 26"
+  },
+  {
+    "address": "AURMhKmTd1jKDLBnQN9NXUJg64U1Waez6qe1fYXT7H5X",
+    "name": "Approved Developer 27"
+  },
+  {
+    "address": "DjNcHk9pqNCjPn9uydKZfkiMSmNxvwZVQarhi85CY4yq",
+    "name": "Approved Developer 28"
+  },
+  {
+    "address": "44oCibitUm3L2YMCiRZ4N7GAv9uMj51D4YEANrDguBs5",
+    "name": "Approved Developer 29"
+  },
+  {
+    "address": "G4Ys7RscN6GehSp1JVQrEGZ7MsAkfyDXPBWUr2qyTeKp",
+    "name": "Approved Developer 30"
+  },
+  {
+    "address": "Ah7StgznzCG7XYJrpjKZ6Yzy1UGzb62PQ3YxPKcdakHx",
+    "name": "Approved Developer 31"
+  },
+  {
+    "address": "9dtGg97QAfxc2UF4LGaxLzYdB4MJpnNMK7Y2iUwGidoy",
+    "name": "Approved Developer 32"
   }
-] 
+]
