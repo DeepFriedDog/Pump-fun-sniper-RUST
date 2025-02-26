@@ -13,10 +13,14 @@ pub struct Trade {
     pub mint: String,
     pub tokens: String,
     pub buy_price: f64,
-    pub current_price: f64, // Used for calculations in monitor_tokens
-    pub sell_price: f64,    // Used when selling tokens
-    pub status: String,     // Used to determine if a token is pending or sold
+    #[allow(dead_code)] // Used for calculations in monitor_tokens but flagged as unused
+    pub current_price: f64,
+    #[allow(dead_code)] // Used when selling tokens but flagged as unused
+    pub sell_price: f64,
+    #[allow(dead_code)] // Used to determine if a token is pending or sold but flagged as unused
+    pub status: String,
     pub created_at: String,
+    #[allow(dead_code)] // Used for tracking when records are updated but flagged as unused
     pub updated_at: String,
 }
 
@@ -87,11 +91,10 @@ pub fn init_db(reset_pending: bool) -> Result<()> {
 #[inline]
 pub fn get_db() -> Result<Arc<Mutex<Connection>>> {
     unsafe {
-        // Using `let conn_ref = DB_CONNECTION.as_ref()` to avoid the static_mut_refs warning
-        // while still safely accessing the static variable
-        match DB_CONNECTION.as_ref() {
-            Some(conn) => Ok(Arc::clone(conn)),
-            None => Err(anyhow::anyhow!("Database not initialized. Call init_db() first."))
+        if let Some(conn) = &DB_CONNECTION {
+            Ok(Arc::clone(conn))
+        } else {
+            Err(anyhow::anyhow!("Database not initialized. Call init_db() first."))
         }
     }
 }
@@ -115,8 +118,8 @@ pub fn get_pending_trades() -> Result<Vec<Trade>> {
             current_price: row.get(4)?,
             sell_price: row.get(5)?,
             status: row.get(6)?,
-            created_at: created_at,
-            updated_at: updated_at,
+            created_at,
+            updated_at,
         })
     })?;
     
@@ -196,6 +199,7 @@ pub fn count_pending_trades() -> Result<i64> {
 }
 
 /// Clear all pending trades
+#[allow(dead_code)]
 pub fn clear_pending_trades() -> Result<usize> {
     let db = get_db()?;
     let conn = db.lock().unwrap();

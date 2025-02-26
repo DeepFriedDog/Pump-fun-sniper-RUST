@@ -759,6 +759,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "lazy_static"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
+
+[[package]]
 name = "libc"
 version = "0.2.170"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -985,6 +991,7 @@ dependencies = [
  "dotenv",
  "env_logger",
  "futures",
+ "lazy_static",
  "log",
  "reqwest",
  "rusqlite",
@@ -1200,6 +1207,7 @@ version = "1.0.139"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "44f86c3acccc9c65b153fe1b85a3be07fe5515274ec9f0653b4a0875731c72a6"
 dependencies = [
+ "indexmap",
  "itoa",
  "memchr",
  "ryu",

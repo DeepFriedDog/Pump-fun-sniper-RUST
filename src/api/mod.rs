@@ -51,6 +51,7 @@ pub struct SellRequest {
 pub struct ApiResponse {
     pub status: String,
     #[serde(flatten)]
+    #[allow(dead_code)] // Data field is needed for deserialization but not directly accessed
     pub data: Value, // Used for deserialization, even if not directly accessed
 }
 

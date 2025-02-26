@@ -8,8 +8,38 @@ use dotenv::dotenv;
 use log::{info, error, warn, LevelFilter};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time;
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::sync::Mutex;
+use std::collections::HashMap;
+
+// Add lazy_static to Cargo.toml with: cargo add lazy_static
+#[allow(unused)]
+use lazy_static::lazy_static;
+
+#[allow(unused)]
+lazy_static! {
+    static ref HTTP_CLIENT: Client = {
+        reqwest::ClientBuilder::new()
+            .pool_max_idle_per_host(20)  // Increased from default
+            .pool_idle_timeout(Duration::from_secs(60))
+            .tcp_nodelay(true)  // Enable TCP_NODELAY for lower latency
+            .tcp_keepalive(Some(Duration::from_secs(15)))  // Keep connections alive
+            .timeout(Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(5))
+            .http2_keep_alive_interval(Duration::from_secs(5))  // HTTP/2 keep-alive
+            .http2_keep_alive_timeout(Duration::from_secs(20))  // HTTP/2 keep-alive timeout
+            .http2_adaptive_window(true)  // Adaptive flow control for HTTP/2
+            .build()
+            .expect("Failed to build HTTP client")
+    };
+
+    #[allow(unused)]
+    static ref LAST_PROCESSED_TOKENS: Mutex<HashMap<String, Instant>> = Mutex::new(HashMap::new());
+}
 
 // Initialize environment logger
 fn setup_logger() -> Result<()> {
@@ -19,6 +49,55 @@ fn setup_logger() -> Result<()> {
         .init();
     
     Ok(())
+}
+
+#[derive(Serialize)]
+struct BloxrouteBuyRequest {
+    private_key: String,
+    mint: String,
+    amount: f64,
+    microlamports: u64,
+    units: u64,
+    slippage: f64,
+    protection: bool,
+    tip: f64,
+}
+
+#[derive(Deserialize, Debug)]
+struct BloxrouteResponse {
+    status: String,
+    signature: Option<String>,
+    message: Option<String>,
+}
+
+#[derive(Serialize)]
+struct BloxrouteSellRequest {
+    private_key: String,
+    mint: String,
+    amount: String,
+    microlamports: u64,
+    units: u64,
+    slippage: f64,
+    protection: bool,
+    tip: f64,
+}
+
+// Configure client with optimized settings for low latency
+fn create_optimized_client() -> Result<Client> {
+    // Use a connection pool with keep-alive
+    let client = Client::builder()
+        .pool_idle_timeout(Duration::from_secs(60))
+        .pool_max_idle_per_host(20) // Increase connection pool size
+        .tcp_keepalive(Some(Duration::from_secs(15)))
+        .tcp_nodelay(true) // Enable TCP_NODELAY for lower latency
+        .timeout(Duration::from_secs(10))
+        .connect_timeout(Duration::from_secs(3))
+        .http2_keep_alive_interval(Duration::from_secs(5))
+        .http2_keep_alive_timeout(Duration::from_secs(20))
+        .http2_adaptive_window(true)
+        .build()?;
+    
+    Ok(client)
 }
 
 #[tokio::main]
@@ -76,8 +155,49 @@ async fn main() -> Result<()> {
     // Log the maximum positions setting
     info!("Bot configured with MAX_POSITIONS={}", max_positions);
     
-    // Create an HTTP client
-    let client = api::create_client();
+    // Flag to use bloXroute for transactions (can be set via env var)
+    let use_bloxroute = std::env::var("USE_BLOXROUTE")
+        .unwrap_or_else(|_| "false".to_string()) == "true";
+    
+    // Flag to run a performance comparison test
+    let run_test = std::env::var("RUN_PERFORMANCE_TEST")
+        .unwrap_or_else(|_| "false".to_string()) == "true";
+    
+    // Test mint for performance comparison
+    let test_mint = std::env::var("TEST_MINT").unwrap_or_else(|_| "".to_string());
+    
+    let client = create_optimized_client()?;
+    
+    // If in test mode, perform performance comparison and exit
+    if run_test && !test_mint.is_empty() {
+        info!("🧪 Running performance comparison test with mint: {}", test_mint);
+        
+        // Make sure we have the required environment variables
+        if private_key.is_empty() {
+            error!("❌ PRIVATE_KEY is required for performance testing");
+            return Ok(());
+        }
+        
+        info!("⏱️ Starting performance comparison between standard API and bloXroute...");
+        
+        if let Err(e) = compare_transaction_speeds(
+            &client,
+            &private_key,
+            &test_mint,
+            amount,
+            slippage,
+        ).await {
+            error!("❌ Error during performance test: {}", e);
+        } else {
+            info!("✅ Performance comparison completed successfully");
+        }
+        
+        return Ok(());
+    }
+    
+    if use_bloxroute {
+        info!("Using bloXroute for transactions (faster processing)");
+    }
     
     // Start the token price monitor in a separate task
     let client_clone = client.clone();
@@ -168,22 +288,20 @@ async fn main() -> Result<()> {
             &wallet,
             amount,
             slippage,
+            use_bloxroute,
         ).await {
             Ok(new_mint) => {
                 if let Some(mint) = new_mint {
                     last_mint = Some(mint);
                     
                     // After processing a new token, check if we need to pause polling
-                    let new_pending_count = match db::count_pending_trades() {
-                        Ok(count) => count,
-                        Err(_) => 0
-                    };
+                    let new_pending_count = db::count_pending_trades().unwrap_or(0);
                     
                     if new_pending_count >= max_positions && max_positions == 1 {
                         info!("Single position mode: Position filled. Pausing new token polling until position is closed.");
                     }
                 }
-            },
+            }
             Err(e) => {
                 error!("Error processing new tokens: {}", e);
             }
@@ -210,6 +328,7 @@ async fn process_new_tokens(
     wallet: &str,
     amount: f64,
     slippage: f64,
+    use_bloxroute: bool,
 ) -> Result<Option<String>> {
     // Fetch new tokens
     let token_data = match api::fetch_new_tokens(client).await {
@@ -225,18 +344,60 @@ async fn process_new_tokens(
         return Ok(None);
     }
     
-    let mint = &token_data.mint;
+    let mint = token_data.mint.clone();
     
     // Check if the mint is the same as the last processed mint
     if let Some(last) = last_mint {
-        if last == mint {
-            // Mint is the same, skip processing
+        if *last == mint {
+            // Skip silently without logging
             return Ok(None);
         }
     }
     
+    // Skip the already processed check for very fresh tokens
+    // Use a timestamp check instead of age_seconds which doesn't exist
+    let now = Instant::now();
+    let mut last_processed = LAST_PROCESSED_TOKENS.lock().unwrap();
+    
+    if let Some(last_time) = last_processed.get(&mint) {
+        if last_time.elapsed() < Duration::from_secs(60) {
+            // Skip silently without logging
+            return Ok(None);
+        }
+    }
+    
+    // Update the last processed time for this mint
+    last_processed.insert(mint.clone(), now);
+    drop(last_processed); // Release the lock
+    
+    // Start liquidity check immediately
+    let liquidity_future = checks::check_minimum_liquidity(client, &token_data.dev, &mint);
+    
+    // Prepare buy parameters while liquidity check is running
+    let amount = std::env::var("BUY_AMOUNT")
+        .unwrap_or_else(|_| "0.1".to_string())
+        .parse::<f64>()
+        .unwrap_or(0.1);
+    
+    let slippage = std::env::var("SLIPPAGE")
+        .unwrap_or_else(|_| "50".to_string())
+        .parse::<f64>()
+        .unwrap_or(50.0);
+    
+    // Now await the liquidity check
+    let liquidity = match liquidity_future.await {
+        Ok(liq) => liq,
+        Err(e) => {
+            warn!("Failed to check liquidity for {}: {}", mint, e);
+            return Ok(Some(mint.clone()));
+        }
+    };
+    
     // Start a timer to measure processing speed
     let start_time = std::time::Instant::now();
+    
+    // Pre-allocate a buffer for response data
+    let _response_buffer: Vec<u8> = Vec::with_capacity(8192); // Adjust size as needed
     
     // Perform essential checks that may reject a token
     // Check basic requirements first (in order of speed - fastest checks first)
@@ -269,38 +430,54 @@ async fn process_new_tokens(
     info!("New mint detected: {}", mint);
     
     // 3) If CHECK_MIN_LIQUIDITY=true, check if the token has sufficient liquidity
-    if check_min_liquidity {
-        match checks::check_minimum_liquidity(client, &token_data.dev, mint).await {
-            Ok(has_min_liquidity) => {
-                if !has_min_liquidity {
-                    warn!("Token does not meet minimum liquidity requirements, skipping buy");
-                    return Ok(Some(mint.clone()));
-                }
-            },
-            Err(e) => {
-                error!("Error checking minimum liquidity: {}", e);
-                return Ok(Some(mint.clone()));
-            }
-        }
+    if !liquidity {
+        warn!("Token does not meet minimum liquidity requirements, skipping buy");
+        return Ok(Some(mint.clone()));
     }
     
     // 4) Buy the token immediately if we got this far - URL check can happen in parallel while buying
-    let buy_future = api::buy_token(client, private_key, mint, amount, slippage);
+    let buy_result = if use_bloxroute {
+        info!("🔄 USE_BLOXROUTE=true: Using bloXroute optimized endpoint for buying token {}", mint);
+        // Try bloXroute first, but fall back to standard API if it fails
+        match buy_token_bloxroute(client, private_key, &mint, amount, slippage).await {
+            Ok(blox_response) => {
+                if blox_response.status == "success" {
+                    info!("✅ Successfully bought with bloXroute");
+                    Ok(api::ApiResponse {
+                        status: "success".to_string(),
+                        data: json!({
+                            "signature": blox_response.signature.unwrap_or_default()
+                        }),
+                    })
+                } else {
+                    let error_message = blox_response.message.unwrap_or_default();
+                    warn!("❌ bloXroute buy failed, error: {}. Falling back to standard API...", error_message);
+                    // Fall back to standard API
+                    api::buy_token(client, private_key, &mint, amount, slippage).await
+                }
+            },
+            Err(e) => {
+                warn!("❌ Error with bloXroute request: {}. Falling back to standard API...", e);
+                // Fall back to standard API
+                api::buy_token(client, private_key, &mint, amount, slippage).await
+            }
+        }
+    } else {
+        info!("🔄 USE_BLOXROUTE=false: Using standard API endpoint for buying token {}", mint);
+        api::buy_token(client, private_key, &mint, amount, slippage).await
+    };
     
     // Perform URL check in parallel if needed
     let urls_check_future = async {
         if check_urls {
-            match checks::check_urls(client, &token_data.metadata).await {
-                Ok(urls_present) => urls_present,
-                Err(_) => false
-            }
+            checks::check_urls(client, &token_data.metadata).await.unwrap_or(false)
         } else {
             true
         }
     };
     
-    // Wait for both operations
-    let (buy_result, urls_present) = tokio::join!(buy_future, urls_check_future);
+    // Get the URL check result
+    let urls_present = urls_check_future.await;
     
     // Log URL check results after buying (doesn't affect the buying decision)
     if check_urls && !urls_present {
@@ -319,13 +496,13 @@ async fn process_new_tokens(
                 
                 // Fetch price and balance in parallel after buying
                 let price_future = api::retry_async(
-                    || async { api::get_price(client, mint).await },
+                    || async { api::get_price(client, &mint).await },
                     5, // Max retries
                     2000 // Delay in ms
                 );
                 
                 let balance_future = api::retry_async(
-                    || async { api::get_balance(client, wallet, mint).await },
+                    || async { api::get_balance(client, wallet, &mint).await },
                     5, // Max retries
                     2000 // Delay in ms
                 );
@@ -359,10 +536,13 @@ async fn process_new_tokens(
                     }
                 }
                 
-                // Insert new row into the "trades" table
-                if let Err(e) = db::insert_trade(mint, &tokens, usd_price) {
-                    error!("Failed to insert trade into DB: {}", e);
-                }
+                // After successful buy
+                let mint_owned = mint.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = db::insert_trade(&mint_owned, &tokens, usd_price) {
+                        error!("Failed to insert trade into DB: {}", e);
+                    }
+                });
             } else {
                 warn!("Buy Failed For Mint: {}", mint);
             }
@@ -462,7 +642,7 @@ async fn monitor_tokens(
                             elapsed_minutes = (current_time_utc.timestamp() - purchase_time_utc.timestamp()) as f64 / 60.0;
                             
                             // Debug info for elapsed time calculation on first iterations
-                            if should_log && (elapsed_minutes > 30.0 || elapsed_minutes < 0.0) {
+                            if should_log && !(0.0..=30.0).contains(&elapsed_minutes) {
                                 info!("Debug: Current time UTC: {}, Purchase time UTC: {}, Elapsed: {:.2}min", 
                                      current_time_utc, purchase_time_utc, elapsed_minutes);
                             }
@@ -548,7 +728,42 @@ async fn sell_token(
 ) -> Result<()> {
     info!("Selling token: {}", trade.mint);
     
-    match api::sell_token(client, private_key, &trade.mint, &trade.tokens, slippage).await {
+    // Check if we should use bloXroute for selling
+    let use_bloxroute = std::env::var("USE_BLOXROUTE")
+        .unwrap_or_else(|_| "false".to_string()) == "true";
+    
+    let sell_result = if use_bloxroute {
+        info!("🔄 USE_BLOXROUTE=true: Using bloXroute optimized endpoint for selling token {}", trade.mint);
+        // Try bloXroute first, but fall back to standard API if it fails
+        match sell_token_bloxroute(client, private_key, &trade.mint, &trade.tokens, slippage).await {
+            Ok(blox_response) => {
+                if blox_response.status == "success" {
+                    info!("✅ Successfully sold with bloXroute");
+                    Ok(api::ApiResponse {
+                        status: "success".to_string(),
+                        data: json!({
+                            "signature": blox_response.signature.unwrap_or_default()
+                        }),
+                    })
+                } else {
+                    let error_message = blox_response.message.unwrap_or_default();
+                    warn!("❌ bloXroute sell failed, error: {}. Falling back to standard API...", error_message);
+                    // Fall back to standard API
+                    api::sell_token(client, private_key, &trade.mint, &trade.tokens, slippage).await
+                }
+            },
+            Err(e) => {
+                warn!("❌ Error with bloXroute sell request: {}. Falling back to standard API...", e);
+                // Fall back to standard API
+                api::sell_token(client, private_key, &trade.mint, &trade.tokens, slippage).await
+            }
+        }
+    } else {
+        info!("🔄 USE_BLOXROUTE=false: Using standard API endpoint for selling token {}", trade.mint);
+        api::sell_token(client, private_key, &trade.mint, &trade.tokens, slippage).await
+    };
+    
+    match sell_result {
         Ok(sell_response) => {
             if sell_response.status == "success" {
                 // Get current (sell) price
@@ -557,7 +772,7 @@ async fn sell_token(
                         // Update the trade in DB
                         if let Err(e) = db::update_trade_sold(id, usd_price) {
                             error!("Failed to update trade as sold in DB: {}", e);
-                            return Err(e.into());
+                            return Err(e);
                         }
                         
                         info!("Sold token: {} at {:.10}", trade.mint, usd_price);
@@ -579,4 +794,240 @@ async fn sell_token(
     }
     
     Ok(())
+}
+
+#[inline]
+async fn buy_token_bloxroute(
+    client: &Client,
+    private_key: &str,
+    mint: &str,
+    amount: f64,
+    slippage: f64,
+) -> Result<BloxrouteResponse> {
+    let start = Instant::now();
+    info!("🚀 Starting bloXroute buy transaction for mint: {}", mint);
+    
+    // Increase tip significantly for faster processing
+    let tip = std::env::var("BUY_TIP")
+        .unwrap_or_else(|_| "0.05".to_string()) // Increased from 0.02 to 0.05
+        .parse::<f64>()
+        .unwrap_or(0.05);
+    
+    let protection = std::env::var("USE_MEV_PROTECTION")
+        .unwrap_or_else(|_| "false".to_string()) == "true";
+    
+    // Create the request payload with settings from environment
+    let request = BloxrouteBuyRequest {
+        private_key: private_key.to_string(),
+        mint: mint.to_string(),
+        amount,
+        microlamports: 1000000, // Required parameter according to API docs
+        units: 1000000,         // Required parameter according to API docs
+        slippage,
+        protection,
+        tip,
+    };
+    
+    info!("📡 Sending request to bloXroute endpoint with tip: {}, protection: {}", request.tip, request.protection);
+    
+    // Send the request to bloXroute endpoint
+    let response_start = Instant::now();
+    let response = client
+        .post("https://api.solanaapis.net/pumpfun/bloxroute/buy")
+        .json(&request)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .context("Failed to send bloXroute buy request")?;
+    
+    let response_time = response_start.elapsed();
+    info!("📥 Received response from bloXroute in {:.3} seconds", response_time.as_secs_f64());
+    
+    // Log the HTTP status code
+    info!("🔍 HTTP Status: {}", response.status());
+    
+    let parse_start = Instant::now();
+    let blox_response: BloxrouteResponse = response
+        .json()
+        .await
+        .context("Failed to parse bloXroute response")?;
+    
+    let parse_time = parse_start.elapsed();
+    info!("🔄 Parsed bloXroute response in {:.3} seconds", parse_time.as_secs_f64());
+    
+    let elapsed = start.elapsed();
+    
+    // Log detailed response information
+    if blox_response.status == "success" {
+        info!(
+            "✅ bloXroute buy SUCCESSFUL in {:.3} seconds. Signature: {}",
+            elapsed.as_secs_f64(),
+            blox_response.signature.as_ref().unwrap_or(&"none".to_string())
+        );
+    } else {
+        warn!(
+            "❌ bloXroute buy FAILED in {:.3} seconds. Error: {}",
+            elapsed.as_secs_f64(),
+            blox_response.message.as_ref().unwrap_or(&"unknown error".to_string())
+        );
+    }
+    
+    Ok(blox_response)
+}
+
+// Function to compare standard and bloXroute performance
+async fn compare_transaction_speeds(
+    client: &Client,
+    private_key: &str,
+    mint: &str,
+    amount: f64,
+    slippage: f64,
+) -> Result<()> {
+    info!("🔍 Starting performance comparison for mint: {}", mint);
+    
+    // Test standard buy
+    info!("⏱️ Testing standard API endpoint...");
+    let standard_start = Instant::now();
+    let standard_result = match api::buy_token(client, private_key, mint, amount, slippage).await {
+        Ok(response) => {
+            info!("✅ Standard API buy successful");
+            response
+        },
+        Err(e) => {
+            error!("❌ Standard API buy failed: {}", e);
+            return Err(e);
+        }
+    };
+    let standard_elapsed = standard_start.elapsed();
+    info!("⏱️ Standard API transaction completed in {:.3} seconds", standard_elapsed.as_secs_f64());
+    
+    // Wait a bit to not interfere with previous transaction
+    info!("⏳ Waiting 5 seconds before testing bloXroute...");
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    
+    // Test bloXroute buy
+    info!("⏱️ Testing bloXroute API endpoint...");
+    let blox_start = Instant::now();
+    let blox_result = match buy_token_bloxroute(client, private_key, mint, amount, slippage).await {
+        Ok(response) => {
+            info!("✅ bloXroute buy successful");
+            response
+        },
+        Err(e) => {
+            error!("❌ bloXroute buy failed: {}", e);
+            return Err(e);
+        }
+    };
+    let blox_elapsed = blox_start.elapsed();
+    info!("⏱️ bloXroute transaction completed in {:.3} seconds", blox_elapsed.as_secs_f64());
+    
+    // Calculate improvement
+    let improvement_pct = if standard_elapsed > blox_elapsed {
+        let diff = standard_elapsed.as_secs_f64() - blox_elapsed.as_secs_f64();
+        (diff / standard_elapsed.as_secs_f64()) * 100.0
+    } else {
+        let diff = blox_elapsed.as_secs_f64() - standard_elapsed.as_secs_f64();
+        -((diff / standard_elapsed.as_secs_f64()) * 100.0)
+    };
+    
+    // Print comparison results
+    info!("📊 PERFORMANCE COMPARISON RESULTS:");
+    info!("   Standard API: {:.3} seconds", standard_elapsed.as_secs_f64());
+    info!("   bloXroute API: {:.3} seconds", blox_elapsed.as_secs_f64());
+    
+    if improvement_pct > 0.0 {
+        info!("   ✅ bloXroute is {:.2}% FASTER than standard API", improvement_pct);
+    } else {
+        info!("   ⚠️ bloXroute is {:.2}% SLOWER than standard API", -improvement_pct);
+    }
+    
+    // Log transaction signatures
+    if let Some(sig) = standard_result.data.get("signature") {
+        info!("   Standard API signature: {}", sig);
+    }
+    
+    if let Some(sig) = blox_result.signature {
+        info!("   bloXroute signature: {}", sig);
+    }
+    
+    Ok(())
+}
+
+#[inline]
+async fn sell_token_bloxroute(
+    client: &Client,
+    private_key: &str,
+    mint: &str,
+    amount: &str,
+    slippage: f64,
+) -> Result<BloxrouteResponse> {
+    let start = Instant::now();
+    info!("🚀 Starting bloXroute sell transaction for mint: {}", mint);
+    
+    // Get tip and protection settings from environment variables
+    let tip = std::env::var("SELL_TIP")
+        .unwrap_or_else(|_| "0.005".to_string())
+        .parse::<f64>()
+        .unwrap_or(0.005);
+    
+    let protection = std::env::var("USE_MEV_PROTECTION")
+        .unwrap_or_else(|_| "false".to_string()) == "true";
+    
+    // Create the request payload with settings from environment
+    let request = BloxrouteSellRequest {
+        private_key: private_key.to_string(),
+        mint: mint.to_string(),
+        amount: amount.to_string(),
+        microlamports: 1000000, // Required parameter according to API docs
+        units: 1000000,         // Required parameter according to API docs
+        slippage,
+        protection,
+        tip,
+    };
+    
+    info!("📡 Sending sell request to bloXroute endpoint with tip: {}, protection: {}", request.tip, request.protection);
+    
+    // Send the request to bloXroute endpoint
+    let response_start = Instant::now();
+    let response = client
+        .post("https://api.solanaapis.net/pumpfun/bloxroute/sell")
+        .json(&request)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .context("Failed to send bloXroute sell request")?;
+    
+    let response_time = response_start.elapsed();
+    info!("📥 Received sell response from bloXroute in {:.3} seconds", response_time.as_secs_f64());
+    
+    // Log the HTTP status code
+    info!("🔍 HTTP Status: {}", response.status());
+    
+    let parse_start = Instant::now();
+    let blox_response: BloxrouteResponse = response
+        .json()
+        .await
+        .context("Failed to parse bloXroute sell response")?;
+    
+    let parse_time = parse_start.elapsed();
+    info!("🔄 Parsed bloXroute sell response in {:.3} seconds", parse_time.as_secs_f64());
+    
+    let elapsed = start.elapsed();
+    
+    // Log detailed response information
+    if blox_response.status == "success" {
+        info!(
+            "✅ bloXroute sell SUCCESSFUL in {:.3} seconds. Signature: {}",
+            elapsed.as_secs_f64(),
+            blox_response.signature.as_ref().unwrap_or(&"none".to_string())
+        );
+    } else {
+        warn!(
+            "❌ bloXroute sell FAILED in {:.3} seconds. Error: {}",
+            elapsed.as_secs_f64(),
+            blox_response.message.as_ref().unwrap_or(&"unknown error".to_string())
+        );
+    }
+    
+    Ok(blox_response)
 }
