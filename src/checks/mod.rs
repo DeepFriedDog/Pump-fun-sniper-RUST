@@ -93,8 +93,8 @@ pub async fn check_minimum_liquidity(client: &Client, dev_wallet: &str, mint: &s
         || async {
             api::get_balance(client, dev_wallet, mint).await
         },
-        2, // max retries
-        1000 // delay in ms
+        Some(2), // max retries
+        Some(1000) // delay in ms
     ).await?;
     
     // Parse the balance - handle potential formatting issues

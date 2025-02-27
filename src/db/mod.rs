@@ -89,6 +89,7 @@ pub fn init_db(reset_pending: bool) -> Result<()> {
 
 /// Get a connection to the database
 #[inline]
+#[allow(static_mut_refs)]
 pub fn get_db() -> Result<Arc<Mutex<Connection>>> {
     unsafe {
         if let Some(conn) = &DB_CONNECTION {
