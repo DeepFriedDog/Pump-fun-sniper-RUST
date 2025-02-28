@@ -8,4 +8,6 @@ pub mod checks;
 pub mod db;
 pub mod rpc_latency_test;
 pub mod tests;
-pub mod websocket_test; 
+pub mod websocket_test;
+pub mod websocket_reconnect;
+pub mod chainstack_simple; 

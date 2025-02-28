@@ -132,6 +132,38 @@ pub fn get_pending_trades() -> Result<Vec<Trade>> {
     Ok(trades)
 }
 
+/// Get all trades from the database
+#[inline]
+pub fn get_all_trades() -> Result<Vec<Trade>> {
+    let db = get_db()?;
+    let conn = db.lock().unwrap();
+    
+    let mut stmt = conn.prepare("SELECT * FROM trades ORDER BY created_at DESC")?;
+    let trade_iter = stmt.query_map([], |row| {
+        let created_at: String = row.get(7)?;
+        let updated_at: String = row.get(8)?;
+        
+        Ok(Trade {
+            id: row.get(0)?,
+            mint: row.get(1)?,
+            tokens: row.get(2)?,
+            buy_price: row.get(3)?,
+            current_price: row.get(4)?,
+            sell_price: row.get(5)?,
+            status: row.get(6)?,
+            created_at,
+            updated_at,
+        })
+    })?;
+    
+    let mut trades = Vec::new();
+    for trade in trade_iter {
+        trades.push(trade?);
+    }
+    
+    Ok(trades)
+}
+
 /// Insert a new trade into the database
 #[inline]
 pub fn insert_trade(mint: &str, tokens: &str, buy_price: f64) -> Result<()> {

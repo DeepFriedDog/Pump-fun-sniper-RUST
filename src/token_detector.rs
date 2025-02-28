@@ -11,8 +11,14 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use url::Url;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, VecDeque};
+use tokio::sync::mpsc;
+use tokio::time::sleep;
+use crate::chainstack_simple;
+use lazy_static::lazy_static;
 
-use crate::chainstack::{self, NewToken, WEBSOCKET_MESSAGES};
+// Import from config
 use crate::config::{ATA_PROGRAM_ID, PUMP_PROGRAM_ID, TOKEN_PROGRAM_ID};
 
 /// Finds the associated bonding curve for a given mint and bonding curve.
@@ -28,7 +34,7 @@ pub fn find_associated_bonding_curve(mint: &Pubkey, bonding_curve: &Pubkey) -> P
 }
 
 /// Parses the create instruction data
-fn parse_create_instruction(data: &[u8]) -> Option<TokenData> {
+fn parse_create_instruction(data: &[u8]) -> Option<DetectorTokenData> {
     if data.len() < 8 {
         debug!("Data too short to be a valid instruction: {} bytes", data.len());
         return None;
@@ -137,36 +143,38 @@ fn parse_create_instruction(data: &[u8]) -> Option<TokenData> {
     };
 
     info!("Successfully parsed token data: {} ({})", name, symbol);
-    Some(TokenData {
+    Some(DetectorTokenData {
         name,
         symbol, 
         uri,
         mint,
         bonding_curve,
         user,
+        tx_signature: String::new(),
     })
 }
 
-// Struct for parsed token data
+// Define our own TokenData rather than importing from crate::api
 #[derive(Debug, Clone)]
-struct TokenData {
-    name: String,
-    symbol: String,
-    uri: String,
-    mint: String, 
-    bonding_curve: String,
-    user: String,
+pub struct DetectorTokenData {
+    pub name: String,
+    pub symbol: String,
+    pub uri: String,
+    pub mint: String,
+    pub bonding_curve: String,
+    pub user: String,
+    pub tx_signature: String,
 }
 
 // Convert TokenData to the existing NewToken structure for compatibility
-impl From<TokenData> for NewToken {
-    fn from(token: TokenData) -> Self {
+impl From<DetectorTokenData> for NewToken {
+    fn from(token: DetectorTokenData) -> Self {
         NewToken {
             token_name: token.name,
             token_symbol: token.symbol,
             mint_address: token.mint,
             creator_address: token.user,
-            transaction_signature: String::new(), // Will be filled from log data
+            transaction_signature: token.tx_signature,
             timestamp: chrono::Utc::now().timestamp(),
         }
     }
@@ -259,7 +267,7 @@ async fn connect_to_websocket(wss_endpoint: &str) -> Result<()> {
                     Some(Ok(Message::Text(text))) => {
                         debug!("Received WebSocket message");
                         // Process the message
-                        if let Err(e) = process_message(&text, &WEBSOCKET_MESSAGES).await {
+                        if let Err(e) = process_message(&text, WEBSOCKET_MESSAGES.clone()).await {
                             warn!("Error processing message: {}", e);
                         }
                     }
@@ -289,7 +297,7 @@ async fn connect_to_websocket(wss_endpoint: &str) -> Result<()> {
     }
 }
 
-async fn process_message(text: &str, queue: &Arc<Mutex<std::collections::VecDeque<String>>>) -> Result<()> {
+async fn process_message(text: &str, queue: Arc<Mutex<std::collections::VecDeque<String>>>) -> Result<(), Box<dyn std::error::Error>> {
     // Parse the message
     let data: Value = serde_json::from_str(text)?;
     
@@ -376,7 +384,7 @@ async fn process_message(text: &str, queue: &Arc<Mutex<std::collections::VecDequ
                                             }
                                             
                                             // Process the token in chainstack module
-                                            if let Some(token) = chainstack::process_notification(text) {
+                                            if let Some(token) = chainstack_simple::process_notification(text) {
                                                 info!("Token processed by chainstack: {} ({})",
                                                       token.token_name, token.mint_address);
                                             }
@@ -415,9 +423,61 @@ async fn process_message(text: &str, queue: &Arc<Mutex<std::collections::VecDequ
 
 // Test function for unit testing
 #[cfg(test)]
-pub fn test_parse_instruction(base64_data: &str) -> Option<TokenData> {
+pub fn test_parse_instruction(base64_data: &str) -> Option<DetectorTokenData> {
     match BASE64.decode(base64_data) {
         Ok(decoded) => parse_create_instruction(&decoded),
         Err(_) => None,
     }
+}
+
+/// Check token liquidity by examining the balance of the associated bonding curve
+pub async fn check_token_liquidity(
+    mint: &str, 
+    bonding_curve: &str,
+    liquidity_threshold: f64,
+) -> Result<(bool, f64), Box<dyn std::error::Error>> {
+    use solana_client::rpc_client::RpcClient;
+    use solana_sdk::pubkey::Pubkey;
+    use std::str::FromStr;
+
+    // Get RPC URL from environment or use a default
+    let rpc_url = std::env::var("SOLANA_RPC_URL")
+        .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
+    
+    // Create a Solana RPC client
+    let client = RpcClient::new(rpc_url);
+    
+    // Convert addresses to public keys
+    let mint_pubkey = Pubkey::from_str(mint)?;
+    let bonding_curve_pubkey = Pubkey::from_str(bonding_curve)?;
+    
+    // Calculate the associated bonding curve address
+    let associated_bonding_curve = find_associated_bonding_curve(&mint_pubkey, &bonding_curve_pubkey);
+    
+    // Get account info to check liquidity
+    match client.get_account(&associated_bonding_curve) {
+        Ok(account) => {
+            let balance = account.lamports as f64 / 1_000_000_000.0; // Convert lamports to SOL
+            Ok((balance >= liquidity_threshold, balance))
+        },
+        Err(e) => {
+            Err(format!("Failed to get account info: {}", e).into())
+        }
+    }
+}
+
+// Define our own NewToken structure
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewToken {
+    pub token_name: String,
+    pub token_symbol: String,
+    pub mint_address: String,
+    pub creator_address: String,
+    pub transaction_signature: String,
+    pub timestamp: i64,
+}
+
+// Define a constant for WebSocket messages
+lazy_static! {
+    pub static ref WEBSOCKET_MESSAGES: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
 } 

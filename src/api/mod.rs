@@ -4,7 +4,6 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
-use crate::chainstack;
 use std::sync::{Arc, Mutex};
 use std::collections::{VecDeque, HashMap};
 use tokio::sync::mpsc;
@@ -18,6 +17,7 @@ use bs58;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
+use crate::chainstack_simple;
 
 // Lazy static definitions
 lazy_static! {
@@ -63,7 +63,7 @@ lazy_static::lazy_static! {
 // Configure a client with appropriate timeouts and pooling
 pub fn create_client() -> Client {
     // Use the Chainstack client instead of creating a new one
-    chainstack::create_chainstack_client()
+    chainstack_simple::create_chainstack_client()
 }
 
 // Create a super-optimized client for speed-critical operations
@@ -153,7 +153,7 @@ pub async fn initialize_websocket(_api_key: Option<String>) -> Result<()> {
         
         loop {
             // Use the authenticated WebSocket URL from chainstack module
-            let wss_url = crate::chainstack::get_authenticated_wss_url();
+            let wss_url = "wss://api.pump.fun/socket".to_string();
             
             info!("Using WebSocket URL for token monitoring: {}", wss_url);
                 
@@ -570,7 +570,22 @@ fn parse_create_instruction(data: &[u8]) -> Option<HashMap<String, String>> {
 
 // Calculate associated bonding curve
 pub fn calculate_associated_bonding_curve(mint: &str, bonding_curve: &str) -> anyhow::Result<String> {
-    crate::chainstack::calculate_associated_bonding_curve(mint, bonding_curve)
+    let mint_pubkey = Pubkey::from_str(mint)?;
+    let bonding_curve_pubkey = Pubkey::from_str(bonding_curve)?;
+    
+    // Calculate the associated bonding curve address
+    let seeds = &[
+        b"bonding_curve",
+        mint_pubkey.as_ref(),
+        bonding_curve_pubkey.as_ref(),
+    ];
+    
+    let (derived_address, _) = Pubkey::find_program_address(
+        seeds,
+        &Pubkey::from_str("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P").unwrap(),
+    );
+    
+    Ok(derived_address.to_string())
 }
 
 // Fetch new tokens from the WebSocket queue
@@ -784,7 +799,7 @@ pub async fn buy_token(
     amount: f64,
     slippage: f64
 ) -> Result<ApiResponse> {
-    let rpc_url = chainstack::get_chainstack_endpoint();
+    let rpc_url = chainstack_simple::get_chainstack_endpoint();
     info!("🌐 Using Chainstack endpoint for buy: {}", rpc_url);
     
     let microlamports = std::env::var("PRIORITY_FEE")
@@ -827,7 +842,7 @@ pub async fn sell_token(
     amount: &str,
     slippage: f64
 ) -> Result<ApiResponse> {
-    let rpc_url = chainstack::get_chainstack_endpoint();
+    let rpc_url = chainstack_simple::get_chainstack_endpoint();
     
     log::info!("🌐 Using Chainstack endpoint for sell: {}", rpc_url);
     
@@ -859,7 +874,7 @@ pub async fn get_balance(
     wallet: &str,
     mint: &str
 ) -> Result<String> {
-    let balance = chainstack::get_token_balance(client, wallet, mint).await?;
+    let balance = chainstack_simple::get_token_balance(client, wallet, mint).await?;
     Ok(balance.to_string())
 }
 
@@ -867,7 +882,7 @@ pub async fn get_price(
     client: &Client,
     mint: &str
 ) -> Result<f64> {
-    chainstack::get_token_price(client, mint).await
+    chainstack_simple::get_token_price(client, mint).await
 }
 
 // Restored function for bonding curve liquidity calculation

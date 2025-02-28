@@ -1349,4 +1349,12 @@ mod tests {
         // The test is considered successful if at least one of the notifications was properly parsed
         assert!(token1.is_some() || token2.is_some(), "Should have detected at least one token");
     }
+}
+
+/// Create a Solana RPC client using the given RPC URL
+pub fn create_solana_client(rpc_url: &str) -> solana_client::rpc_client::RpcClient {
+    use solana_client::rpc_client::RpcClient;
+    
+    // Create client with default commitment config
+    RpcClient::new(rpc_url.to_string())
 } 
