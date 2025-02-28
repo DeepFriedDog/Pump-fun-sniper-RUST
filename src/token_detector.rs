@@ -21,6 +21,16 @@ use lazy_static::lazy_static;
 // Import from config
 use crate::config::{ATA_PROGRAM_ID, PUMP_PROGRAM_ID, TOKEN_PROGRAM_ID};
 
+/// Derives the bonding curve address for a given mint
+pub fn get_bonding_curve_address(mint: &Pubkey) -> (Pubkey, u8) {
+    let seeds = &[
+        b"bonding-curve",
+        mint.as_ref(),
+    ];
+    
+    Pubkey::find_program_address(seeds, &PUMP_PROGRAM_ID)
+}
+
 /// Finds the associated bonding curve for a given mint and bonding curve.
 pub fn find_associated_bonding_curve(mint: &Pubkey, bonding_curve: &Pubkey) -> Pubkey {
     let seeds = &[
@@ -461,6 +471,56 @@ pub async fn check_token_liquidity(
             Ok((balance >= liquidity_threshold, balance))
         },
         Err(e) => {
+            Err(format!("Failed to get account info: {}", e).into())
+        }
+    }
+}
+
+/// Check only the primary bonding curve account liquidity and subtract rent exemption
+/// This is faster than the original function as it only checks one account
+pub async fn check_token_primary_liquidity(
+    mint: &str,
+    liquidity_threshold: f64,
+) -> Result<(bool, f64), Box<dyn std::error::Error>> {
+    use solana_client::rpc_client::RpcClient;
+    use solana_sdk::pubkey::Pubkey;
+    use std::str::FromStr;
+
+    // The rent exempt minimum amount in SOL
+    const RENT_EXEMPT_MINIMUM: f64 = 0.00203928;
+
+    // Get RPC URL from environment or use a default
+    let rpc_url = std::env::var("SOLANA_RPC_URL")
+        .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
+    
+    // Create a Solana RPC client
+    let client = RpcClient::new(rpc_url);
+    
+    // Convert mint address to public key
+    let mint_pubkey = Pubkey::from_str(mint)?;
+    
+    // Derive the bonding curve address from the mint
+    let (bonding_curve_pubkey, _) = get_bonding_curve_address(&mint_pubkey);
+    
+    debug!("Checking liquidity for mint: {}", mint);
+    debug!("Derived bonding curve: {}", bonding_curve_pubkey);
+    
+    // Get primary bonding curve account info to check liquidity
+    match client.get_account(&bonding_curve_pubkey) {
+        Ok(account) => {
+            // Get total balance
+            let total_balance = account.lamports as f64 / 1_000_000_000.0; // Convert lamports to SOL
+            
+            // Subtract rent exempt minimum to get actual liquidity
+            let actual_liquidity = (total_balance - RENT_EXEMPT_MINIMUM).max(0.0);
+            
+            debug!("Found liquidity: {} SOL (after rent exemption)", actual_liquidity);
+            
+            // Check if actual liquidity meets threshold
+            Ok((actual_liquidity >= liquidity_threshold, actual_liquidity))
+        },
+        Err(e) => {
+            warn!("Failed to get bonding curve account info: {}", e);
             Err(format!("Failed to get account info: {}", e).into())
         }
     }

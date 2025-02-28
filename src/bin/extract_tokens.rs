@@ -49,26 +49,14 @@ async fn main() -> Result<()> {
     ).await {
         Ok(token_data_list) => {
             // Display the results
-            println!("\n{:-^80}", " TOKEN CREATION EVENTS ");
-            
             if token_data_list.is_empty() {
-                println!("No token creation events detected during the test period.");
+                info!("Token extraction complete. No token creation events detected during the test period.");
             } else {
-                println!("Found {} token creation events:", token_data_list.len());
-                println!("\n{:<5} {:<20} {:<10} {:<44} {:<44} {:<44}", 
-                         "#", "NAME", "SYMBOL", "MINT", "BONDING CURVE", "CREATOR");
-                println!("{:-<170}", "");
-                
-                for (i, token) in token_data_list.iter().enumerate() {
-                    println!("{:<5} {:<20} {:<10} {:<44} {:<44} {:<44}", 
-                             i+1, 
-                             token.name, 
-                             token.symbol, 
-                             token.mint, 
-                             token.bonding_curve, 
-                             token.user);
-                }
+                info!("Token extraction complete. Found {} tokens during the session.", token_data_list.len());
             }
+            
+            // Print a simple completion message
+            println!("Token extraction completed.");
         },
         Err(e) => {
             error!("Error running WebSocket test: {}", e);

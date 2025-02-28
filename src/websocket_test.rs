@@ -138,7 +138,7 @@ fn parse_create_instruction(data: &[u8]) -> Option<TokenData> {
         }
     };
 
-    info!("Successfully parsed token data: {} ({})", name, symbol);
+    debug!("Successfully parsed token data: {} ({})", name, symbol);
     Some(TokenData {
         name,
         symbol, 

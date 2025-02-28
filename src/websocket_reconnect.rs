@@ -11,8 +11,11 @@ use tokio_tungstenite::{
     tungstenite::{Error as WsError, Message},
 };
 use url::Url;
+use std::str::FromStr;
+use solana_program::pubkey::Pubkey;
 
 use crate::websocket_test::TokenData;
+use crate::token_detector;
 
 /// Run WebSocket connection with automatic reconnection
 pub async fn run_websocket_with_reconnect(
@@ -189,7 +192,7 @@ async fn run_websocket_session(
                                 // Parse and process message
                                 if let Ok(json_msg) = serde_json::from_str::<Value>(&text) {
                                     // Use the public functions from websocket_test
-                                    if let Some(result) = process_message(&json_msg, token_creations) {
+                                    if let Some(result) = process_message(&json_msg, token_creations).await {
                                         token_data_list.push(result);
                                     }
                                 }
@@ -225,7 +228,7 @@ async fn run_websocket_session(
 }
 
 // Custom message processing function (copied logic from websocket_test.rs)
-fn process_message(message: &serde_json::Value, token_creation_count: &mut usize) -> Option<TokenData> {
+async fn process_message(message: &serde_json::Value, token_creation_count: &mut usize) -> Option<TokenData> {
     // Check if this is a subscription confirmation
     if let Some(id) = message.get("id").and_then(|v| v.as_i64()) {
         info!("WebSocket subscription confirmed with id: {}", id);
@@ -250,18 +253,47 @@ fn process_message(message: &serde_json::Value, token_creation_count: &mut usize
                                 *token_creation_count += 1;
                                 
                                 if let Some(signature) = value.get("signature").and_then(|v| v.as_str()) {
-                                    info!("🪙 NEW TOKEN CREATED! Transaction signature: {}", signature);
+                                    debug!("🪙 NEW TOKEN CREATED! Transaction signature: {}", signature);
                                     
                                     // Extract program data from logs and pass to parse_instruction in websocket_test
                                     for log in logs {
                                         if let Some(log_str) = log.as_str() {
                                             if log_str.contains("Program data:") {
                                                 if let Some(data_part) = log_str.strip_prefix("Program data: ") {
-                                                    // Decode and process the data - fixed to use Engine trait properly
+                                                    // Decode and process the data
                                                     if let Ok(decoded_data) = STANDARD.decode(data_part) {
                                                         // Try to use our token parser
                                                         if let Some(mut token_data) = crate::websocket_test::parse_instruction(&decoded_data) {
+                                                            // Set the signature
                                                             token_data.tx_signature = signature.to_string();
+                                                            
+                                                            // Get liquidity data if available
+                                                            // Read MIN_LIQUIDITY from environment or use default
+                                                            let min_liquidity = std::env::var("MIN_LIQUIDITY")
+                                                                .ok()
+                                                                .and_then(|v| v.parse::<f64>().ok())
+                                                                .unwrap_or(0.5); // Default if env var is missing
+                                                            
+                                                            let (is_valid, liquidity) = match crate::token_detector::check_token_primary_liquidity(
+                                                                &token_data.mint,
+                                                                min_liquidity
+                                                            ).await {
+                                                                Ok((valid, liq)) => (valid, liq),
+                                                                Err(e) => {
+                                                                    // If we can't check liquidity, token is not valid
+                                                                    warn!("Failed to get liquidity for {}: {}. Error: {}", 
+                                                                           token_data.name, token_data.mint, e);
+                                                                    (false, 0.0)
+                                                                }
+                                                            };
+                                                            
+                                                            let status_indicator = if is_valid { "✅" } else { "❌" };
+                                                            
+                                                            // Log the new token with its liquidity and status
+                                                            info!("🪙 NEW TOKEN CREATED! {}, mint: {} (bonding curve: {}), liquidity: {} SOL {}", 
+                                                                  token_data.name, token_data.mint, token_data.bonding_curve, 
+                                                                  liquidity, status_indicator);
+                                                            
                                                             return Some(token_data);
                                                         }
                                                     }
