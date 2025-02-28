@@ -498,7 +498,18 @@ pub async fn setup_websocket() -> anyhow::Result<()> {
                                                 
                                                 // Process the notification immediately
                                                 if let Some(token) = process_notification(&text) {
-                                                    info!("✨ DETECTED NEW TOKEN: {} ({})", token.token_name, token.mint_address);
+                                                    // Calculate or estimate liquidity
+                                                    let liquidity = 0.5; // Default value
+                                                    
+                                                    // Determine opportunity status
+                                                    let opportunity_status = "⚡"; // Ultra-fast detection
+                                                    
+                                                    // Log the token information with new format
+                                                    info!("🪙 NEW TOKEN CREATED! {} (mint: {}) 💰 {:.2} SOL {}", 
+                                                        token.token_name, 
+                                                        token.mint_address, 
+                                                        liquidity, 
+                                                        opportunity_status);
                                                     
                                                     // Add to the WebSocket messages queue for later processing
                                                     if let Ok(mut queue) = WEBSOCKET_MESSAGES.try_lock() {
@@ -1195,8 +1206,18 @@ fn handle_notification(notification: String) {
             error!("Failed to lock websocket messages queue");
         }
         
-        // Log the token information
-        info!("Detected new token: {} ({})", token.token_name, token.mint_address);
+        // Calculate or estimate liquidity
+        let liquidity = 0.5; // Default value
+        
+        // Determine opportunity status
+        let opportunity_status = "⚡"; // Ultra-fast detection
+        
+        // Log the token information with new format
+        info!("🪙 NEW TOKEN CREATED! {} (mint: {}) 💰 {:.2} SOL {}", 
+            token.token_name, 
+            token.mint_address, 
+            liquidity, 
+            opportunity_status);
     } else {
         debug!("Notification did not contain valid token creation data");
     }

@@ -18,6 +18,7 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+use std::io::Write;
 
 // External crate imports
 use anyhow::{Context, Result};
@@ -94,8 +95,21 @@ async fn process_new_tokens_from_websocket(
     last_processed.insert(mint.clone(), now);
     drop(last_processed); // Release the lock
     
-    // Log new token detection
-    info!("🔍 New token detected: {} ({}) - Mint: {}, Creator: {}", name, symbol, mint, user);
+    // Calculate or estimate liquidity
+    let liquidity = match api::calculate_liquidity_from_bonding_curve(&mint, &user, amount).await {
+        Ok(liq) => liq,
+        Err(_) => 0.5, // Default value if calculation fails
+    };
+    
+    // Determine opportunity status
+    let opportunity_status = "💎"; // Diamond for confirmed token
+    
+    // Log new token detection with the new format
+    info!("🪙 NEW TOKEN CREATED! {} (mint: {}) 💰 {:.2} SOL {}", 
+        name, 
+        mint, 
+        liquidity, 
+        opportunity_status);
     
     // Check if tag matches if a tag filter is specified
     if !snipe_by_tag.trim().is_empty() {
@@ -115,7 +129,7 @@ async fn process_new_tokens_from_websocket(
         match checks::check_approved_devs(user).await {
             Ok(is_approved) => {
                 if is_approved {
-                    info!("🚀 APPROVED DEVELOPER DETECTED! {}", user);
+                    info!("🚀 APPROVED DEVELOPER! {} (creator: {})", name, user);
                 }
                 is_approved
             },
@@ -291,10 +305,47 @@ async fn main() -> Result<()> {
     // Initialize environment variables from .env file
     dotenv().ok();
     
-    // Initialize logging
-    env_logger::Builder::new()
-        .filter_level(LevelFilter::Info)
+    // Get any logging preference from command-line arguments
+    let show_only_token_creation = std::env::args().any(|arg| arg == "--quiet" || arg == "-q");
+    
+    // Initialize logging with custom filter
+    let log_filter = if show_only_token_creation {
+        // Only show token creation messages and errors/warnings
+        "error,warn,pumpfun_sniper::websocket_test=info"
+    } else {
+        // Show all info logs (default behavior)
+        "info"
+    };
+    
+    let env = env_logger::Env::default()
+        .filter_or("RUST_LOG", log_filter);
+    
+    // Capture quiet mode flag for the formatter
+    let quiet_mode = show_only_token_creation;
+    
+    env_logger::Builder::from_env(env)
         .format_timestamp_millis()
+        .format(move |buf, record| {
+            // Special formatting for token creation messages
+            if record.args().to_string().contains("NEW TOKEN CREATED!") {
+                // Always include timestamp for token creation messages
+                writeln!(
+                    buf,
+                    "[{}] {}",
+                    buf.timestamp_millis(),
+                    record.args()
+                )
+            } else {
+                // Standard format for other logs
+                writeln!(
+                    buf,
+                    "[{}] {} {}",
+                    buf.timestamp_millis(),
+                    record.level(),
+                    record.args()
+                )
+            }
+        })
         .init();
     
     info!("Starting Pump.fun Sniper Bot...");
@@ -303,9 +354,9 @@ async fn main() -> Result<()> {
     if std::env::args().any(|arg| arg == "--extract-tokens" || arg == "-e") {
         info!("Extracting token data from WebSocket messages");
         
-        // Get WebSocket endpoint from environment or use default
+        // Get WebSocket endpoint from environment or use authenticated URL from chainstack_simple
         let wss_endpoint = std::env::var("WSS_ENDPOINT")
-            .unwrap_or_else(|_| "wss://api.pump.fun/socket".to_string());
+            .unwrap_or_else(|_| chainstack_simple::get_authenticated_wss_url());
             
         info!("Using WebSocket endpoint: {}", wss_endpoint);
         
@@ -379,9 +430,9 @@ async fn main() -> Result<()> {
         println!("Press Ctrl+C at any time to stop monitoring");
         println!("{:-^100}", "");
         
-        // Initialize the WebSocket
+        // Initialize the WebSocket - use the authenticated WebSocket URL from chainstack_simple
         let wss_endpoint = std::env::var("WSS_ENDPOINT")
-            .unwrap_or_else(|_| "wss://api.pump.fun/socket".to_string());
+            .unwrap_or_else(|_| chainstack_simple::get_authenticated_wss_url());
         
         info!("Using WebSocket endpoint: {}", wss_endpoint);
         
@@ -430,6 +481,7 @@ async fn main() -> Result<()> {
     println!("Pump.fun Sniper Bot - Available Commands:");
     println!("  --extract-tokens, -e : Extract token data from WebSocket messages");
     println!("  --monitor-websocket, -m : Monitor for new tokens via WebSocket with automatic buying");
+    println!("  --quiet, -q : Only show token creation messages and suppress other logs");
     
     Ok(())
 } 

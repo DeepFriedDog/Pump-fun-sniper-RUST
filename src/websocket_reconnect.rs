@@ -289,10 +289,12 @@ async fn process_message(message: &serde_json::Value, token_creation_count: &mut
                                                             
                                                             let status_indicator = if is_valid { "✅" } else { "❌" };
                                                             
-                                                            // Log the new token with its liquidity and status
-                                                            info!("🪙 NEW TOKEN CREATED! {}, mint: {} (bonding curve: {}), liquidity: {} SOL {}", 
-                                                                  token_data.name, token_data.mint, token_data.bonding_curve, 
-                                                                  liquidity, status_indicator);
+                                                            // Log the new token with the standardized format
+                                                            info!("🪙 NEW TOKEN CREATED! {} (mint: {}) 💰 {:.2} SOL {}", 
+                                                                  token_data.name, 
+                                                                  token_data.mint, 
+                                                                  liquidity, 
+                                                                  status_indicator);
                                                             
                                                             return Some(token_data);
                                                         }

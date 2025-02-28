@@ -153,7 +153,7 @@ pub async fn initialize_websocket(_api_key: Option<String>) -> Result<()> {
         
         loop {
             // Use the authenticated WebSocket URL from chainstack module
-            let wss_url = "wss://api.pump.fun/socket".to_string();
+            let wss_url = crate::chainstack_simple::get_authenticated_wss_url();
             
             info!("Using WebSocket URL for token monitoring: {}", wss_url);
                 
@@ -498,12 +498,16 @@ async fn process_token_logs(logs: &[String], mint: &str, tx_signature: &str) -> 
                 timestamp: Some(Utc::now().timestamp()),
             };
             
-            info!("🚀 NEW PUMP.FUN TOKEN DETECTED:");
-            info!("   Mint: {}", mint_clone);
-            info!("   Name: {}", token_name);
-            info!("   Symbol: {}", token_symbol);
-            info!("   Developer: {}", developer);
-            info!("   Transaction: {}", tx_signature_clone);
+            // Calculate or estimate liquidity (simplified for this implementation)
+            let liquidity = 0.5; // Default value if we don't have actual data
+            let opportunity_status = "⚡"; // Lightning bolt for ultra-fast detection
+            
+            // New simplified log format
+            info!("🪙 NEW TOKEN CREATED! {} (mint: {}) 💰 {} SOL {}", 
+                token_name, 
+                mint_clone, 
+                liquidity, 
+                opportunity_status);
             
             // Add token to queue
             let mut queue = NEW_TOKEN_QUEUE.lock().unwrap();

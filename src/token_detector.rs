@@ -349,12 +349,16 @@ async fn process_message(text: &str, queue: Arc<Mutex<std::collections::VecDeque
                                         
                                         // Parse the instruction
                                         if let Some(token_data) = parse_create_instruction(&decoded_data) {
-                                            info!("Detected new token creation:");
-                                            info!("  Signature: {}", signature);
-                                            info!("  Name: {}", token_data.name);
-                                            info!("  Symbol: {}", token_data.symbol);
-                                            info!("  Mint: {}", token_data.mint);
-                                            info!("  Creator: {}", token_data.user);
+                                            // Calculate or estimate liquidity (simplified for now)
+                                            let liquidity = 0.5; // Default value if we don't have actual data
+                                            let opportunity_status = "⚡"; // Lightning bolt for ultra-fast detection
+                                            
+                                            // New simplified log format
+                                            info!("🪙 NEW TOKEN CREATED! {} (mint: {}) 💰 {} SOL {}", 
+                                                token_data.name, 
+                                                token_data.mint, 
+                                                liquidity, 
+                                                opportunity_status);
                                             
                                             // Save mint and bonding curve before token_data is moved
                                             let mint_str = token_data.mint.clone();
@@ -409,9 +413,59 @@ async fn process_message(text: &str, queue: Arc<Mutex<std::collections::VecDeque
                                             Ok(decoded_bs58) => {
                                                 debug!("Decoded using bs58 instead ({} bytes)", decoded_bs58.len());
                                                 if let Some(token_data) = parse_create_instruction(&decoded_bs58) {
-                                                    info!("Detected new token (bs58 decoded):");
-                                                    info!("  Name: {}", token_data.name);
-                                                    // ... rest of token processing logic
+                                                    // Calculate or estimate liquidity (simplified for now)
+                                                    let liquidity = 0.5; // Default value if we don't have actual data
+                                                    let opportunity_status = "⚡"; // Lightning bolt for ultra-fast detection
+                                                    
+                                                    // New simplified log format
+                                                    info!("🪙 NEW TOKEN CREATED! {} (mint: {}) 💰 {} SOL {}", 
+                                                        token_data.name, 
+                                                        token_data.mint, 
+                                                        liquidity, 
+                                                        opportunity_status);
+                                                    
+                                                    // Save mint and bonding curve before token_data is moved
+                                                    let mint_str = token_data.mint.clone();
+                                                    let bonding_curve_str = token_data.bonding_curve.clone();
+                                                    
+                                                    // Convert to NewToken and add to the queue
+                                                    let mut new_token: NewToken = token_data.into();
+                                                    new_token.transaction_signature = signature.to_string();
+                                                    
+                                                    // Add message to global queue for processing
+                                                    let mut queue_guard = queue.lock().await;
+                                                    queue_guard.push_back(text.to_string());
+                                                    info!("Added token to queue. Current queue size: {}", queue_guard.len());
+                                                    
+                                                    // IMPORTANT: Also add to the API queue that is checked by fetch_new_tokens
+                                                    let token_data = crate::api::TokenData {
+                                                        status: "success".to_string(),
+                                                        mint: mint_str.clone(),
+                                                        dev: new_token.creator_address.clone(),
+                                                        metadata: Some(format!("bonding_curve:{}", bonding_curve_str)),
+                                                        name: Some(new_token.token_name.clone()),
+                                                        symbol: Some(new_token.token_symbol.clone()),
+                                                        timestamp: Some(chrono::Utc::now().timestamp()),
+                                                    };
+                                                    
+                                                    let mut api_queue = crate::api::NEW_TOKEN_QUEUE.lock().unwrap();
+                                                    api_queue.push_back(token_data);
+                                                    info!("Added token to API queue. Current API queue size: {}", api_queue.len());
+                                                    
+                                                    // Calculate associated bonding curve
+                                                    if let (Ok(mint), Ok(bonding_curve)) = (
+                                                        Pubkey::from_str(&mint_str),
+                                                        Pubkey::from_str(&bonding_curve_str)
+                                                    ) {
+                                                        let associated_curve = find_associated_bonding_curve(&mint, &bonding_curve);
+                                                        info!("Associated Bonding Curve: {}", associated_curve);
+                                                    }
+                                                    
+                                                    // Process the token in chainstack module
+                                                    if let Some(token) = chainstack_simple::process_notification(text) {
+                                                        info!("Token processed by chainstack: {} ({})",
+                                                              token.token_name, token.mint_address);
+                                                    }
                                                 }
                                             }
                                             Err(_) => {

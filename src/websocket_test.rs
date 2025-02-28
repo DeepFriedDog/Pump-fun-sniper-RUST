@@ -188,7 +188,13 @@ pub async fn run_websocket_test(endpoint: &str) -> Result<Vec<TokenData>, Error>
         ]
     }).to_string();
     
-    info!("Sending subscription request: {}", subscription_request);
+    // Check if we're in quiet mode
+    let quiet_mode = std::env::args().any(|arg| arg == "--quiet" || arg == "-q");
+    
+    if !quiet_mode {
+        info!("Sending subscription request: {}", subscription_request);
+    }
+    
     ws_stream.send(Message::Text(subscription_request)).await?;
     
     info!("WebSocket connection established, waiting for token creation events...");
@@ -213,8 +219,10 @@ pub async fn run_websocket_test(endpoint: &str) -> Result<Vec<TokenData>, Error>
     let mut token_data_list = Vec::new();
     
     // Log initial status
-    info!("Status: WebSocket test running. Will listen for {} seconds", 
-          test_duration);
+    if !quiet_mode {
+        info!("Status: WebSocket test running. Will listen for {} seconds", 
+            test_duration);
+    }
           
     // Process messages
     loop {
@@ -232,8 +240,10 @@ pub async fn run_websocket_test(endpoint: &str) -> Result<Vec<TokenData>, Error>
                 let mins = remaining.as_secs() / 60;
                 let secs = remaining.as_secs() % 60;
                 
-                info!("Status: Processed {} messages, found {} new tokens. Test ends in {}m{}s", 
-                      message_count, token_creations, mins, secs);
+                if !quiet_mode {
+                    info!("Status: Processed {} messages, found {} new tokens. Test ends in {}m{}s", 
+                          message_count, token_creations, mins, secs);
+                }
             }
             
             // Process messages
@@ -250,7 +260,7 @@ pub async fn run_websocket_test(endpoint: &str) -> Result<Vec<TokenData>, Error>
                                 
                                 // Parse and process message
                                 if let Ok(json_msg) = serde_json::from_str::<serde_json::Value>(&text) {
-                                    if let Some(token_data) = process_websocket_message(&json_msg, &mut token_creations) {
+                                    if let Some(token_data) = process_websocket_message(&json_msg, &mut token_creations, quiet_mode) {
                                         // Just collect the token data, don't take any action
                                         token_data_list.push(token_data);
                                     }
@@ -306,10 +316,12 @@ pub async fn run_websocket_test(endpoint: &str) -> Result<Vec<TokenData>, Error>
 }
 
 /// Process a WebSocket message to extract token data if it's a token creation event
-fn process_websocket_message(message: &serde_json::Value, token_creation_count: &mut usize) -> Option<TokenData> {
+fn process_websocket_message(message: &serde_json::Value, token_creation_count: &mut usize, quiet_mode: bool) -> Option<TokenData> {
     // Check if this is a subscription confirmation
     if let Some(id) = message.get("id").and_then(|v| v.as_i64()) {
-        info!("WebSocket subscription confirmed with id: {}", id);
+        if !quiet_mode {
+            info!("WebSocket subscription confirmed with id: {}", id);
+        }
         return None;
     }
     
@@ -321,7 +333,9 @@ fn process_websocket_message(message: &serde_json::Value, token_creation_count: 
                     if let Some(value) = result.get("value") {
                         // Extract log data
                         if let Some(logs) = value.get("logs").and_then(|v| v.as_array()) {
-                            info!("Log entry count: {}", logs.len());
+                            if !quiet_mode {
+                                info!("Log entry count: {}", logs.len());
+                            }
                             
                             // ONLY check for "Create" instruction in logs - ignore Buy events as requested
                             let contains_create = logs.iter()
@@ -333,7 +347,18 @@ fn process_websocket_message(message: &serde_json::Value, token_creation_count: 
                                 *token_creation_count += 1;
                                 
                                 if let Some(signature) = value.get("signature").and_then(|v| v.as_str()) {
-                                    info!("🪙 NEW TOKEN CREATED! Transaction signature: {}", signature);
+                                    // Default values since we don't have full token info yet
+                                    let token_name = "Unknown";
+                                    let mint = signature;
+                                    let liquidity = 0.5;
+                                    let opportunity_status = "⚡";
+                                    
+                                    // Always show token creation messages, regardless of quiet mode
+                                    info!("🪙 NEW TOKEN CREATED! {} (mint: {}) 💰 {:.2} SOL {}", 
+                                        token_name, 
+                                        mint, 
+                                        liquidity, 
+                                        opportunity_status);
                                     
                                     // Extract and parse program data
                                     let mut program_data_base64 = String::new();
@@ -342,7 +367,9 @@ fn process_websocket_message(message: &serde_json::Value, token_creation_count: 
                                     for log in logs {
                                         if let Some(log_str) = log.as_str() {
                                             if log_str.contains("Program data:") {
-                                                info!("Program data found: {}", log_str);
+                                                if !quiet_mode {
+                                                    info!("Program data found: {}", log_str);
+                                                }
                                                 
                                                 // Extract base64 data part
                                                 if let Some(data_part) = log_str.strip_prefix("Program data: ") {
@@ -350,34 +377,46 @@ fn process_websocket_message(message: &serde_json::Value, token_creation_count: 
                                                     
                                                     // Decode the base64 data
                                                     if let Ok(decoded_data) = BASE64.decode(data_part) {
-                                                        info!("Successfully decoded program data ({} bytes)", decoded_data.len());
+                                                        if !quiet_mode {
+                                                            info!("Successfully decoded program data ({} bytes)", decoded_data.len());
+                                                        }
                                                         
                                                         // Parse the token details
                                                         if let Some(mut token_data) = parse_create_instruction(&decoded_data) {
                                                             // Set the transaction signature
                                                             token_data.tx_signature = signature.to_string();
                                                             
-                                                            // Display the extracted token details
-                                                            info!("=== NEWLY MINTED TOKEN DETAILS ===");
-                                                            info!("Token Name: {}", token_data.name);
-                                                            info!("Token Symbol: {}", token_data.symbol);
-                                                            info!("Token URI: {}", token_data.uri);
-                                                            info!("Mint Address: {}", token_data.mint);
-                                                            info!("Bonding Curve Address: {}", token_data.bonding_curve);
-                                                            info!("Creator Address: {}", token_data.user);
+                                                            // Always show the token creation message with the actual name
+                                                            info!("🪙 NEW TOKEN CREATED! {} (mint: {}) 💰 {:.2} SOL {}", 
+                                                                token_data.name,
+                                                                token_data.mint,
+                                                                0.5, // Default liquidity
+                                                                "⚡"); // Opportunity status
                                                             
-                                                            // Calculate associated bonding curve
-                                                            if let Ok(mint_pubkey) = Pubkey::from_str(&token_data.mint) {
-                                                                if let Ok(bonding_curve_pubkey) = Pubkey::from_str(&token_data.bonding_curve) {
-                                                                    let associated_bonding_curve = find_associated_bonding_curve(&mint_pubkey, &bonding_curve_pubkey);
-                                                                    info!("Associated Bonding Curve: {}", associated_bonding_curve);
+                                                            // Only show detailed logs if not in quiet mode
+                                                            if !quiet_mode {
+                                                                // Display the extracted token details
+                                                                info!("=== NEWLY MINTED TOKEN DETAILS ===");
+                                                                info!("Token Name: {}", token_data.name);
+                                                                info!("Token Symbol: {}", token_data.symbol);
+                                                                info!("Token URI: {}", token_data.uri);
+                                                                info!("Mint Address: {}", token_data.mint);
+                                                                info!("Bonding Curve Address: {}", token_data.bonding_curve);
+                                                                info!("Creator Address: {}", token_data.user);
+                                                            
+                                                                // Calculate associated bonding curve
+                                                                if let Ok(mint_pubkey) = Pubkey::from_str(&token_data.mint) {
+                                                                    if let Ok(bonding_curve_pubkey) = Pubkey::from_str(&token_data.bonding_curve) {
+                                                                        let associated_bonding_curve = find_associated_bonding_curve(&mint_pubkey, &bonding_curve_pubkey);
+                                                                        info!("Associated Bonding Curve: {}", associated_bonding_curve);
+                                                                    }
                                                                 }
+                                                            
+                                                                info!("Transaction Signature: {}", signature);
+                                                            
+                                                                // Print a separator for readability
+                                                                info!("==================================================================");
                                                             }
-                                                            
-                                                            info!("Transaction Signature: {}", signature);
-                                                            
-                                                            // Print a separator for readability
-                                                            info!("==================================================================");
                                                             
                                                             return Some(token_data);
                                                         } else {
