@@ -206,7 +206,7 @@ async fn connect_websocket(ws_url: &str, pump_program_id: &str) -> Result<()> {
                         "mentions": [program_id_str]
                     },
                     {
-                        "commitment": "finalized"
+                        "commitment": "processed"
                     }
                 ]
             });

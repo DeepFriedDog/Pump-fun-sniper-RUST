@@ -335,7 +335,7 @@ pub async fn setup_websocket() -> anyhow::Result<()> {
     let default_commitment = if std::env::args().any(|arg| arg == "--finalized") {
         "finalized"
     } else {
-        "confirmed"
+        "processed"
     };
     
     // ALWAYS use "processed" for faster token detection - matching Python implementation
@@ -344,9 +344,9 @@ pub async fn setup_websocket() -> anyhow::Result<()> {
         info!("🔄 Test mode detected: forcing 'processed' commitment level for faster results");
         "processed".to_string()
     } else {
-        // Change from "processed" to "finalized" for more consistent token detection
-        info!("Using 'finalized' commitment level for more consistent token detection");
-        "finalized".to_string()
+        // Use "processed" for faster token detection
+        info!("Using 'processed' commitment level for faster token detection");
+        "processed".to_string()
     };
     
     info!("Solana: Listening to pump.fun token mint using logsSubscribe for program ID: {}", pump_program_id);
