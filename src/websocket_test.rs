@@ -386,12 +386,42 @@ fn process_websocket_message(message: &serde_json::Value, token_creation_count: 
                                                             // Set the transaction signature
                                                             token_data.tx_signature = signature.to_string();
                                                             
-                                                            // Always show the token creation message with the actual name
-                                                            info!("🪙 NEW TOKEN CREATED! {} (mint: {}) 💰 {:.2} SOL {}", 
-                                                                token_data.name,
-                                                                token_data.mint,
-                                                                0.5, // Default liquidity
-                                                                "⚡"); // Opportunity status
+                                                            // Create a clone for async liquidity checking
+                                                            let token_data_clone = token_data.clone();
+                                                            
+                                                            // Spawn a task to check liquidity asynchronously
+                                                            tokio::spawn(async move {
+                                                                // Get MIN_LIQUIDITY from environment variable
+                                                                let min_liquidity_str = std::env::var("MIN_LIQUIDITY").unwrap_or_else(|_| "4.0".to_string());
+                                                                let min_liquidity = min_liquidity_str.parse::<f64>().unwrap_or(4.0);
+                                                                
+                                                                // Use the token_detector function for liquidity check
+                                                                match crate::token_detector::check_token_liquidity(
+                                                                    &token_data_clone.mint,
+                                                                    &token_data_clone.bonding_curve,
+                                                                    min_liquidity
+                                                                ).await {
+                                                                    Ok((has_liquidity, sol_amount)) => {
+                                                                        // Log the token creation with liquidity info
+                                                                        let check_mark = if has_liquidity { "✅" } else { "❌" };
+                                                                        
+                                                                        info!("🪙 NEW TOKEN CREATED! {} (mint: {}) 💰 {:.2} SOL {}", 
+                                                                            token_data_clone.name, 
+                                                                            token_data_clone.mint, 
+                                                                            sol_amount, 
+                                                                            check_mark);
+                                                                    },
+                                                                    Err(e) => {
+                                                                        // Log error and show token with 0 SOL
+                                                                        if !quiet_mode {
+                                                                            info!("Error checking liquidity: {}", e);
+                                                                        }
+                                                                        info!("🪙 NEW TOKEN CREATED! {} (mint: {}) 💰 0.00 SOL ❌", 
+                                                                            token_data_clone.name, 
+                                                                            token_data_clone.mint);
+                                                                    }
+                                                                }
+                                                            });
                                                             
                                                             // Only show detailed logs if not in quiet mode
                                                             if !quiet_mode {

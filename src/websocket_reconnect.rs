@@ -14,6 +14,9 @@ use url::Url;
 use std::str::FromStr;
 use solana_program::pubkey::Pubkey;
 use reqwest::Client;
+use std::collections::{HashMap, VecDeque};
+use solana_client::rpc_client::RpcClient;
+use solana_sdk::commitment_config::CommitmentConfig;
 
 use crate::token_detector::{self, DetectorTokenData};
 use crate::websocket_test;
@@ -61,8 +64,7 @@ pub async fn run_websocket_with_reconnect(
         
         // If this isn't the first attempt, apply backoff with jitter
         if attempt > 1 {
-            let mut random = rand::rng();
-            let jitter = random.random_range(0..=500);
+            let jitter = rand::thread_rng().gen_range(0..=500);
             let backoff_ms = backoff_secs * 1000 + jitter;
             
             info!("Applying backoff: waiting for {}ms before reconnecting", backoff_ms);

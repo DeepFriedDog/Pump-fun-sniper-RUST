@@ -349,20 +349,42 @@ async fn process_message(text: &str, queue: Arc<Mutex<std::collections::VecDeque
                                         
                                         // Parse the instruction
                                         if let Some(token_data) = parse_create_instruction(&decoded_data) {
-                                            // Calculate or estimate liquidity (simplified for now)
-                                            let liquidity = 0.5; // Default value if we don't have actual data
-                                            let opportunity_status = "⚡"; // Lightning bolt for ultra-fast detection
-                                            
-                                            // New simplified log format
-                                            info!("🪙 NEW TOKEN CREATED! {} (mint: {}) 💰 {} SOL {}", 
-                                                token_data.name, 
-                                                token_data.mint, 
-                                                liquidity, 
-                                                opportunity_status);
-                                            
-                                            // Save mint and bonding curve before token_data is moved
+                                            // Save mint and bonding curve before token_data is moved or cloned
                                             let mint_str = token_data.mint.clone();
                                             let bonding_curve_str = token_data.bonding_curve.clone();
+                                            let token_data_clone = token_data.clone();
+
+                                            // Spawn a task to check liquidity asynchronously
+                                            tokio::spawn(async move {
+                                                // Get MIN_LIQUIDITY from environment variable
+                                                let min_liquidity_str = std::env::var("MIN_LIQUIDITY").unwrap_or_else(|_| "4.0".to_string());
+                                                let min_liquidity = min_liquidity_str.parse::<f64>().unwrap_or(4.0);
+                                                
+                                                // Check actual liquidity
+                                                match check_token_liquidity(
+                                                    &token_data_clone.mint,
+                                                    &token_data_clone.bonding_curve,
+                                                    min_liquidity
+                                                ).await {
+                                                    Ok((has_liquidity, sol_amount)) => {
+                                                        // Log the token creation with liquidity info
+                                                        let check_mark = if has_liquidity { "✅" } else { "❌" };
+                                                        
+                                                        info!("🪙 NEW TOKEN CREATED! {} (mint: {}) 💰 {:.2} SOL {}", 
+                                                            token_data_clone.name, 
+                                                            token_data_clone.mint, 
+                                                            sol_amount, 
+                                                            check_mark);
+                                                    },
+                                                    Err(e) => {
+                                                        // Log error and show token with 0 SOL
+                                                        debug!("Error checking liquidity: {}", e);
+                                                        info!("🪙 NEW TOKEN CREATED! {} (mint: {}) 💰 0.00 SOL ❌", 
+                                                            token_data_clone.name, 
+                                                            token_data_clone.mint);
+                                                    }
+                                                }
+                                            });
                                             
                                             // Convert to NewToken and add to the queue
                                             let mut new_token: NewToken = token_data.into();
@@ -413,20 +435,42 @@ async fn process_message(text: &str, queue: Arc<Mutex<std::collections::VecDeque
                                             Ok(decoded_bs58) => {
                                                 debug!("Decoded using bs58 instead ({} bytes)", decoded_bs58.len());
                                                 if let Some(token_data) = parse_create_instruction(&decoded_bs58) {
-                                                    // Calculate or estimate liquidity (simplified for now)
-                                                    let liquidity = 0.5; // Default value if we don't have actual data
-                                                    let opportunity_status = "⚡"; // Lightning bolt for ultra-fast detection
-                                                    
-                                                    // New simplified log format
-                                                    info!("🪙 NEW TOKEN CREATED! {} (mint: {}) 💰 {} SOL {}", 
-                                                        token_data.name, 
-                                                        token_data.mint, 
-                                                        liquidity, 
-                                                        opportunity_status);
-                                                    
-                                                    // Save mint and bonding curve before token_data is moved
+                                                    // Save mint and bonding curve before token_data is moved or cloned
                                                     let mint_str = token_data.mint.clone();
                                                     let bonding_curve_str = token_data.bonding_curve.clone();
+                                                    let token_data_clone = token_data.clone();
+
+                                                    // Spawn a task to check liquidity asynchronously
+                                                    tokio::spawn(async move {
+                                                        // Get MIN_LIQUIDITY from environment variable
+                                                        let min_liquidity_str = std::env::var("MIN_LIQUIDITY").unwrap_or_else(|_| "4.0".to_string());
+                                                        let min_liquidity = min_liquidity_str.parse::<f64>().unwrap_or(4.0);
+                                                        
+                                                        // Check actual liquidity
+                                                        match check_token_liquidity(
+                                                            &token_data_clone.mint,
+                                                            &token_data_clone.bonding_curve,
+                                                            min_liquidity
+                                                        ).await {
+                                                            Ok((has_liquidity, sol_amount)) => {
+                                                                // Log the token creation with liquidity info
+                                                                let check_mark = if has_liquidity { "✅" } else { "❌" };
+                                                                
+                                                                info!("🪙 NEW TOKEN CREATED! {} (mint: {}) 💰 {:.2} SOL {}", 
+                                                                    token_data_clone.name, 
+                                                                    token_data_clone.mint, 
+                                                                    sol_amount, 
+                                                                    check_mark);
+                                                            },
+                                                            Err(e) => {
+                                                                // Log error and show token with 0 SOL
+                                                                debug!("Error checking liquidity: {}", e);
+                                                                info!("🪙 NEW TOKEN CREATED! {} (mint: {}) 💰 0.00 SOL ❌", 
+                                                                    token_data_clone.name, 
+                                                                    token_data_clone.mint);
+                                                            }
+                                                        }
+                                                    });
                                                     
                                                     // Convert to NewToken and add to the queue
                                                     let mut new_token: NewToken = token_data.into();
