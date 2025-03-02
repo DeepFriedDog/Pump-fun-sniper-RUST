@@ -300,6 +300,165 @@ fn create_optimized_client() -> Result<reqwest::Client> {
     Ok(client)
 }
 
+/// Run in monitor websocket mode
+async fn monitor_websocket() -> Result<()> {
+    info!("Starting WebSocket monitor for new tokens with automatic buying");
+    
+    // Read configuration
+    let check_min_liquidity = std::env::var("CHECK_MIN_LIQUIDITY")
+        .unwrap_or_else(|_| "false".to_string()) == "true";
+    let approved_devs_only = std::env::var("APPROVED_DEVS_ONLY")
+        .unwrap_or_else(|_| "false".to_string()) == "true";
+    let snipe_by_tag = std::env::var("SNIPE_BY_TAG").unwrap_or_else(|_| "".to_string());
+    let private_key = std::env::var("PRIVATE_KEY").context("Missing PRIVATE_KEY in .env")?;
+    let amount = std::env::var("AMOUNT")
+        .unwrap_or_else(|_| "0.1".to_string())
+        .parse::<f64>()
+        .context("Invalid AMOUNT value in .env")?;
+    let slippage = std::env::var("SLIPPAGE")
+        .unwrap_or_else(|_| "10".to_string())
+        .parse::<f64>()
+        .context("Invalid SLIPPAGE value in .env")?;
+    let wallet = std::env::var("WALLET").context("Missing WALLET in .env")?;
+    
+    // Get duration setting - use 0 for indefinite monitoring (will run until Ctrl+C)
+    let duration = std::env::var("MONITOR_DURATION")
+        .map(|v| v.parse::<u64>().unwrap_or(0))
+        .unwrap_or(0);
+        
+    // Initialize HTTP client
+    let client = Arc::new(create_optimized_client()?);
+    
+    // Display configuration
+    println!("\n{:-^100}", " PUMP.FUN TOKEN MONITOR ");
+    println!("Mode: {}", if approved_devs_only { "APPROVED DEV (Auto-Buy without Liquidity Check)" } 
+                           else if check_min_liquidity { "STANDARD (Verify Liquidity Before Buy)" }
+                           else { "AGGRESSIVE (Buy Without Liquidity Check)" });
+    println!("Amount: {} SOL", amount);
+    println!("Slippage: {}%", slippage);
+    if !snipe_by_tag.is_empty() {
+        println!("Tag Filter: {}", snipe_by_tag);
+    }
+    
+    // Show duration info
+    if duration > 0 {
+        println!("Monitor Duration: {} seconds", duration);
+    } else {
+        println!("Monitor Duration: INDEFINITE (press Ctrl+C to stop)");
+    }
+    
+    println!("Auto-reconnect: ENABLED (will automatically reconnect if WebSocket disconnects)");
+    println!("Press Ctrl+C at any time to stop monitoring");
+    println!("{:-^100}", "");
+    
+    // This will collect all tokens found during the monitoring session
+    let mut token_data_list = Vec::new();
+    
+    // Reconnection settings
+    let initial_backoff = Duration::from_secs(1);
+    let max_backoff = Duration::from_secs(60);
+    let mut current_backoff = initial_backoff;
+    let backoff_factor = 2.0;
+    let mut consecutive_failures = 0;
+    
+    // Master loop that handles reconnections and monitoring sessions
+    loop {
+        // Initialize the WebSocket - use the authenticated WebSocket URL from chainstack_simple
+        let wss_endpoint = std::env::var("WSS_ENDPOINT")
+            .unwrap_or_else(|_| chainstack_simple::get_authenticated_wss_url());
+        
+        info!("Using WebSocket endpoint: {}", wss_endpoint);
+        
+        // Run the WebSocket test and handle errors
+        match websocket_test::run_websocket_test(&wss_endpoint).await {
+            Ok(partial_list) => {
+                // Success! Reset the backoff since we had a successful connection
+                current_backoff = initial_backoff;
+                consecutive_failures = 0;
+                
+                // Process each token found
+                if !partial_list.is_empty() {
+                    for token in &partial_list {
+                        // Add to our master list
+                        token_data_list.push(token.clone());
+                        
+                        // Process each new token for potential buying
+                        if let Err(e) = process_new_tokens_from_websocket(
+                            &client,
+                            token,
+                            check_min_liquidity,
+                            approved_devs_only,
+                            &snipe_by_tag,
+                            &private_key,
+                            &wallet,
+                            amount,
+                            slippage
+                        ).await {
+                            warn!("Error processing token {}: {}", token.mint, e);
+                        }
+                    }
+                }
+                
+                info!("WebSocket monitoring cycle completed. Total tokens found so far: {}", token_data_list.len());
+                
+                // If we have a non-zero duration, exit after one iteration
+                if duration > 0 {
+                    break;
+                }
+                
+                // Small delay between cycles to prevent overloading the server
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                
+            },
+            Err(e) => {
+                // WebSocket connection failed
+                consecutive_failures += 1;
+                
+                // Log the error
+                error!("WebSocket connection error: {}. Reconnection attempt #{}", e, consecutive_failures);
+                
+                // Calculate the exponential backoff delay
+                if consecutive_failures > 1 {
+                    let backoff_secs = current_backoff.as_secs() * backoff_factor as u64;
+                    current_backoff = std::cmp::min(Duration::from_secs(backoff_secs), max_backoff);
+                }
+                
+                // Log the reconnection attempt
+                info!("Reconnecting to WebSocket in {} seconds...", current_backoff.as_secs());
+                
+                // Wait before reconnecting with exponential backoff
+                tokio::time::sleep(current_backoff).await;
+                
+                // If this is a time-limited session and we've exceeded the duration, exit
+                if duration > 0 {
+                    warn!("Monitoring session terminated due to connection issues");
+                    break;
+                }
+                
+                // Otherwise continue the reconnection loop
+                continue;
+            }
+        }
+    }
+    
+    // Display summary after monitoring completes (only reached if duration > 0 or on program exit)
+    println!("\n{:-^100}", " MONITORING SUMMARY ");
+    println!("Total tokens detected: {}", token_data_list.len());
+    
+    if !token_data_list.is_empty() {
+        println!("\nDetected tokens:");
+        
+        for (i, token) in token_data_list.iter().enumerate() {
+            println!("{}. {} ({}) - Mint: {}", 
+                i+1, token.name, token.symbol, token.mint);
+        }
+    } else {
+        println!("No tokens were detected during the monitoring period.");
+    }
+    
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize environment variables from .env file
@@ -349,6 +508,18 @@ async fn main() -> Result<()> {
         .init();
     
     info!("Starting Pump.fun Sniper Bot...");
+
+    // Check if any arguments were provided
+    let args: Vec<String> = std::env::args().collect();
+    let has_mode_flag = args.iter().any(|arg| arg == "--extract-tokens" || arg == "-e" || arg == "--monitor-websocket" || arg == "-m");
+
+    // If no mode flag was provided and there are arguments (program name counts as one), 
+    // or if args.len() is exactly 1 (just the program name), default to monitor mode
+    if args.len() == 1 || (!has_mode_flag && args.len() > 1) {
+        info!("No mode specified, defaulting to monitor mode");
+        // Run monitor websocket function
+        return monitor_websocket().await;
+    }
     
     // Check if we should extract tokens from WebSocket
     if std::env::args().any(|arg| arg == "--extract-tokens" || arg == "-e") {
@@ -390,97 +561,13 @@ async fn main() -> Result<()> {
     
     // Check if we should monitor for new tokens via WebSocket
     if std::env::args().any(|arg| arg == "--monitor-websocket" || arg == "-m") {
-        info!("Starting WebSocket monitor for new tokens with automatic buying");
-        
-        // Read configuration
-        let check_min_liquidity = std::env::var("CHECK_MIN_LIQUIDITY")
-            .unwrap_or_else(|_| "false".to_string()) == "true";
-        let approved_devs_only = std::env::var("APPROVED_DEVS_ONLY")
-            .unwrap_or_else(|_| "false".to_string()) == "true";
-        let snipe_by_tag = std::env::var("SNIPE_BY_TAG").unwrap_or_else(|_| "".to_string());
-        let private_key = std::env::var("PRIVATE_KEY").context("Missing PRIVATE_KEY in .env")?;
-        let amount = std::env::var("AMOUNT")
-            .unwrap_or_else(|_| "0.1".to_string())
-            .parse::<f64>()
-            .context("Invalid AMOUNT value in .env")?;
-        let slippage = std::env::var("SLIPPAGE")
-            .unwrap_or_else(|_| "10".to_string())
-            .parse::<f64>()
-            .context("Invalid SLIPPAGE value in .env")?;
-        let wallet = std::env::var("WALLET").context("Missing WALLET in .env")?;
-        
-        let duration = std::env::var("MONITOR_DURATION")
-            .map(|v| v.parse::<u64>().unwrap_or(3600))
-            .unwrap_or(3600);
-            
-        // Initialize HTTP client
-        let client = Arc::new(create_optimized_client()?);
-        
-        // Display configuration
-        println!("\n{:-^100}", " PUMP.FUN TOKEN MONITOR ");
-        println!("Mode: {}", if approved_devs_only { "APPROVED DEV (Auto-Buy without Liquidity Check)" } 
-                               else if check_min_liquidity { "STANDARD (Verify Liquidity Before Buy)" }
-                               else { "AGGRESSIVE (Buy Without Liquidity Check)" });
-        println!("Amount: {} SOL", amount);
-        println!("Slippage: {}%", slippage);
-        if !snipe_by_tag.is_empty() {
-            println!("Tag Filter: {}", snipe_by_tag);
-        }
-        println!("Monitor Duration: {} seconds", duration);
-        println!("Press Ctrl+C at any time to stop monitoring");
-        println!("{:-^100}", "");
-        
-        // Initialize the WebSocket - use the authenticated WebSocket URL from chainstack_simple
-        let wss_endpoint = std::env::var("WSS_ENDPOINT")
-            .unwrap_or_else(|_| chainstack_simple::get_authenticated_wss_url());
-        
-        info!("Using WebSocket endpoint: {}", wss_endpoint);
-        
-        // This will collect new tokens
-        let token_data_list = websocket_test::run_websocket_test(&wss_endpoint).await?;
-        
-        // Process each token found
-        if !token_data_list.is_empty() {
-            for token in &token_data_list {
-                // Process each new token for potential buying
-                if let Err(e) = process_new_tokens_from_websocket(
-                    &client,
-                    token,
-                    check_min_liquidity,
-                    approved_devs_only,
-                    &snipe_by_tag,
-                    &private_key,
-                    &wallet,
-                    amount,
-                    slippage
-                ).await {
-                    warn!("Error processing token {}: {}", token.mint, e);
-                }
-            }
-        }
-        
-        // Display summary after monitoring completes
-        println!("\n{:-^100}", " MONITORING SUMMARY ");
-        println!("Total tokens detected: {}", token_data_list.len());
-        
-        if !token_data_list.is_empty() {
-            println!("\nDetected tokens:");
-            
-            for (i, token) in token_data_list.iter().enumerate() {
-                println!("{}. {} ({}) - Mint: {}", 
-                    i+1, token.name, token.symbol, token.mint);
-            }
-        } else {
-            println!("No tokens were detected during the monitoring period.");
-        }
-        
-        return Ok(());
+        return monitor_websocket().await;
     }
     
-    // Default behavior - display help
+    // Default behavior - display help (this will only be reached if --help or -h is provided)
     println!("Pump.fun Sniper Bot - Available Commands:");
     println!("  --extract-tokens, -e : Extract token data from WebSocket messages");
-    println!("  --monitor-websocket, -m : Monitor for new tokens via WebSocket with automatic buying");
+    println!("  --monitor-websocket, -m : Monitor for new tokens via WebSocket with automatic buying (default mode)");
     println!("  --quiet, -q : Only show token creation messages and suppress other logs");
     
     Ok(())

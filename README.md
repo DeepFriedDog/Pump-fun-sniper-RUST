@@ -9,6 +9,7 @@ A high-performance sniper bot for Solana pump.fun tokens, optimized for ultra-fa
 - **Warp Transactions**: Executes trades at lightning speed using optimized transaction settings
 - **Smart Liquidity Calculation**: Uses SolanaAPIs and pump.fun bonding curve formula to accurately determine token liquidity
 - **Advanced Trading Features**: Take profit, stop loss, timeout settings, and multi-position management
+- **Auto-Reconnect**: Automatically maintains WebSocket connections with exponential backoff retry logic
 
 ## Setup Guide
 
@@ -84,8 +85,71 @@ cargo build --release
 Run the bot:
 
 ```bash
-cargo run --release
+# Default command (specifying the binary explicitly)
+cargo run --release --bin pumpfun-sniper
+
+# This is equivalent to:
+cargo run --release --bin pumpfun-sniper -- --monitor-websocket
 ```
+
+For the best experience with minimal logging (showing only token creation events):
+
+```bash
+cargo run --release --bin pumpfun-sniper -- --quiet
+```
+
+By default, the bot will run in monitor-websocket mode, which continuously monitors for new tokens and executes trades based on your configuration.
+
+### Available Commands
+
+The bot supports several command-line arguments:
+
+```bash
+# Run in monitor mode with reduced logging (recommended default)
+cargo run --release --bin pumpfun-sniper -- --monitor-websocket --quiet
+
+# Run in monitor mode (default)
+cargo run --release --bin pumpfun-sniper
+
+# Extract tokens without buying
+cargo run --release --bin pumpfun-sniper -- --extract-tokens
+
+# Run with reduced logging (only show token creation)
+cargo run --release --bin pumpfun-sniper -- --quiet
+```
+
+### Monitoring Duration
+
+By default, the bot will run in indefinite monitoring mode, continuously checking for new tokens until manually stopped with Ctrl+C.
+
+You can set a specific duration using the `MONITOR_DURATION` environment variable:
+
+```bash
+# Run for 10 minutes then exit
+$env:MONITOR_DURATION="600"; cargo run --release --bin pumpfun-sniper
+
+# Run indefinitely (default)
+$env:MONITOR_DURATION="0"; cargo run --release --bin pumpfun-sniper
+```
+
+### Connection Reliability
+
+The bot features automatic WebSocket reconnection to ensure continuous operation:
+
+- If a WebSocket connection is lost, the bot will automatically attempt to reconnect
+- Uses exponential backoff strategy (starts at 1 second, doubles with each failure, up to 60 seconds)
+- Monitors connection health with heartbeat pings every 30 seconds
+- Detects and recovers from stale connections (no messages for 60+ seconds)
+- Resubscribes to token creation events automatically after reconnection
+- Handles various failure scenarios: network errors, server-side closures, timeouts
+
+Technical implementation details:
+- Dedicated reconnection module in `src/websocket_reconnect.rs`
+- Connection health tracking based on message timestamp monitoring
+- Graceful cleanup of dead connections before establishing new ones
+- Automatic ping/pong handling to maintain active connections
+
+No configuration is required for this feature - it works automatically to maintain a stable connection.
 
 ## Understanding the Logs
 

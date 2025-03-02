@@ -2,6 +2,7 @@
 name = "pumpfun-sniper"
 version = "0.1.0"
 edition = "2021"
+default-run = "pumpfun-sniper"
 
 [dependencies]
 tokio = { version = "1.36", features = ["full"] }

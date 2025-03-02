@@ -2,6 +2,7 @@ use anyhow::Result;
 use dotenv::dotenv;
 use log::{error, info};
 use std::env;
+use std::time::Duration;
 
 // Import the websocket modules
 use pumpfun_sniper::websocket_reconnect;
@@ -39,48 +40,39 @@ async fn main() -> Result<()> {
     // Get WebSocket endpoint from environment or use default from chainstack
     let wss_endpoint = env::var("CHAINSTACK_WSS_ENDPOINT")
         .unwrap_or_else(|_| chainstack_simple::get_authenticated_wss_url());
-        
-    // Set max reconnection attempts
-    let max_attempts = env::var("MAX_RECONNECTION_ATTEMPTS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(5);
-        
-    // Set test duration
-    let duration = env::var("MONITOR_DURATION")
+    
+    // Set max idle time for connection health monitoring (in seconds)    
+    let max_idle_seconds = env::var("MAX_IDLE_TIME")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(120);
+        .unwrap_or(60); // Default to 60 seconds
+        
+    let max_idle_time = Duration::from_secs(max_idle_seconds);
+    
+    // Get quiet mode setting
+    let quiet_mode = !debug_websocket;
         
     info!("Using Chainstack WebSocket endpoint: {}", wss_endpoint);
-    info!("Max reconnection attempts: {}", max_attempts);
-    info!("Test duration: {} seconds", duration);
+    info!("Max idle time before reconnection: {} seconds", max_idle_seconds);
     
-    // Run the WebSocket test with reconnection logic
+    // Run the WebSocket with indefinite reconnection logic
     match websocket_reconnect::run_websocket_with_reconnect(
         &wss_endpoint, 
-        Some(max_attempts),
-        Some(duration)
+        quiet_mode,
+        max_idle_time
     ).await {
-        Ok(token_data_list) => {
-            // Display the results
-            if token_data_list.is_empty() {
-                info!("Token extraction complete. No token creation events detected during the test period.");
-            } else {
-                info!("Token extraction complete. Found {} tokens during the session.", token_data_list.len());
-            }
-            
-            // Print a simple completion message
-            println!("Token extraction completed.");
+        Ok(_) => {
+            // This should only happen if the function returns normally (unlikely as it's a loop)
+            info!("WebSocket monitoring completed normally.");
         },
         Err(e) => {
-            error!("Error running WebSocket test: {}", e);
+            error!("Error with WebSocket connection: {}", e);
             
             // Suggest specific troubleshooting options for Chainstack
             println!("\nThe Chainstack WebSocket endpoint might be unavailable. Try these options:");
             println!("1. Check your Chainstack API key in .env file");
             println!("2. Verify your Chainstack subscription is active");
-            println!("3. Try increasing MAX_RECONNECTION_ATTEMPTS (current: {})", max_attempts);
+            println!("3. Try increasing MAX_IDLE_TIME (current: {} seconds)", max_idle_seconds);
             println!("4. Set CHAINSTACK_WSS_ENDPOINT to a different endpoint in your .env file");
         }
     }

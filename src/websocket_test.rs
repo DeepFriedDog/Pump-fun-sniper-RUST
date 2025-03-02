@@ -171,8 +171,36 @@ pub struct TokenData {
 pub async fn run_websocket_test(endpoint: &str) -> Result<Vec<TokenData>, Error> {
     info!("Starting WebSocket test, connecting to: {}", endpoint);
     
-    // Connect to the WebSocket
-    let (mut ws_stream, _) = connect_async(endpoint).await?;
+    // Parse the URL and add query parameters for keep-alive if needed
+    let mut url = Url::parse(endpoint).map_err(|e| anyhow!("Failed to parse WebSocket URL: {}", e))?;
+    
+    // Some WebSocket servers support keep-alive via query parameters
+    if !url.query_pairs().any(|(k, _)| k == "keepalive") {
+        url.query_pairs_mut().append_pair("keepalive", "true");
+    }
+    
+    // Connection retry logic
+    let mut retry_attempts = 0;
+    let max_retries = 3; // Retry connection up to 3 times within this function
+    let retry_delay = Duration::from_secs(2);
+    
+    // Try to establish the WebSocket connection with retries
+    let mut ws_stream = loop {
+        match connect_async(&url).await {
+            Ok((stream, _)) => break stream,
+            Err(e) => {
+                retry_attempts += 1;
+                if retry_attempts >= max_retries {
+                    return Err(anyhow!("Failed to connect to WebSocket after {} attempts: {}", max_retries, e));
+                }
+                
+                warn!("WebSocket connection attempt {} failed: {}. Retrying in {} seconds...", 
+                      retry_attempts, e, retry_delay.as_secs());
+                      
+                tokio::time::sleep(retry_delay).await;
+            }
+        }
+    };
     
     // Pump.fun program ID for token creation
     let pump_program_id = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
@@ -195,7 +223,9 @@ pub async fn run_websocket_test(endpoint: &str) -> Result<Vec<TokenData>, Error>
         info!("Sending subscription request: {}", subscription_request);
     }
     
-    ws_stream.send(Message::Text(subscription_request)).await?;
+    // Send the subscription request
+    ws_stream.send(Message::Text(subscription_request)).await
+        .map_err(|e| anyhow!("Failed to send subscription request: {}", e))?;
     
     info!("WebSocket connection established, waiting for token creation events...");
     
@@ -204,24 +234,45 @@ pub async fn run_websocket_test(endpoint: &str) -> Result<Vec<TokenData>, Error>
     let mut token_creations = 0;
     let start_time = Instant::now();
     
-    // Get the test duration from env or default to 2 minutes
+    // Get the test duration from env or default to 0 (indefinite)
+    // A duration of 0 means run until connection error or max token limit
     let test_duration = std::env::var("MONITOR_DURATION")
-        .unwrap_or_else(|_| "120".to_string())
+        .unwrap_or_else(|_| "0".to_string())
         .parse::<u64>()
-        .unwrap_or(120);
+        .unwrap_or(0);
     
-    let timeout_duration = Duration::from_secs(test_duration);
+    // Default to 2 minutes per cycle if no duration is specified
+    let cycle_duration = if test_duration > 0 { 
+        test_duration 
+    } else { 
+        120 // 2 minute default cycle when running indefinitely
+    };
+    
+    let timeout_duration = Duration::from_secs(cycle_duration);
+    
+    // Max tokens to collect per cycle (to prevent memory issues in indefinite mode)
+    let max_tokens_per_cycle = 100;
+    
+    // Heartbeat/ping interval - every 30 seconds to keep connection alive
+    let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
     
     // Status update interval - every 30 seconds
     let mut status_interval = tokio::time::interval(Duration::from_secs(30));
+    
+    // Last message received time for connection health monitoring
+    let mut last_message_time = Instant::now();
+    let max_idle_time = Duration::from_secs(60); // Consider connection dead after 60s with no messages
     
     // Vector to store token data
     let mut token_data_list = Vec::new();
     
     // Log initial status
     if !quiet_mode {
-        info!("Status: WebSocket test running. Will listen for {} seconds", 
-            test_duration);
+        if test_duration > 0 {
+            info!("Status: WebSocket test running. Will listen for {} seconds", test_duration);
+        } else {
+            info!("Status: WebSocket monitoring running indefinitely or until max token limit");
+        }
     }
           
     // Process messages
@@ -229,85 +280,118 @@ pub async fn run_websocket_test(endpoint: &str) -> Result<Vec<TokenData>, Error>
         tokio::select! {
             // Check for timeout
             _ = tokio::time::sleep(timeout_duration.saturating_sub(start_time.elapsed())) => {
-                info!("Test timeout reached after {} seconds. Exiting...", test_duration);
+                if test_duration > 0 {
+                    info!("Test timeout reached after {} seconds. Exiting...", test_duration);
+                } else {
+                    info!("Monitoring cycle completed. Returning tokens collected so far.");
+                }
                 break;
+            }
+            
+            // Send heartbeat ping
+            _ = ping_interval.tick() => {
+                // Check if connection seems dead (no messages for too long)
+                if last_message_time.elapsed() > max_idle_time {
+                    warn!("WebSocket connection appears to be dead - no messages for {} seconds", 
+                          last_message_time.elapsed().as_secs());
+                    
+                    // Let the main loop handle reconnection
+                    return Err(anyhow!("WebSocket connection timeout - no messages received"));
+                }
+                
+                // Send a ping to keep the connection alive
+                if let Err(e) = ws_stream.send(Message::Ping(vec![1, 2, 3])).await {
+                    warn!("Failed to send ping: {}", e);
+                    // Don't return an error here, just log it - the next message attempt will fail if connection is dead
+                } else if !quiet_mode {
+                    debug!("Sent ping to keep WebSocket connection alive");
+                }
             }
             
             // Status update interval
             _ = status_interval.tick() => {
                 let elapsed = start_time.elapsed();
-                let remaining = timeout_duration.saturating_sub(elapsed);
-                let mins = remaining.as_secs() / 60;
-                let secs = remaining.as_secs() % 60;
                 
-                if !quiet_mode {
-                    info!("Status: Processed {} messages, found {} new tokens. Test ends in {}m{}s", 
-                          message_count, token_creations, mins, secs);
+                if test_duration > 0 {
+                    let remaining = timeout_duration.saturating_sub(elapsed);
+                    let mins = remaining.as_secs() / 60;
+                    let secs = remaining.as_secs() % 60;
+                    
+                    if !quiet_mode {
+                        info!("Status: Processed {} messages, found {} new tokens. Test ends in {}m{}s", 
+                              message_count, token_creations, mins, secs);
+                    }
+                } else {
+                    if !quiet_mode {
+                        info!("Status: Processed {} messages, found {} new tokens. Monitoring indefinitely.", 
+                              message_count, token_creations);
+                    }
                 }
             }
             
             // Process messages
             result = ws_stream.next() => {
                 match result {
-                    Some(Ok(msg)) => {
-                        let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+                    Some(Ok(message)) => {
+                        // Update the last message timestamp whenever we receive any message
+                        last_message_time = Instant::now();
+                        message_count += 1;
                         
-                        match msg {
+                        // Handle different message types
+                        match message {
                             Message::Text(text) => {
-                                message_count += 1;
-                                // Debug level for raw messages to reduce log spam
-                                debug!("[{}] Raw WebSocket message received: {}", timestamp, text);
-                                
-                                // Parse and process message
-                                if let Ok(json_msg) = serde_json::from_str::<serde_json::Value>(&text) {
-                                    if let Some(token_data) = process_websocket_message(&json_msg, &mut token_creations, quiet_mode) {
-                                        // Just collect the token data, don't take any action
+                                // Parse message as JSON
+                                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                                    if let Some(token_data) = process_websocket_message(&json, &mut token_creations, quiet_mode) {
+                                        // Add token data to our list
                                         token_data_list.push(token_data);
+                                        
+                                        // In indefinite mode, if we reach the max tokens per cycle, return early
+                                        if test_duration == 0 && token_data_list.len() >= max_tokens_per_cycle {
+                                            info!("Reached maximum tokens per cycle ({}). Returning batch.", max_tokens_per_cycle);
+                                            break;
+                                        }
                                     }
-                                } else {
-                                    debug!("Failed to parse WebSocket message as JSON");
                                 }
-                            }
+                            },
                             Message::Binary(data) => {
                                 message_count += 1;
-                                debug!("[{}] Binary WebSocket message received: {} bytes", timestamp, data.len());
-                            }
+                                debug!("[{}] Binary WebSocket message received: {} bytes", chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true), data.len());
+                            },
                             Message::Ping(data) => {
                                 // Automatically respond to ping with pong
-                                debug!("[{}] WebSocket ping received", timestamp);
+                                debug!("[{}] WebSocket ping received", chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
                                 if let Err(e) = ws_stream.send(Message::Pong(data)).await {
                                     error!("Failed to send pong response: {}", e);
                                 }
-                            }
+                            },
                             Message::Pong(_) => {
-                                debug!("[{}] WebSocket pong received", timestamp);
-                            }
+                                debug!("[{}] WebSocket pong received", chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+                            },
                             Message::Close(frame) => {
-                                info!("[{}] WebSocket close frame received: {:?}", timestamp, frame);
-                                break;
-                            }
+                                info!("[{}] WebSocket close frame received: {:?}", chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true), frame);
+                                return Err(anyhow!("WebSocket connection closed by server"));
+                            },
                             _ => {
-                                debug!("[{}] Other WebSocket message type received", timestamp);
+                                debug!("[{}] Other WebSocket message type received", chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
                             }
                         }
-                    }
+                    },
                     Some(Err(e)) => {
-                        error!("WebSocket error: {}", e);
-                        break;
-                    }
+                        warn!("WebSocket error: {}", e);
+                        return Err(anyhow!("WebSocket error: {}", e));
+                    },
                     None => {
-                        info!("WebSocket connection closed by server");
-                        break;
+                        info!("WebSocket connection closed");
+                        return Err(anyhow!("WebSocket connection closed unexpectedly"));
                     }
                 }
             }
         }
     }
     
-    // Close connection by sending a close frame
-    if let Err(e) = ws_stream.send(Message::Close(None)).await {
-        warn!("Failed to send close frame: {}", e);
-    }
+    // Try to gracefully close the connection
+    let _ = ws_stream.send(Message::Close(None)).await;
     
     info!("WebSocket test complete. Processed {} messages, found {} new tokens.", 
          message_count, token_creations);
@@ -347,19 +431,6 @@ fn process_websocket_message(message: &serde_json::Value, token_creation_count: 
                                 *token_creation_count += 1;
                                 
                                 if let Some(signature) = value.get("signature").and_then(|v| v.as_str()) {
-                                    // Default values since we don't have full token info yet
-                                    let token_name = "Unknown";
-                                    let mint = signature;
-                                    let liquidity = 0.5;
-                                    let opportunity_status = "⚡";
-                                    
-                                    // Always show token creation messages, regardless of quiet mode
-                                    info!("🪙 NEW TOKEN CREATED! {} (mint: {}) 💰 {:.2} SOL {}", 
-                                        token_name, 
-                                        mint, 
-                                        liquidity, 
-                                        opportunity_status);
-                                    
                                     // Extract and parse program data
                                     let mut program_data_base64 = String::new();
                                     
@@ -386,82 +457,89 @@ fn process_websocket_message(message: &serde_json::Value, token_creation_count: 
                                                             // Set the transaction signature
                                                             token_data.tx_signature = signature.to_string();
                                                             
-                                                            // Create a clone for async liquidity checking
-                                                            let token_data_clone = token_data.clone();
-                                                            
-                                                            // Spawn a task to check liquidity asynchronously
-                                                            tokio::spawn(async move {
-                                                                // Get MIN_LIQUIDITY from environment variable
-                                                                let min_liquidity_str = std::env::var("MIN_LIQUIDITY").unwrap_or_else(|_| "4.0".to_string());
-                                                                let min_liquidity = min_liquidity_str.parse::<f64>().unwrap_or(4.0);
+                                                            // Only proceed with valid tokens
+                                                            // Check if the mint address ends with "pump" which indicates a valid token
+                                                            if token_data.mint.ends_with("pump") || token_data.name != "Unknown" {
+                                                                // Create a clone for async liquidity checking
+                                                                let token_data_clone = token_data.clone();
                                                                 
-                                                                // Use the token_detector function for liquidity check
-                                                                match crate::token_detector::check_token_liquidity(
-                                                                    &token_data_clone.mint,
-                                                                    &token_data_clone.bonding_curve,
-                                                                    min_liquidity
-                                                                ).await {
-                                                                    Ok((has_liquidity, sol_amount)) => {
-                                                                        // Log the token creation with liquidity info
-                                                                        let check_mark = if has_liquidity { "✅" } else { "❌" };
-                                                                        
-                                                                        info!("🪙 NEW TOKEN CREATED! {} (mint: {}) 💰 {:.2} SOL {}", 
-                                                                            token_data_clone.name, 
-                                                                            token_data_clone.mint, 
-                                                                            sol_amount, 
-                                                                            check_mark);
-                                                                    },
-                                                                    Err(e) => {
-                                                                        // Log error and show token with 0 SOL
-                                                                        if !quiet_mode {
-                                                                            info!("Error checking liquidity: {}", e);
+                                                                // Spawn a task to check liquidity asynchronously
+                                                                tokio::spawn(async move {
+                                                                    // Get MIN_LIQUIDITY from environment variable
+                                                                    let min_liquidity_str = std::env::var("MIN_LIQUIDITY").unwrap_or_else(|_| "4.0".to_string());
+                                                                    let min_liquidity = min_liquidity_str.parse::<f64>().unwrap_or(4.0);
+                                                                    
+                                                                    // Use the token_detector function for liquidity check
+                                                                    match crate::token_detector::check_token_liquidity(
+                                                                        &token_data_clone.mint,
+                                                                        &token_data_clone.bonding_curve,
+                                                                        min_liquidity
+                                                                    ).await {
+                                                                        Ok((has_liquidity, sol_amount)) => {
+                                                                            // Log the token creation with liquidity info
+                                                                            let check_mark = if has_liquidity { "✅" } else { "❌" };
+                                                                            
+                                                                            info!("🪙 NEW TOKEN CREATED! {} (mint: {}) 💰 {:.2} SOL {}", 
+                                                                                token_data_clone.name, 
+                                                                                token_data_clone.mint, 
+                                                                                sol_amount, 
+                                                                                check_mark);
+                                                                        },
+                                                                        Err(e) => {
+                                                                            // Log error and show token with 0 SOL
+                                                                            if !quiet_mode {
+                                                                                info!("Error checking liquidity: {}", e);
+                                                                            }
+                                                                            info!("🪙 NEW TOKEN CREATED! {} (mint: {}) 💰 0.00 SOL ❌", 
+                                                                                token_data_clone.name, 
+                                                                                token_data_clone.mint);
                                                                         }
-                                                                        info!("🪙 NEW TOKEN CREATED! {} (mint: {}) 💰 0.00 SOL ❌", 
-                                                                            token_data_clone.name, 
-                                                                            token_data_clone.mint);
                                                                     }
-                                                                }
-                                                            });
-                                                            
-                                                            // Only show detailed logs if not in quiet mode
-                                                            if !quiet_mode {
-                                                                // Display the extracted token details
-                                                                info!("=== NEWLY MINTED TOKEN DETAILS ===");
-                                                                info!("Token Name: {}", token_data.name);
-                                                                info!("Token Symbol: {}", token_data.symbol);
-                                                                info!("Token URI: {}", token_data.uri);
-                                                                info!("Mint Address: {}", token_data.mint);
-                                                                info!("Bonding Curve Address: {}", token_data.bonding_curve);
-                                                                info!("Creator Address: {}", token_data.user);
-                                                            
-                                                                // Calculate associated bonding curve
-                                                                if let Ok(mint_pubkey) = Pubkey::from_str(&token_data.mint) {
-                                                                    if let Ok(bonding_curve_pubkey) = Pubkey::from_str(&token_data.bonding_curve) {
-                                                                        let associated_bonding_curve = find_associated_bonding_curve(&mint_pubkey, &bonding_curve_pubkey);
-                                                                        info!("Associated Bonding Curve: {}", associated_bonding_curve);
+                                                                });
+                                                                
+                                                                // Only show detailed logs if not in quiet mode
+                                                                if !quiet_mode {
+                                                                    // Display the extracted token details
+                                                                    info!("=== NEWLY MINTED TOKEN DETAILS ===");
+                                                                    info!("Token Name: {}", token_data.name);
+                                                                    info!("Token Symbol: {}", token_data.symbol);
+                                                                    info!("Token URI: {}", token_data.uri);
+                                                                    info!("Mint Address: {}", token_data.mint);
+                                                                    info!("Bonding Curve Address: {}", token_data.bonding_curve);
+                                                                    info!("Creator Address: {}", token_data.user);
+                                                                
+                                                                    // Calculate associated bonding curve
+                                                                    if let Ok(mint_pubkey) = Pubkey::from_str(&token_data.mint) {
+                                                                        if let Ok(bonding_curve_pubkey) = Pubkey::from_str(&token_data.bonding_curve) {
+                                                                            let associated_bonding_curve = find_associated_bonding_curve(&mint_pubkey, &bonding_curve_pubkey);
+                                                                            info!("Associated Bonding Curve: {}", associated_bonding_curve);
+                                                                        }
                                                                     }
+                                                                
+                                                                    info!("Transaction Signature: {}", signature);
+                                                                
+                                                                    // Print a separator for readability
+                                                                    info!("==================================================================");
                                                                 }
-                                                            
-                                                                info!("Transaction Signature: {}", signature);
-                                                            
-                                                                // Print a separator for readability
-                                                                info!("==================================================================");
+                                                                
+                                                                return Some(token_data);
+                                                            } else if !quiet_mode {
+                                                                debug!("Filtered out invalid token with mint: {}", token_data.mint);
                                                             }
-                                                            
-                                                            return Some(token_data);
                                                         } else {
-                                                            warn!("Failed to parse token data from decoded program data");
+                                                            if !quiet_mode {
+                                                                debug!("Failed to parse token data from decoded program data");
+                                                            }
                                                         }
                                                     } else {
-                                                        warn!("Failed to decode base64 program data");
+                                                        if !quiet_mode {
+                                                            debug!("Failed to decode base64 program data");
+                                                        }
                                                     }
                                                 }
                                             }
                                         }
                                     }
-                                    
-                                    // Print a separator for readability
-                                    info!("==================================================================");
                                 }
                             }
                         }

@@ -349,6 +349,12 @@ async fn process_message(text: &str, queue: Arc<Mutex<std::collections::VecDeque
                                         
                                         // Parse the instruction
                                         if let Some(token_data) = parse_create_instruction(&decoded_data) {
+                                            // Filter out invalid tokens
+                                            if !token_data.mint.ends_with("pump") && token_data.name == "Unknown" {
+                                                debug!("Filtered out invalid token with mint: {}", token_data.mint);
+                                                continue;
+                                            }
+                                            
                                             // Save mint and bonding curve before token_data is moved or cloned
                                             let mint_str = token_data.mint.clone();
                                             let bonding_curve_str = token_data.bonding_curve.clone();
@@ -427,7 +433,7 @@ async fn process_message(text: &str, queue: Arc<Mutex<std::collections::VecDeque
                                         }
                                     }
                                     Err(e) => {
-                                        warn!("Failed to decode base64 data: {}", e);
+                                        debug!("Failed to decode base64 data: {}", e);
                                         debug!("Raw encoded data: {}", encoded_data);
                                         
                                         // Try with fallback to bs58 decoding (some chains use this)
@@ -435,6 +441,12 @@ async fn process_message(text: &str, queue: Arc<Mutex<std::collections::VecDeque
                                             Ok(decoded_bs58) => {
                                                 debug!("Decoded using bs58 instead ({} bytes)", decoded_bs58.len());
                                                 if let Some(token_data) = parse_create_instruction(&decoded_bs58) {
+                                                    // Filter out invalid tokens
+                                                    if !token_data.mint.ends_with("pump") && token_data.name == "Unknown" {
+                                                        debug!("Filtered out invalid token with mint: {}", token_data.mint);
+                                                        continue;
+                                                    }
+                                                    
                                                     // Save mint and bonding curve before token_data is moved or cloned
                                                     let mint_str = token_data.mint.clone();
                                                     let bonding_curve_str = token_data.bonding_curve.clone();
@@ -513,7 +525,7 @@ async fn process_message(text: &str, queue: Arc<Mutex<std::collections::VecDeque
                                                 }
                                             }
                                             Err(_) => {
-                                                warn!("Failed to decode with bs58 as well");
+                                                debug!("Failed to decode with bs58 as well");
                                             }
                                         }
                                     }
