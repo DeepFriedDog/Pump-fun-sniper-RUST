@@ -268,9 +268,6 @@ async fn process_message(
                         if logs_array.iter().any(|log| {
                             log.as_str().map_or(false, |s| s.contains("Program log: Instruction: Create"))
                         }) {
-                            let now = chrono::Utc::now();
-                            info!("⚡ INSTANT DETECTION: Token creation detected in tx: {} at {}", signature, now);
-                            
                             // Parse program data from logs
                             for log in logs_array {
                                 if let Some(log_str) = log.as_str() {
