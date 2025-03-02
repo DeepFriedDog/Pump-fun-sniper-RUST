@@ -1,6 +1,6 @@
 use anyhow::Result;
 use dotenv::dotenv;
-use log::{error, info, LevelFilter};
+use log::{error, info};
 use std::env;
 
 // Import the websocket modules
@@ -12,13 +12,29 @@ async fn main() -> Result<()> {
     // Initialize environment variables from .env file
     dotenv().ok();
     
-    // Initialize logging
-    env_logger::Builder::new()
-        .filter_level(LevelFilter::Info)
-        .format_timestamp_millis()
+    // Check if DEBUG_WEBSOCKET_MESSAGES is set to true
+    let debug_websocket = env::var("DEBUG_WEBSOCKET_MESSAGES")
+        .unwrap_or_else(|_| "false".to_string())
+        .to_lowercase() == "true";
+    
+    // Set appropriate log level based on DEBUG_WEBSOCKET_MESSAGES
+    let log_level = if debug_websocket {
+        "debug" // Use debug level if DEBUG_WEBSOCKET_MESSAGES=true
+    } else {
+        "info"  // Otherwise use info level to hide raw messages
+    };
+    
+    // Initialize logger with the appropriate level
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level))
+        .format_timestamp(Some(env_logger::TimestampPrecision::Millis))
+        .format_module_path(false)
         .init();
     
     info!("Starting token extraction...");
+    
+    if debug_websocket {
+        info!("Debug mode enabled: Will show raw WebSocket messages");
+    }
     
     // Get WebSocket endpoint from environment or use default from chainstack
     let wss_endpoint = env::var("CHAINSTACK_WSS_ENDPOINT")

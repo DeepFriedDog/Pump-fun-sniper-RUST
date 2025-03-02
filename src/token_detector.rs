@@ -523,21 +523,66 @@ pub async fn check_token_liquidity(
         solana_sdk::commitment_config::CommitmentConfig::processed()
     );
     
-    // Convert addresses to public keys
+    // The rent exempt minimum amount in SOL
+    const RENT_EXEMPT_MINIMUM: f64 = 0.00203928;
+    
+    // Convert mint address to public key
     let mint_pubkey = Pubkey::from_str(mint)?;
-    let bonding_curve_pubkey = Pubkey::from_str(bonding_curve)?;
+    
+    // IMPROVEMENT: First try to directly get the primary bonding curve address
+    let (primary_bonding_curve, _) = get_bonding_curve_address(&mint_pubkey);
+    debug!("Checking primary bonding curve: {}", primary_bonding_curve);
+    
+    // Check the primary bonding curve first (it's the one that matters most)
+    match client.get_account(&primary_bonding_curve) {
+        Ok(account) => {
+            // Get total balance
+            let total_balance = account.lamports as f64 / 1_000_000_000.0; // Convert lamports to SOL
+            
+            // Subtract rent exempt minimum to get actual liquidity
+            let actual_liquidity = (total_balance - RENT_EXEMPT_MINIMUM).max(0.0);
+            
+            debug!("Primary bonding curve has {} SOL (after subtracting {} SOL rent)",
+                   actual_liquidity, RENT_EXEMPT_MINIMUM);
+            
+            return Ok((actual_liquidity >= liquidity_threshold, actual_liquidity));
+        },
+        Err(_) => {
+            debug!("Primary bonding curve not found, checking alternative method...");
+        }
+    }
+
+    // If we get here, we need to try the old method as a fallback
+    
+    // Convert bonding curve to public key
+    let bonding_curve_pubkey = match Pubkey::from_str(bonding_curve) {
+        Ok(pubkey) => pubkey,
+        Err(e) => {
+            debug!("Error parsing bonding curve pubkey: {}", e);
+            // Return 0.0 SOL if we can't parse the bonding curve
+            return Ok((false, 0.0));
+        }
+    };
     
     // Calculate the associated bonding curve address
     let associated_bonding_curve = find_associated_bonding_curve(&mint_pubkey, &bonding_curve_pubkey);
     
     // Get account info to check liquidity
+    debug!("Checking associated account {} for liquidity (threshold: {} SOL)", associated_bonding_curve, liquidity_threshold);
     match client.get_account(&associated_bonding_curve) {
         Ok(account) => {
             let balance = account.lamports as f64 / 1_000_000_000.0; // Convert lamports to SOL
+            debug!("Found account with {} SOL ({} lamports)", balance, account.lamports);
             Ok((balance >= liquidity_threshold, balance))
         },
         Err(e) => {
-            Err(format!("Failed to get account info: {}", e).into())
+            debug!("Error retrieving associated account {}: {}", associated_bonding_curve, e);
+            
+            // We already tried the primary bonding curve above, so this is a real error
+            debug!("No valid bonding curve account found");
+            
+            // Return the original error
+            Err(format!("Failed to get account info for associated bonding curve: {}", e).into())
         }
     }
 }

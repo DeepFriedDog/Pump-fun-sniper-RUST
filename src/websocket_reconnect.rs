@@ -21,10 +21,7 @@ use crate::websocket_test::TokenData;
 
 // Lazy-initialized HTTP client for RPC calls
 lazy_static::lazy_static! {
-    static ref HTTP_CLIENT: Client = Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .expect("Failed to create HTTP client");
+    static ref HTTP_CLIENT: Client = Client::new();
 }
 
 /// Run WebSocket connection with automatic reconnection
@@ -272,49 +269,56 @@ async fn process_message(
                             for log in logs_array {
                                 if let Some(log_str) = log.as_str() {
                                     if log_str.contains("Program data:") {
-                                        let parts: Vec<&str> = log_str.split(": ").collect();
+                                        let parts: Vec<&str> = log_str.split("Program data: ").collect();
                                         if parts.len() > 1 {
-                                            // The data will be base64 encoded in the logs
-                                            if let Ok(data) = STANDARD.decode(parts[1]) {
-                                                // Parse the instruction data
+                                            let data_base64 = parts[1];
+                                            if let Ok(data) = base64::engine::general_purpose::STANDARD.decode(data_base64) {
                                                 if let Some(mut token_data) = crate::websocket_test::parse_instruction(&data) {
-                                                    // Set the transaction signature
+                                                    // Set the transaction signature for the token data
                                                     token_data.tx_signature = signature.clone();
                                                     
                                                     // Create a clone for async processing
                                                     let token_data_clone = token_data.clone();
                                                     
-                                                    // Create TokenData for our result immediately
-                                                    let token_data_result = TokenData {
-                                                        name: token_data.name.clone(),
-                                                        symbol: token_data.symbol.clone(),
-                                                        uri: token_data.uri.clone(),
-                                                        mint: token_data.mint.clone(),
-                                                        bonding_curve: token_data.bonding_curve.clone(),
-                                                        user: token_data.user.clone(),
-                                                        tx_signature: token_data.tx_signature.clone(),
-                                                    };
-                                                    
-                                                    // Spawn a task to check liquidity asynchronously without blocking detection
+                                                    // Spawn a task to check liquidity asynchronously
                                                     tokio::spawn(async move {
-                                                        // Check token liquidity
-                                                        let (has_liquidity, sol_amount) = match token_detector::check_token_liquidity(
+                                                        // Get MIN_LIQUIDITY from environment variable
+                                                        let min_liquidity_str = std::env::var("MIN_LIQUIDITY").unwrap_or_else(|_| "4.0".to_string());
+                                                        let min_liquidity = min_liquidity_str.parse::<f64>().unwrap_or(4.0);
+                                                        
+                                                        debug!("Checking liquidity for token: {} (mint: {})", token_data_clone.name, token_data_clone.mint);
+                                                        debug!("Using bonding curve: {}", token_data_clone.bonding_curve);
+                                                        debug!("Minimum liquidity threshold: {} SOL", min_liquidity);
+                                                        
+                                                        let liquidity_start = std::time::Instant::now();
+                                                        
+                                                        // Use the original token_detector function which is known to work
+                                                        match token_detector::check_token_liquidity(
                                                             &token_data_clone.mint,
                                                             &token_data_clone.bonding_curve,
-                                                            0.0
+                                                            min_liquidity // Use the environment variable instead of hardcoded value
                                                         ).await {
-                                                            Ok((has_liq, amount)) => (has_liq, amount),
-                                                            Err(_) => (false, 0.0),
-                                                        };
-                                                        
-                                                        // Log in the desired format
-                                                        let check_mark = if has_liquidity { "✅" } else { "❌" };
-                                                        info!("🪙 NEW TOKEN CREATED! {} (mint: {}) 💰 {:.2} SOL {}", 
-                                                             token_data_clone.name, token_data_clone.mint, sol_amount, check_mark);
+                                                            Ok((has_liquidity, sol_amount)) => {
+                                                                // Log the token creation with liquidity info
+                                                                let check_mark = if has_liquidity { "✅" } else { "❌" };
+                                                                let elapsed = liquidity_start.elapsed();
+                                                                
+                                                                debug!("Liquidity check completed in {:.2}ms: {} SOL (required: {} SOL)", 
+                                                                    elapsed.as_millis(), sol_amount, min_liquidity);
+                                                                
+                                                                info!("🪙 NEW TOKEN CREATED! {} (mint: {}) 💰 {:.2} SOL {}", 
+                                                                    token_data_clone.name, token_data_clone.mint, sol_amount, check_mark);
+                                                            },
+                                                            Err(e) => {
+                                                                // Log error and show token with 0 SOL
+                                                                debug!("Error checking liquidity: {}", e);
+                                                                info!("🪙 NEW TOKEN CREATED! {} (mint: {}) 💰 0.00 SOL ❌", 
+                                                                    token_data_clone.name, token_data_clone.mint);
+                                                            }
+                                                        }
                                                     });
                                                     
                                                     *token_creations += 1;
-                                                    return Some(token_data_result);
                                                 }
                                             }
                                         }
@@ -329,4 +333,119 @@ async fn process_message(
     }
     
     None
+}
+
+/// Fast liquidity check using direct getBalance with processed commitment
+async fn fast_check_liquidity(mint: &str, bonding_curve: &str, liquidity_threshold: f64) -> (bool, f64) {
+    debug!("Starting fast_check_liquidity for mint: {}, bonding_curve: {}", mint, bonding_curve);
+    
+    // Try to convert addresses to public keys
+    let mint_pubkey = match Pubkey::from_str(mint) {
+        Ok(pk) => pk,
+        Err(e) => {
+            debug!("Error parsing mint address: {}", e);
+            return (false, 0.0);
+        }
+    };
+    
+    let bonding_curve_pubkey = match Pubkey::from_str(bonding_curve) {
+        Ok(pk) => pk,
+        Err(e) => {
+            debug!("Error parsing bonding curve address: {}", e);
+            return (false, 0.0);
+        }
+    };
+    
+    // Calculate the associated bonding curve address
+    let associated_bonding_curve = match find_associated_bonding_curve(&mint_pubkey, &bonding_curve_pubkey) {
+        Ok(addr) => {
+            debug!("Derived associated bonding curve address: {}", addr);
+            addr
+        },
+        Err(e) => {
+            debug!("Error finding associated bonding curve: {}", e);
+            return (false, 0.0);
+        }
+    };
+    
+    // Get Chainstack endpoint
+    let rpc_url = std::env::var("CHAINSTACK_ENDPOINT")
+        .unwrap_or_else(|_| "https://solana-mainnet.core.chainstack.com/b04d312222d7be6eefd6b31d84a303ab".to_string());
+    
+    // Prepare direct getBalance request with processed commitment
+    let request_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getBalance",
+        "params": [
+            associated_bonding_curve.to_string(),
+            {"commitment": "processed"}
+        ]
+    });
+    
+    debug!("Sending getBalance request to {}: {}", rpc_url, request_body);
+    
+    // Make direct HTTP request
+    match HTTP_CLIENT.post(&rpc_url)
+        .header("Content-Type", "application/json")
+        .json(&request_body)
+        .send()
+        .await {
+            Ok(response) => {
+                let status = response.status();
+                debug!("Got HTTP response with status: {}", status);
+                
+                match response.text().await {
+                    Ok(text) => {
+                        debug!("Response text: {}", text);
+                        match serde_json::from_str::<serde_json::Value>(&text) {
+                            Ok(json) => {
+                                debug!("Parsed JSON response: {}", json);
+                                
+                                // The correct path for getBalance response is result.value
+                                if let Some(result) = json.get("result") {
+                                    if let Some(value) = result.as_u64() {
+                                        let sol_amount = value as f64 / 1_000_000_000.0;
+                                        debug!("Extracted SOL amount: {} (from lamports: {})", sol_amount, value);
+                                        return (sol_amount >= liquidity_threshold, sol_amount);
+                                    } else {
+                                        debug!("Couldn't extract lamports as u64 from result: {:?}", result);
+                                    }
+                                } else {
+                                    debug!("No 'result' field in response: {:?}", json);
+                                    
+                                    // Check for error in response
+                                    if let Some(error) = json.get("error") {
+                                        debug!("Error in response: {:?}", error);
+                                    }
+                                }
+                            },
+                            Err(e) => debug!("Error parsing JSON response: {}", e),
+                        }
+                    },
+                    Err(e) => debug!("Error getting response text: {}", e),
+                }
+                
+                debug!("Defaulting to 0.0 SOL due to response parsing issues");
+                (false, 0.0)
+            },
+            Err(e) => {
+                debug!("Error making HTTP request: {}", e);
+                (false, 0.0)
+            },
+        }
+}
+
+/// Finds the associated bonding curve for a given mint and bonding curve
+fn find_associated_bonding_curve(mint: &Pubkey, bonding_curve: &Pubkey) -> Result<Pubkey, Box<dyn std::error::Error>> {
+    use crate::config::{ATA_PROGRAM_ID, TOKEN_PROGRAM_ID};
+    
+    let seeds = &[
+        bonding_curve.as_ref(),
+        TOKEN_PROGRAM_ID.as_ref(),
+        mint.as_ref(),
+    ];
+    
+    let (derived_address, _) = Pubkey::find_program_address(seeds, &ATA_PROGRAM_ID);
+    Ok(derived_address)
 } 
