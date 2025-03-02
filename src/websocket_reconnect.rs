@@ -4,7 +4,7 @@ use futures_util::{SinkExt, StreamExt};
 use log::{debug, error, info, warn};
 use rand::Rng;
 use serde_json::{json, Value};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::time::sleep;
 use tokio_tungstenite::{
     connect_async,
@@ -13,9 +13,19 @@ use tokio_tungstenite::{
 use url::Url;
 use std::str::FromStr;
 use solana_program::pubkey::Pubkey;
+use reqwest::Client;
 
+use crate::token_detector::{self, DetectorTokenData};
+use crate::websocket_test;
 use crate::websocket_test::TokenData;
-use crate::token_detector;
+
+// Lazy-initialized HTTP client for RPC calls
+lazy_static::lazy_static! {
+    static ref HTTP_CLIENT: Client = Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("Failed to create HTTP client");
+}
 
 /// Run WebSocket connection with automatic reconnection
 pub async fn run_websocket_with_reconnect(
@@ -126,17 +136,21 @@ async fn run_websocket_session(
 ) -> Result<()> {
     info!("Connecting to Chainstack WebSocket: {}", endpoint);
     
-    // Parse URL and connect
+    // Parse URL and connect with optimized settings
     let url = Url::parse(endpoint)?;
+    
+    // Use connect_async with lower buffer sizes for faster processing
     let (mut ws_stream, _) = connect_async(url).await?;
     
-    info!("WebSocket connection established");
-    
+    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+    info!("WebSocket connection established at timestamp: {}", timestamp);
+
     // Pump.fun program ID for token creation
     let pump_program_id = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
     
-    // Set to "processed" commitment for faster detection
+    // Use a simple subscription request like in the Python script
     let subscription_request = json!({
+        "client_request_time_ms": timestamp,
         "id": 1,
         "jsonrpc": "2.0",
         "method": "logsSubscribe",
@@ -144,11 +158,11 @@ async fn run_websocket_session(
             {"mentions": [pump_program_id]},
             {"commitment": "processed"}
         ]
-    }).to_string();
+    });
     
-    // Send subscription request
+    // Send subscription request with debug info
     info!("Sending subscription request: {}", subscription_request);
-    ws_stream.send(Message::Text(subscription_request)).await?;
+    ws_stream.send(Message::Text(subscription_request.to_string())).await?;
     
     // Setup status updates every 30 seconds
     let mut status_interval = tokio::time::interval(Duration::from_secs(30));
@@ -182,29 +196,26 @@ async fn run_websocket_session(
             result = ws_stream.next() => {
                 match result {
                     Some(Ok(msg)) => {
-                        let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-                        
                         match msg {
                             Message::Text(text) => {
                                 *message_count += 1;
-                                debug!("[{}] Raw WebSocket message: {}", timestamp, text);
+                                debug!("Raw WebSocket message received: {}", text);
                                 
                                 // Parse and process message
                                 if let Ok(json_msg) = serde_json::from_str::<Value>(&text) {
-                                    // Use the public functions from websocket_test
                                     if let Some(result) = process_message(&json_msg, token_creations).await {
                                         token_data_list.push(result);
                                     }
                                 }
                             }
                             Message::Ping(data) => {
-                                debug!("[{}] WebSocket ping received", timestamp);
+                                debug!("WebSocket ping received");
                                 if let Err(e) = ws_stream.send(Message::Pong(data)).await {
                                     error!("Failed to send pong: {}", e);
                                 }
                             }
                             Message::Close(frame) => {
-                                info!("[{}] WebSocket close frame received: {:?}", timestamp, frame);
+                                info!("WebSocket close frame received: {:?}", frame);
                                 break;
                             }
                             _ => {}
@@ -227,8 +238,11 @@ async fn run_websocket_session(
     Ok(())
 }
 
-// Custom message processing function (copied logic from websocket_test.rs)
-async fn process_message(message: &serde_json::Value, token_creations: &mut usize) -> Option<TokenData> {
+// Process message and directly parse logs without making additional RPC calls
+async fn process_message(
+    message: &serde_json::Value, 
+    token_creations: &mut usize
+) -> Option<TokenData> {
     // Check if this is a subscription confirmation
     if let Some(id) = message.get("id").and_then(|v| v.as_i64()) {
         info!("WebSocket subscription confirmed with id: {}", id);
@@ -241,73 +255,69 @@ async fn process_message(message: &serde_json::Value, token_creations: &mut usiz
             if let Some(params) = message.get("params") {
                 if let Some(result) = params.get("result") {
                     if let Some(value) = result.get("value") {
-                        // Record timestamp immediately upon receiving the message
-                        let received_at = chrono::Utc::now();
+                        let signature_str = value.get("signature").and_then(|v| v.as_str()).unwrap_or("unknown");
+                        let signature = signature_str.to_string();
                         
-                        // Extract signature and log exact detection time
-                        if let Some(signature) = value.get("signature").and_then(|v| v.as_str()) {
-                            debug!("Received transaction at: {} - Signature: {}", 
-                                   received_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true), signature);
-                        }
+                        // Clone the logs array to create a longer-lived value
+                        let logs_array = value.get("logs").and_then(|v| v.as_array()).cloned().unwrap_or_default();
                         
-                        // Extract log data
-                        if let Some(logs) = value.get("logs").and_then(|v| v.as_array()) {
-                            // ONLY check for "Create" instruction in logs
-                            let contains_create = logs.iter()
-                                .any(|log| log.as_str()
-                                    .map_or(false, |s| s.contains("Program log: Instruction: Create")));
+                        // Get slot info for timing comparison
+                        let slot = value.get("slot").and_then(|v| v.as_u64()).unwrap_or(0);
+                        
+                        // Check if this is a token creation instruction
+                        if logs_array.iter().any(|log| {
+                            log.as_str().map_or(false, |s| s.contains("Program log: Instruction: Create"))
+                        }) {
+                            let now = chrono::Utc::now();
+                            info!("⚡ INSTANT DETECTION: Token creation detected in tx: {} at {}", signature, now);
                             
-                            if contains_create {
-                                // Found a token creation event!
-                                *token_creations += 1;
-                                
-                                if let Some(signature) = value.get("signature").and_then(|v| v.as_str()) {
-                                    debug!("🪙 NEW TOKEN CREATED! Transaction signature: {}", signature);
-                                    
-                                    // Extract program data from logs and pass to parse_instruction in websocket_test
-                                    for log in logs {
-                                        if let Some(log_str) = log.as_str() {
-                                            if log_str.contains("Program data:") {
-                                                if let Some(data_part) = log_str.strip_prefix("Program data: ") {
-                                                    // Decode and process the data
-                                                    if let Ok(decoded_data) = STANDARD.decode(data_part) {
-                                                        // Try to use our token parser
-                                                        if let Some(mut token_data) = crate::websocket_test::parse_instruction(&decoded_data) {
-                                                            // Set the signature
-                                                            token_data.tx_signature = signature.to_string();
-                                                            
-                                                            // Get liquidity data if available
-                                                            // Read MIN_LIQUIDITY from environment or use default
-                                                            let min_liquidity = std::env::var("MIN_LIQUIDITY")
-                                                                .ok()
-                                                                .and_then(|v| v.parse::<f64>().ok())
-                                                                .unwrap_or(0.5); // Default if env var is missing
-                                                            
-                                                            let (is_valid, liquidity) = match crate::token_detector::check_token_primary_liquidity(
-                                                                &token_data.mint,
-                                                                min_liquidity
-                                                            ).await {
-                                                                Ok((valid, liq)) => (valid, liq),
-                                                                Err(e) => {
-                                                                    // If we can't check liquidity, token is not valid
-                                                                    warn!("Failed to get liquidity for {}: {}. Error: {}", 
-                                                                           token_data.name, token_data.mint, e);
-                                                                    (false, 0.0)
-                                                                }
-                                                            };
-                                                            
-                                                            let status_indicator = if is_valid { "✅" } else { "❌" };
-                                                            
-                                                            // Log the new token with the standardized format
-                                                            info!("🪙 NEW TOKEN CREATED! {} (mint: {}) 💰 {:.2} SOL {}", 
-                                                                  token_data.name, 
-                                                                  token_data.mint, 
-                                                                  liquidity, 
-                                                                  status_indicator);
-                                                            
-                                                            return Some(token_data);
-                                                        }
-                                                    }
+                            // Parse program data from logs
+                            for log in logs_array {
+                                if let Some(log_str) = log.as_str() {
+                                    if log_str.contains("Program data:") {
+                                        let parts: Vec<&str> = log_str.split(": ").collect();
+                                        if parts.len() > 1 {
+                                            // The data will be base64 encoded in the logs
+                                            if let Ok(data) = STANDARD.decode(parts[1]) {
+                                                // Parse the instruction data
+                                                if let Some(mut token_data) = crate::websocket_test::parse_instruction(&data) {
+                                                    // Set the transaction signature
+                                                    token_data.tx_signature = signature.clone();
+                                                    
+                                                    // Create a clone for async processing
+                                                    let token_data_clone = token_data.clone();
+                                                    
+                                                    // Create TokenData for our result immediately
+                                                    let token_data_result = TokenData {
+                                                        name: token_data.name.clone(),
+                                                        symbol: token_data.symbol.clone(),
+                                                        uri: token_data.uri.clone(),
+                                                        mint: token_data.mint.clone(),
+                                                        bonding_curve: token_data.bonding_curve.clone(),
+                                                        user: token_data.user.clone(),
+                                                        tx_signature: token_data.tx_signature.clone(),
+                                                    };
+                                                    
+                                                    // Spawn a task to check liquidity asynchronously without blocking detection
+                                                    tokio::spawn(async move {
+                                                        // Check token liquidity
+                                                        let (has_liquidity, sol_amount) = match token_detector::check_token_liquidity(
+                                                            &token_data_clone.mint,
+                                                            &token_data_clone.bonding_curve,
+                                                            0.0
+                                                        ).await {
+                                                            Ok((has_liq, amount)) => (has_liq, amount),
+                                                            Err(_) => (false, 0.0),
+                                                        };
+                                                        
+                                                        // Log in the desired format
+                                                        let check_mark = if has_liquidity { "✅" } else { "❌" };
+                                                        info!("🪙 NEW TOKEN CREATED! {} (mint: {}) 💰 {:.2} SOL {}", 
+                                                             token_data_clone.name, token_data_clone.mint, sol_amount, check_mark);
+                                                    });
+                                                    
+                                                    *token_creations += 1;
+                                                    return Some(token_data_result);
                                                 }
                                             }
                                         }

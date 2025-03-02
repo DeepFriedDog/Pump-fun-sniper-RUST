@@ -155,7 +155,7 @@ pub async fn get_token_balance(client: &Client, wallet: &str, mint: &str) -> Res
     let params = json!([
         wallet,
         mint,
-        { "commitment": "confirmed" }
+        { "commitment": "processed" }
     ]);
     
     let result = make_jsonrpc_call(client, "getTokenAccountBalance", params).await?;
@@ -209,7 +209,7 @@ pub async fn get_token_price(client: &Client, mint: &str) -> Result<f64> {
     // If not in cache or expired, fetch from RPC with optimized parameters
     let params = json!([
         mint, 
-        { "commitment": "confirmed" } // Keep only necessary parameters
+        { "commitment": "processed" } // Keep only necessary parameters
     ]);
     
     let _result = make_jsonrpc_call(client, "getTokenSupply", params).await?;
@@ -959,7 +959,7 @@ pub async fn sell_token(
 pub async fn get_block(client: &Client, slot: u64) -> Result<Value> {
     let params = json!([
         slot,
-        { "encoding": "json", "commitment": "confirmed" }
+        { "encoding": "json", "commitment": "processed" }
     ]);
     
     make_jsonrpc_call(client, "getBlock", params).await
@@ -972,7 +972,7 @@ pub async fn get_blocks(client: &Client, start_slot: u64, end_slot: Option<u64>)
     let params = json!([
         start_slot,
         end,
-        { "commitment": "confirmed" }
+        { "commitment": "processed" }
     ]);
     
     let result = make_jsonrpc_call(client, "getBlocks", params).await?;
@@ -1376,6 +1376,6 @@ mod tests {
 pub fn create_solana_client(rpc_url: &str) -> solana_client::rpc_client::RpcClient {
     use solana_client::rpc_client::RpcClient;
     
-    // Create client with default commitment config
-    RpcClient::new(rpc_url.to_string())
+    // Create client with processed commitment config for faster token detection
+    RpcClient::new_with_commitment(rpc_url.to_string(), CommitmentConfig::processed())
 } 

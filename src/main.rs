@@ -13,7 +13,7 @@ mod chainstack_simple;
 mod websocket_reconnect;
 
 // Standard library imports
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -359,7 +359,7 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|_| chainstack_simple::get_authenticated_wss_url());
             
         info!("Using WebSocket endpoint: {}", wss_endpoint);
-        
+
         // Run the WebSocket test to collect token data
         let token_data_list = websocket_test::run_websocket_test(&wss_endpoint).await?;
         

@@ -44,7 +44,7 @@ pub fn find_associated_bonding_curve(mint: &Pubkey, bonding_curve: &Pubkey) -> P
 }
 
 /// Parses the create instruction data
-fn parse_create_instruction(data: &[u8]) -> Option<DetectorTokenData> {
+pub fn parse_create_instruction(data: &[u8]) -> Option<DetectorTokenData> {
     if data.len() < 8 {
         debug!("Data too short to be a valid instruction: {} bytes", data.len());
         return None;
