@@ -62,9 +62,31 @@ pub fn get_authenticated_wss_url() -> String {
 /// Create a Solana RPC client using the given RPC URL
 pub fn create_solana_client(rpc_url: &str) -> solana_client::rpc_client::RpcClient {
     use solana_client::rpc_client::RpcClient;
+    use solana_sdk::commitment_config::CommitmentConfig;
     
-    // Create client with default commitment config
-    RpcClient::new(rpc_url.to_string())
+    // Get a valid Chainstack endpoint URL with proper schema
+    let endpoint = if !rpc_url.is_empty() && rpc_url != "default" {
+        // Use provided URL if it exists
+        let url = if !rpc_url.starts_with("http") {
+            format!("https://{}", rpc_url)
+        } else {
+            rpc_url.to_string()
+        };
+        url
+    } else {
+        // Otherwise get from env or use default
+        let env_url = std::env::var("CHAINSTACK_ENDPOINT")
+            .unwrap_or_else(|_| "https://solana-mainnet.core.chainstack.com/b04d312222d7be6eefd6b31d84a303ab".to_string());
+            
+        if !env_url.starts_with("http") {
+            format!("https://{}", env_url)
+        } else {
+            env_url
+        }
+    };
+    
+    // Create client with "processed" commitment config for fastest response
+    RpcClient::new_with_commitment(endpoint, CommitmentConfig::processed())
 }
 
 /// Calculate the associated bonding curve address

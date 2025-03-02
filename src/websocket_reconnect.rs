@@ -228,7 +228,7 @@ async fn run_websocket_session(
 }
 
 // Custom message processing function (copied logic from websocket_test.rs)
-async fn process_message(message: &serde_json::Value, token_creation_count: &mut usize) -> Option<TokenData> {
+async fn process_message(message: &serde_json::Value, token_creations: &mut usize) -> Option<TokenData> {
     // Check if this is a subscription confirmation
     if let Some(id) = message.get("id").and_then(|v| v.as_i64()) {
         info!("WebSocket subscription confirmed with id: {}", id);
@@ -241,6 +241,15 @@ async fn process_message(message: &serde_json::Value, token_creation_count: &mut
             if let Some(params) = message.get("params") {
                 if let Some(result) = params.get("result") {
                     if let Some(value) = result.get("value") {
+                        // Record timestamp immediately upon receiving the message
+                        let received_at = chrono::Utc::now();
+                        
+                        // Extract signature and log exact detection time
+                        if let Some(signature) = value.get("signature").and_then(|v| v.as_str()) {
+                            debug!("Received transaction at: {} - Signature: {}", 
+                                   received_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true), signature);
+                        }
+                        
                         // Extract log data
                         if let Some(logs) = value.get("logs").and_then(|v| v.as_array()) {
                             // ONLY check for "Create" instruction in logs
@@ -250,7 +259,7 @@ async fn process_message(message: &serde_json::Value, token_creation_count: &mut
                             
                             if contains_create {
                                 // Found a token creation event!
-                                *token_creation_count += 1;
+                                *token_creations += 1;
                                 
                                 if let Some(signature) = value.get("signature").and_then(|v| v.as_str()) {
                                     debug!("🪙 NEW TOKEN CREATED! Transaction signature: {}", signature);

@@ -22,7 +22,6 @@ async fn main() -> Result<()> {
     
     // Get WebSocket endpoint from environment or use default from chainstack
     let wss_endpoint = env::var("CHAINSTACK_WSS_ENDPOINT")
-        .or_else(|_| env::var("WSS_ENDPOINT"))
         .unwrap_or_else(|_| chainstack_simple::get_authenticated_wss_url());
         
     // Set max reconnection attempts

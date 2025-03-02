@@ -504,12 +504,24 @@ pub async fn check_token_liquidity(
     use solana_sdk::pubkey::Pubkey;
     use std::str::FromStr;
 
-    // Get RPC URL from environment or use a default
-    let rpc_url = std::env::var("SOLANA_RPC_URL")
-        .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
+    // Only use Chainstack endpoint for RPC calls
+    let rpc_url = std::env::var("CHAINSTACK_ENDPOINT")
+        .unwrap_or_else(|_| "https://solana-mainnet.core.chainstack.com/b04d312222d7be6eefd6b31d84a303ab".to_string());
     
-    // Create a Solana RPC client
-    let client = RpcClient::new(rpc_url);
+    // Validate that the URL has a proper schema
+    let rpc_url = if !rpc_url.starts_with("http") {
+        format!("https://{}", rpc_url)
+    } else {
+        rpc_url
+    };
+    
+    debug!("Using Chainstack RPC URL for liquidity check: {}", rpc_url);
+    
+    // Create a Solana RPC client with processed commitment level
+    let client = RpcClient::new_with_commitment(
+        rpc_url,
+        solana_sdk::commitment_config::CommitmentConfig::processed()
+    );
     
     // Convert addresses to public keys
     let mint_pubkey = Pubkey::from_str(mint)?;
@@ -543,12 +555,24 @@ pub async fn check_token_primary_liquidity(
     // The rent exempt minimum amount in SOL
     const RENT_EXEMPT_MINIMUM: f64 = 0.00203928;
 
-    // Get RPC URL from environment or use a default
-    let rpc_url = std::env::var("SOLANA_RPC_URL")
-        .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
+    // Only use Chainstack endpoint for RPC calls
+    let rpc_url = std::env::var("CHAINSTACK_ENDPOINT")
+        .unwrap_or_else(|_| "https://solana-mainnet.core.chainstack.com/b04d312222d7be6eefd6b31d84a303ab".to_string());
     
-    // Create a Solana RPC client
-    let client = RpcClient::new(rpc_url);
+    // Validate that the URL has a proper schema
+    let rpc_url = if !rpc_url.starts_with("http") {
+        format!("https://{}", rpc_url)
+    } else {
+        rpc_url
+    };
+    
+    debug!("Using Chainstack RPC URL for liquidity check: {}", rpc_url);
+    
+    // Create a Solana RPC client with processed commitment level
+    let client = RpcClient::new_with_commitment(
+        rpc_url,
+        solana_sdk::commitment_config::CommitmentConfig::processed()
+    );
     
     // Convert mint address to public key
     let mint_pubkey = Pubkey::from_str(mint)?;
