@@ -406,9 +406,8 @@ async fn monitor_websocket() -> Result<()> {
     // Check if we're in quiet mode
     let is_quiet_mode = std::env::args().any(|arg| arg == "--quiet" || arg == "-q");
     
-    if !is_quiet_mode {
-        info!("Starting WebSocket monitor for new tokens with automatic buying");
-    }
+    // Always show the initial info message
+    info!("Starting WebSocket monitor for new tokens with automatic buying");
 
     // Read configuration
     let check_min_liquidity =
@@ -426,6 +425,34 @@ async fn monitor_websocket() -> Result<()> {
         .parse::<f64>()
         .context("Invalid SLIPPAGE value in .env")?;
     let wallet = std::env::var("WALLET").context("Missing WALLET in .env")?;
+    
+    // Additional settings requested by the user
+    let take_profit = std::env::var("TAKE_PROFIT")
+        .unwrap_or_else(|_| "60".to_string())
+        .parse::<f64>()
+        .unwrap_or(60.0);
+    
+    let stop_loss = std::env::var("STOP_LOSS")
+        .unwrap_or_else(|_| "10".to_string())
+        .parse::<f64>()
+        .unwrap_or(10.0);
+    
+    let max_positions = std::env::var("MAX_POSITIONS")
+        .unwrap_or_else(|_| "1".to_string())
+        .parse::<u32>()
+        .unwrap_or(1);
+    
+    let priority_fee = std::env::var("PRIORITY_FEE")
+        .unwrap_or_else(|_| "2000000".to_string())
+        .parse::<u64>()
+        .unwrap_or(2000000);
+    
+    let priority_fee_sol = priority_fee as f64 / 1_000_000_000.0;
+    
+    let price_check_interval = std::env::var("PRICE_CHECK_INTERVAL_MS")
+        .unwrap_or_else(|_| "500".to_string())
+        .parse::<u64>()
+        .unwrap_or(500);
 
     // Get duration setting - use 0 for indefinite monitoring (will run until Ctrl+C)
     let duration = std::env::var("MONITOR_DURATION")
@@ -435,36 +462,40 @@ async fn monitor_websocket() -> Result<()> {
     // Initialize HTTP client
     let client = Arc::new(create_optimized_client()?);
 
-    // Display configuration only if not in quiet mode
-    if !is_quiet_mode {
-        println!("\n{:-^100}", " PUMP.FUN TOKEN MONITOR ");
-        println!(
-            "Mode: {}",
-            if approved_devs_only {
-                "APPROVED DEV (Auto-Buy without Liquidity Check)"
-            } else if check_min_liquidity {
-                "STANDARD (Verify Liquidity Before Buy)"
-            } else {
-                "AGGRESSIVE (Buy Without Liquidity Check)"
-            }
-        );
-        println!("Amount: {} SOL", amount);
-        println!("Slippage: {}%", slippage);
-        if !snipe_by_tag.is_empty() {
-            println!("Tag Filter: {}", snipe_by_tag);
-        }
-
-        // Show duration info
-        if duration > 0 {
-            println!("Monitor Duration: {} seconds", duration);
+    // Always display configuration - even in quiet mode
+    println!("\n{:-^100}", " PUMP.FUN TOKEN MONITOR ");
+    println!(
+        "Mode: {}",
+        if approved_devs_only {
+            "APPROVED DEV (Auto-Buy without Liquidity Check)"
+        } else if check_min_liquidity {
+            "STANDARD (Verify Liquidity Before Buy)"
         } else {
-            println!("Monitor Duration: INDEFINITE (press Ctrl+C to stop)");
+            "AGGRESSIVE (Buy Without Liquidity Check)"
         }
-
-        println!("Auto-reconnect: ENABLED (will automatically reconnect if WebSocket disconnects)");
-        println!("Press Ctrl+C at any time to stop monitoring");
-        println!("{:-^100}", "");
+    );
+    println!("Amount: {} SOL", amount);
+    println!("Slippage: {}%", slippage);
+    println!("Take Profit: {}%", take_profit);
+    println!("Stop Loss: {}%", stop_loss);
+    println!("Max Positions: {}", max_positions);
+    println!("Priority Fee: {:.6} SOL", priority_fee_sol);
+    println!("Price Check Interval: {} ms", price_check_interval);
+    
+    if !snipe_by_tag.is_empty() {
+        println!("Tag Filter: {}", snipe_by_tag);
     }
+
+    // Show duration info
+    if duration > 0 {
+        println!("Monitor Duration: {} seconds", duration);
+    } else {
+        println!("Monitor Duration: INDEFINITE (press Ctrl+C to stop)");
+    }
+
+    println!("Auto-reconnect: ENABLED (will automatically reconnect if WebSocket disconnects)");
+    println!("Press Ctrl+C at any time to stop monitoring");
+    println!("{:-^100}", "");
 
     // This will collect all tokens found during the monitoring session
     let mut token_data_list = Vec::new();
@@ -482,9 +513,8 @@ async fn monitor_websocket() -> Result<()> {
         let wss_endpoint = std::env::var("WSS_ENDPOINT")
             .unwrap_or_else(|_| chainstack_simple::get_authenticated_wss_url());
 
-        if !is_quiet_mode {
-            info!("Using WebSocket endpoint: {}", wss_endpoint);
-        }
+        // Log the endpoint - our logger formatter will handle quiet mode filtering
+        info!("Using WebSocket endpoint: {}", wss_endpoint);
 
         // Run the WebSocket test and handle errors
         match websocket_test::run_websocket_test(&wss_endpoint).await {
@@ -620,13 +650,13 @@ async fn main() -> Result<()> {
     // Initialize the logger with custom formatting
     let mut builder = env_logger::Builder::new();
     
-    // In quiet mode, only show token creation logs
+    // In quiet mode, only show token creation logs and the initial header
     if is_quiet_mode {
         // Only allow specific log messages in quiet mode
         builder.format(|buf, record| {
-            // Only show token creation logs
             let msg = format!("{}", record.args());
-            if msg.contains("NEW TOKEN CREATED") {
+            // Show token creation logs and the initial header
+            if msg.contains("NEW TOKEN CREATED") || msg.contains("Starting WebSocket monitor") {
                 let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
                 writeln!(buf, "{} [{}] {}", timestamp, record.level(), record.args())
             } else {
