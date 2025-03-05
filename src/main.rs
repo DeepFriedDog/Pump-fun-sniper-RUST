@@ -70,7 +70,7 @@ async fn process_new_tokens_from_websocket(
     wallet: &str,
     amount: f64,
     slippage: f64,
-) -> Result<()> {
+) -> std::result::Result<(), String> {
     // Measure start time for performance tracking
     let start_time = std::time::Instant::now();
     
@@ -82,18 +82,28 @@ async fn process_new_tokens_from_websocket(
     
     // Skip the already processed check for fresh tokens
     let now = Instant::now();
-    let mut last_processed = LAST_PROCESSED_TOKENS.lock().unwrap();
-    
-    if let Some(last_time) = last_processed.get(mint) {
-        if last_time.elapsed() < Duration::from_secs(5) {
-            // Token was processed very recently, skip
-            return Ok(());
+    let should_process = {
+        let mut last_processed = LAST_PROCESSED_TOKENS.lock().unwrap();
+        
+        if let Some(last_time) = last_processed.get(mint) {
+            if last_time.elapsed() < Duration::from_secs(5) {
+                // Token was processed very recently, skip
+                false
+            } else {
+                // Update the last processed time for this mint
+                last_processed.insert(mint.clone(), now);
+                true
+            }
+        } else {
+            // Token wasn't processed before, add it
+            last_processed.insert(mint.clone(), now);
+            true
         }
-    }
+    };
     
-    // Update the last processed time for this mint
-    last_processed.insert(mint.clone(), now);
-    drop(last_processed); // Release the lock
+    if !should_process {
+        return Ok(());
+    }
     
     // Calculate or estimate liquidity
     let liquidity = match api::calculate_liquidity_from_bonding_curve(&mint, &user, amount).await {
@@ -143,18 +153,21 @@ async fn process_new_tokens_from_websocket(
     };
     
     // Fast path for approved developers - skip liquidity check
-    if approved_devs_only && is_approved_dev {
+    if approved_devs_only {
         info!("Skipping liquidity check and buying immediately");
         
         // Buy the token immediately using Chainstack warp transaction
         let buy_start = std::time::Instant::now();
-        let buy_result = api::buy_token(
+        let buy_result = match api::buy_token(
             &**client,
             private_key,
             mint,
             amount,
             slippage
-        ).await?;
+        ).await {
+            Ok(result) => result,
+            Err(e) => return Err(format!("Failed to buy token: {}", e)),
+        };
         
         // Process buy result and log speed
         let buy_elapsed = buy_start.elapsed();
@@ -165,7 +178,9 @@ async fn process_new_tokens_from_websocket(
                  mint, buy_elapsed.as_secs_f64(), total_elapsed.as_secs_f64());
             
             // Process the buy result for DB storage and price monitoring
-            process_buy_result(buy_result, client, wallet, mint, start_time).await;
+            if let Err(e) = process_buy_result(buy_result, client, wallet, mint, start_time).await {
+                warn!("Error processing buy result: {}", e);
+            }
         } else {
             info!("❌ FAILED TO BUY: {} - Elapsed: {:.3}s - Reason: {}", 
                  mint, total_elapsed.as_secs_f64(), buy_result.data.get("message").and_then(|m| m.as_str()).unwrap_or("Unknown"));
@@ -189,13 +204,16 @@ async fn process_new_tokens_from_websocket(
                     
                     // Execute buy transaction
                     let buy_start = std::time::Instant::now();
-                    let buy_result = api::buy_token(
+                    let buy_result = match api::buy_token(
                         &**client,
                         private_key,
                         mint,
                         amount,
                         slippage
-                    ).await?;
+                    ).await {
+                        Ok(result) => result,
+                        Err(e) => return Err(format!("Failed to buy token: {}", e)),
+                    };
                     
                     // Process buy result
                     let buy_elapsed = buy_start.elapsed();
@@ -206,7 +224,9 @@ async fn process_new_tokens_from_websocket(
                              mint, buy_elapsed.as_secs_f64(), total_elapsed.as_secs_f64());
                         
                         // Process the buy result
-                        process_buy_result(buy_result, client, wallet, mint, start_time).await;
+                        if let Err(e) = process_buy_result(buy_result, client, wallet, mint, start_time).await {
+                            warn!("Error processing buy result: {}", e);
+                        }
                     } else {
                         info!("❌ FAILED TO BUY: {} - Elapsed: {:.3}s - Reason: {}", 
                              mint, total_elapsed.as_secs_f64(), buy_result.data.get("message").and_then(|m| m.as_str()).unwrap_or("Unknown"));
@@ -225,13 +245,16 @@ async fn process_new_tokens_from_websocket(
         
         // Buy the token immediately
         let buy_start = std::time::Instant::now();
-        let buy_result = api::buy_token(
+        let buy_result = match api::buy_token(
             &**client,
             private_key,
             mint,
             amount,
             slippage
-        ).await?;
+        ).await {
+            Ok(result) => result,
+            Err(e) => return Err(format!("Failed to buy token: {}", e)),
+        };
         
         // Process buy result
         let buy_elapsed = buy_start.elapsed();
@@ -242,7 +265,9 @@ async fn process_new_tokens_from_websocket(
                  mint, buy_elapsed.as_secs_f64(), total_elapsed.as_secs_f64());
             
             // Process the buy result
-            process_buy_result(buy_result, client, wallet, mint, start_time).await;
+            if let Err(e) = process_buy_result(buy_result, client, wallet, mint, start_time).await {
+                warn!("Error processing buy result: {}", e);
+            }
         } else {
             info!("❌ FAILED TO BUY: {} - Elapsed: {:.3}s - Reason: {}", 
                  mint, total_elapsed.as_secs_f64(), buy_result.data.get("message").and_then(|m| m.as_str()).unwrap_or("Unknown"));
@@ -259,24 +284,52 @@ async fn process_buy_result(
     wallet: &str,
     mint: &str,
     start_time: Instant
-) {
-    // Log the successful buy
-    info!("✅ Successfully bought token: {}", mint);
+) -> std::result::Result<(), String> {
+    // Extract transaction signature from the response
+    let tx_signature = buy_result.data.get("transaction")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
     
-    // Try to get the current balance
-    match api::get_balance(&**client, wallet, mint).await {
-        Ok(balance) => {
-            info!("Current balance: {} tokens", balance);
-        },
-        Err(e) => {
-            warn!("Failed to get balance: {}", e);
-        }
-    }
+    info!("Transaction signature: {}", tx_signature);
     
-    // Try to get the current price
+    // Get the token price
     match api::get_price(&**client, mint).await {
         Ok(price) => {
-            info!("Current price: ${:.6}", price);
+            info!("Token price: {} SOL", price);
+            
+            // Start price monitoring if enabled
+            if std::env::var("MONITOR_PRICE").unwrap_or_else(|_| "true".to_string()) == "true" {
+                let take_profit = std::env::var("TAKE_PROFIT")
+                    .unwrap_or_else(|_| "100".to_string())
+                    .parse::<f64>()
+                    .unwrap_or(100.0);
+                    
+                let stop_loss = std::env::var("STOP_LOSS")
+                    .unwrap_or_else(|_| "50".to_string())
+                    .parse::<f64>()
+                    .unwrap_or(50.0);
+                
+                info!("Starting price monitor with take profit: {}%, stop loss: {}%", take_profit, stop_loss);
+                
+                // Clone values for the async block
+                let client_clone = client.clone();
+                let mint_clone = mint.to_string();
+                let wallet_clone = wallet.to_string();
+                
+                // Start price monitoring in a separate task
+                tokio::spawn(async move {
+                    if let Err(e) = api::start_price_monitor(
+                        &client_clone,
+                        &mint_clone,
+                        &wallet_clone,
+                        price,
+                        take_profit,
+                        stop_loss
+                    ).await {
+                        warn!("Price monitoring error: {}", e);
+                    }
+                });
+            }
         },
         Err(e) => {
             warn!("Failed to get price: {}", e);
@@ -286,6 +339,8 @@ async fn process_buy_result(
     // Log total processing time
     let total_elapsed = start_time.elapsed();
     info!("Total processing time: {:.3}s", total_elapsed.as_secs_f64());
+    
+    Ok(())
 }
 
 /// Create an optimized HTTP client for fast API calls
@@ -331,9 +386,10 @@ async fn monitor_websocket() -> Result<()> {
     
     // Display configuration
     println!("\n{:-^100}", " PUMP.FUN TOKEN MONITOR ");
-    println!("Mode: {}", if approved_devs_only { "APPROVED DEV (Auto-Buy without Liquidity Check)" } 
-                           else if check_min_liquidity { "STANDARD (Verify Liquidity Before Buy)" }
-                           else { "AGGRESSIVE (Buy Without Liquidity Check)" });
+    println!("Mode: {}", 
+        if approved_devs_only { "APPROVED DEV (Auto-Buy without Liquidity Check)" } 
+        else if check_min_liquidity { "STANDARD (Verify Liquidity Before Buy)" }
+        else { "AGGRESSIVE (Buy Without Liquidity Check)" });
     println!("Amount: {} SOL", amount);
     println!("Slippage: {}%", slippage);
     if !snipe_by_tag.is_empty() {
@@ -461,114 +517,112 @@ async fn monitor_websocket() -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize environment variables from .env file
+    // Read environment variables
     dotenv().ok();
     
-    // Get any logging preference from command-line arguments
-    let show_only_token_creation = std::env::args().any(|arg| arg == "--quiet" || arg == "-q");
+    // Load WebSocket settings
+    let use_websocket = std::env::var("USE_WEBSOCKET")
+        .unwrap_or_else(|_| "true".to_string())
+        .parse::<bool>()
+        .unwrap_or(true);
+        
+    let websocket_debug = std::env::var("WEBSOCKET_DEBUG")
+        .unwrap_or_else(|_| "false".to_string())
+        .parse::<bool>()
+        .unwrap_or(false);
+        
+    info!("WebSocket enabled: {}", use_websocket);
     
-    // Initialize logging with custom filter
-    let log_filter = if show_only_token_creation {
-        // Only show token creation messages and errors/warnings
-        "error,warn,pumpfun_sniper::websocket_test=info"
+    // Initialize logging with appropriate level
+    let log_level = if websocket_debug {
+        log::LevelFilter::Debug
+    } else if std::env::args().any(|arg| arg == "--quiet") {
+        log::LevelFilter::Info
     } else {
-        // Show all info logs (default behavior)
-        "info"
+        log::LevelFilter::Info
     };
     
-    let env = env_logger::Env::default()
-        .filter_or("RUST_LOG", log_filter);
-    
-    // Capture quiet mode flag for the formatter
-    let quiet_mode = show_only_token_creation;
-    
-    env_logger::Builder::from_env(env)
-        .format_timestamp_millis()
-        .format(move |buf, record| {
-            // Special formatting for token creation messages
-            if record.args().to_string().contains("NEW TOKEN CREATED!") {
-                // Always include timestamp for token creation messages
-                writeln!(
-                    buf,
-                    "[{}] {}",
-                    buf.timestamp_millis(),
-                    record.args()
-                )
-            } else {
-                // Standard format for other logs
-                writeln!(
-                    buf,
-                    "[{}] {} {}",
-                    buf.timestamp_millis(),
-                    record.level(),
-                    record.args()
-                )
-            }
+    // Initialize the logger
+    env_logger::Builder::new()
+        .filter_level(log_level)
+        .format(|buf, record| {
+            let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+            writeln!(
+                buf,
+                "{} [{}] {}",
+                timestamp,
+                record.level(),
+                record.args()
+            )
         })
         .init();
     
-    info!("Starting Pump.fun Sniper Bot...");
-
-    // Check if any arguments were provided
-    let args: Vec<String> = std::env::args().collect();
-    let has_mode_flag = args.iter().any(|arg| arg == "--extract-tokens" || arg == "-e" || arg == "--monitor-websocket" || arg == "-m");
-
-    // If no mode flag was provided and there are arguments (program name counts as one), 
-    // or if args.len() is exactly 1 (just the program name), default to monitor mode
-    if args.len() == 1 || (!has_mode_flag && args.len() > 1) {
-        info!("No mode specified, defaulting to monitor mode");
-        // Run monitor websocket function
-        return monitor_websocket().await;
-    }
+    // Print the banner
+    println!("\n{:-^100}", " PUMP.FUN TOKEN SNIPER ");
+    println!("Version: 1.0.0");
+    println!("Author: @solanadev");
+    println!("Website: https://pump.fun");
+    println!("{:-^100}", "");
     
-    // Check if we should extract tokens from WebSocket
-    if std::env::args().any(|arg| arg == "--extract-tokens" || arg == "-e") {
-        info!("Extracting token data from WebSocket messages");
-        
-        // Get WebSocket endpoint from environment or use authenticated URL from chainstack_simple
-        let wss_endpoint = std::env::var("WSS_ENDPOINT")
-            .unwrap_or_else(|_| chainstack_simple::get_authenticated_wss_url());
+    // Create an optimized HTTP client
+    let client = Arc::new(create_optimized_client()?);
+    
+    // Check command line arguments
+    let args: Vec<String> = std::env::args().collect();
+    
+    // Process command line arguments
+    if args.len() > 1 {
+        // Check if we should extract tokens from WebSocket
+        if std::env::args().any(|arg| arg == "--extract-tokens" || arg == "-e") {
+            info!("Extracting token data from WebSocket messages");
             
-        info!("Using WebSocket endpoint: {}", wss_endpoint);
+            // Get WebSocket endpoint from environment or use authenticated URL from chainstack_simple
+            let wss_endpoint = std::env::var("WSS_ENDPOINT")
+                .unwrap_or_else(|_| chainstack_simple::get_authenticated_wss_url());
+                
+            info!("Using WebSocket endpoint: {}", wss_endpoint);
 
-        // Run the WebSocket test to collect token data
-        let token_data_list = websocket_test::run_websocket_test(&wss_endpoint).await?;
-        
-        // Display the results
-        println!("\n{:-^80}", " TOKEN CREATION EVENTS ");
-        
-        if token_data_list.is_empty() {
-            println!("No token creation events detected during the test period.");
-        } else {
-            println!("Found {} token creation events:", token_data_list.len());
-            println!("\n{:<5} {:<20} {:<10} {:<44} {:<44} {:<44}", 
-                     "#", "NAME", "SYMBOL", "MINT", "BONDING CURVE", "CREATOR");
-            println!("{:-<170}", "");
+            // Run the WebSocket test to collect token data
+            let token_data_list = websocket_test::run_websocket_test(&wss_endpoint).await?;
             
-            for (i, token) in token_data_list.iter().enumerate() {
-                println!("{:<5} {:<20} {:<10} {:<44} {:<44} {:<44}", 
-                         i+1, 
-                         token.name, 
-                         token.symbol, 
-                         token.mint, 
-                         token.bonding_curve, 
-                         token.user);
+            // Display the results
+            println!("\n{:-^80}", " TOKEN CREATION EVENTS ");
+            
+            if token_data_list.is_empty() {
+                println!("No token creation events detected during the test period.");
+            } else {
+                println!("Found {} token creation events:", token_data_list.len());
+                println!("\n{:<5} {:<20} {:<10} {:<44} {:<44} {:<44}", 
+                         "#", "NAME", "SYMBOL", "MINT", "BONDING CURVE", "CREATOR");
+                println!("{:-<170}", "");
+                
+                for (i, token) in token_data_list.iter().enumerate() {
+                    println!("{:<5} {:<20} {:<10} {:<44} {:<44} {:<44}", 
+                             i+1, 
+                             token.name, 
+                             token.symbol, 
+                             token.mint, 
+                             token.bonding_curve, 
+                             token.user);
+                }
             }
+            
+            return Ok(());
         }
+        
+        // Check if we should monitor for new tokens via WebSocket
+        if std::env::args().any(|arg| arg == "--monitor-websocket" || arg == "-m") {
+            return monitor_websocket().await;
+        }
+        
+        // Default behavior - display help (this will only be reached if --help or -h is provided)
+        println!("Pump.fun Sniper Bot - Available Commands:");
+        println!("  --extract-tokens, -e : Extract token data from WebSocket messages");
+        println!("  --monitor-websocket, -m : Monitor for new tokens via WebSocket with automatic buying (default mode)");
+        println!("  --quiet, -q : Only show token creation messages and suppress other logs");
         
         return Ok(());
     }
-    
-    // Check if we should monitor for new tokens via WebSocket
-    if std::env::args().any(|arg| arg == "--monitor-websocket" || arg == "-m") {
-        return monitor_websocket().await;
-    }
-    
-    // Default behavior - display help (this will only be reached if --help or -h is provided)
-    println!("Pump.fun Sniper Bot - Available Commands:");
-    println!("  --extract-tokens, -e : Extract token data from WebSocket messages");
-    println!("  --monitor-websocket, -m : Monitor for new tokens via WebSocket with automatic buying (default mode)");
-    println!("  --quiet, -q : Only show token creation messages and suppress other logs");
     
     Ok(())
 } 

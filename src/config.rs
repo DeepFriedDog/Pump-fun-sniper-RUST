@@ -56,4 +56,12 @@ impl Default for Config {
 // Function to load configuration from environment variables
 pub fn load_config() -> Config {
     Config::default()
+}
+
+// Function to determine if WebSockets should be used
+pub fn use_websocket() -> bool {
+    dotenv().ok(); // Load .env file if exists
+    env::var("USE_WEBSOCKET")
+        .unwrap_or_else(|_| "true".to_string())
+        .to_lowercase() == "true"
 } 

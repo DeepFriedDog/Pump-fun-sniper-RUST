@@ -35,6 +35,7 @@ lazy_static! {
     
     // Queue for websocket messages that contain token creation
     pub static ref WEBSOCKET_MESSAGES: Arc<TokioMutex<VecDeque<String>>> = Arc::new(TokioMutex::new(VecDeque::new()));
+    static ref NEW_TOKENS: Mutex<Vec<NewToken>> = Mutex::new(Vec::new());
 }
 
 struct CachedTokenData {
@@ -331,23 +332,8 @@ pub async fn setup_websocket() -> anyhow::Result<()> {
     // Get the pump.fun program ID from config
     let pump_program_id = crate::config::PUMP_PROGRAM_ID.to_string();
         
-    // Determine the default commitment level
-    let default_commitment = if std::env::args().any(|arg| arg == "--finalized") {
-        "finalized"
-    } else {
-        "processed"
-    };
-    
-    // ALWAYS use "processed" for faster token detection - matching Python implementation
-    let commitment_level = if std::env::args().any(|arg| arg == "--test") || 
-                             std::env::var("WEBSOCKET_TEST_MODE").is_ok() {
-        info!("🔄 Test mode detected: forcing 'processed' commitment level for faster results");
-        "processed".to_string()
-    } else {
-        // Use "processed" for faster token detection
-        info!("Using 'processed' commitment level for faster token detection");
-        "processed".to_string()
-    };
+    // ALWAYS use "processed" commitment level for fastest token detection
+    let commitment_level = "processed".to_string();
     
     info!("Solana: Listening to pump.fun token mint using logsSubscribe for program ID: {}", pump_program_id);
     info!("🔒 Using commitment level: {}", commitment_level);
@@ -496,28 +482,39 @@ pub async fn setup_websocket() -> anyhow::Result<()> {
                                             if create_instruction && program_data {
                                                 info!("⚡ POTENTIAL TOKEN CREATION DETECTED in message #{}", counter);
                                                 
-                                                // Process the notification immediately
+                                                // Process the notification immediately without delay
                                                 if let Some(token) = process_notification(&text) {
                                                     // Calculate or estimate liquidity
                                                     let liquidity = 0.5; // Default value
                                                     
-                                                    // Determine opportunity status
-                                                    let opportunity_status = "⚡"; // Ultra-fast detection
+                                                    // IMPORTANT: Process token immediately without spawning a task
+                                                    // This avoids the delay caused by task scheduling
+                                                    let mint_address = token.mint_address.clone();
+                                                    let creator_address = token.creator_address.clone();
+                                                    let token_name = token.token_name.clone();
+                                                    let token_symbol = token.token_symbol.clone();
                                                     
-                                                    // Log the token information with new format
-                                                    info!("🪙 NEW TOKEN CREATED! {} (mint: {}) 💰 {:.2} SOL {}", 
-                                                        token.token_name, 
-                                                        token.mint_address, 
-                                                        liquidity, 
-                                                        opportunity_status);
-                                                    
-                                                    // Add to the WebSocket messages queue for later processing
-                                                    if let Ok(mut queue) = WEBSOCKET_MESSAGES.try_lock() {
-                                                        queue.push_back(text);
-                                                        info!("✅ Added token to queue (size: {})", queue.len());
-                                                    } else {
-                                                        error!("Failed to lock WebSocket messages queue");
+                                                    // Add to new tokens list
+                                                    {
+                                                        let mut new_tokens = NEW_TOKENS.lock().unwrap();
+                                                        new_tokens.push(token);
+                                                        info!("Added token to new tokens list. Current size: {}", new_tokens.len());
                                                     }
+                                                    
+                                                    // Also add to the API queue for immediate processing
+                                                    let token_data = crate::api::TokenData {
+                                                        status: "success".to_string(),
+                                                        mint: mint_address,
+                                                        dev: creator_address,
+                                                        metadata: Some("bonding_curve:unknown".to_string()),
+                                                        name: Some(token_name),
+                                                        symbol: Some(token_symbol),
+                                                        timestamp: Some(chrono::Utc::now().timestamp()),
+                                                    };
+                                                    
+                                                    let mut api_queue = crate::api::NEW_TOKEN_QUEUE.lock().unwrap();
+                                                    api_queue.push_back(token_data);
+                                                    info!("Added token to API queue for immediate processing. Current size: {}", api_queue.len());
                                                 }
                                             }
                                         } else if text.contains("\"result\"") {
@@ -820,15 +817,15 @@ pub fn process_notification(notification: &str) -> Option<NewToken> {
                                     
                                     // Create the token data structure to return
                                     let token = NewToken {
-                                        token_name,
-                                        token_symbol,
-                                        mint_address,
-                                        creator_address,
+                                        token_name: token_name.clone(),
+                                        token_symbol: token_symbol.clone(),
+                                        mint_address: mint_address.clone(),
+                                        creator_address: creator_address.clone(),
                                         transaction_signature: tx_signature.to_string(),
                                         timestamp: chrono::Utc::now().timestamp(),
                                     };
                                     
-                                    // Add the token to the API's global queue for processing
+                                    // Add the token to the API's global queue for immediate processing
                                     if let Ok(mut queue) = crate::api::NEW_TOKEN_QUEUE.try_lock() {
                                         let token_data = crate::api::TokenData {
                                             status: "success".to_string(),
@@ -840,10 +837,95 @@ pub fn process_notification(notification: &str) -> Option<NewToken> {
                                             timestamp: Some(token.timestamp),
                                         };
                                         
-                                        queue.push_back(token_data);
-                                        info!("✅ Added token to API queue for processing (size: {})", queue.len());
+                                        queue.push_back(token_data.clone());
+                                        info!("⚡ Added token to API queue for processing (size: {})", queue.len());
+                                        
+                                        // CRITICAL FIX: Process token IMMEDIATELY in a separate task
+                                        // This is similar to the approach in websocket_test.rs that works without delay
+                                        let notification_clone = notification.to_string();
+                                        let token_data_clone = token_data.clone();
+                                        let mint_address_clone = mint_address.clone();
+                                        
+                                        tokio::spawn(async move {
+                                            // Get MIN_LIQUIDITY from environment variable
+                                            let min_liquidity_str = std::env::var("MIN_LIQUIDITY").unwrap_or_else(|_| "4.0".to_string());
+                                            let min_liquidity = min_liquidity_str.parse::<f64>().unwrap_or(4.0);
+                                            
+                                            if let Some(bonding_curve) = token_data_clone.metadata.as_ref().and_then(|m| {
+                                                if m.starts_with("bonding_curve:") {
+                                                    Some(m.replace("bonding_curve:", ""))
+                                                } else {
+                                                    None
+                                                }
+                                            }) {
+                                                // Use the token_detector function for liquidity check
+                                                match crate::token_detector::check_token_liquidity(
+                                                    &mint_address_clone,
+                                                    &bonding_curve,
+                                                    min_liquidity
+                                                ).await {
+                                                    Ok((has_liquidity, sol_amount)) => {
+                                                        // Log the token creation with liquidity info
+                                                        let check_mark = if has_liquidity { "✅" } else { "❌" };
+                                                        
+                                                        info!("🪙 DIRECT PROCESSING: TOKEN CREATED! {} (mint: {}) 💰 {:.2} SOL {}", 
+                                                            token_data_clone.name.unwrap_or_else(|| "Unknown".to_string()), 
+                                                            mint_address_clone, 
+                                                            sol_amount, 
+                                                            check_mark);
+                                                            
+                                                        // This is the key that was missing - we're processing directly here
+                                                        let client = crate::api::create_speed_optimized_client();
+                                                        
+                                                        // Get configuration values from environment
+                                                        let private_key = std::env::var("PRIVATE_KEY").unwrap_or_default();
+                                                        let amount = std::env::var("AMOUNT")
+                                                            .unwrap_or_else(|_| "0.01".to_string())
+                                                            .parse::<f64>()
+                                                            .unwrap_or(0.01);
+                                                        let slippage = std::env::var("SLIPPAGE")
+                                                            .unwrap_or_else(|_| "30".to_string())
+                                                            .parse::<f64>()
+                                                            .unwrap_or(30.0);
+                                                            
+                                                        // Buy the token directly
+                                                        let buy_result = crate::api::buy_token(
+                                                            &client,
+                                                            &private_key,
+                                                            &token_data_clone.mint,
+                                                            amount,
+                                                            slippage
+                                                        ).await;
+                                                        
+                                                        if let Ok(result) = buy_result {
+                                                            info!("🚀 AUTO-BUY RESULT: {:?}", result);
+                                                        }
+                                                    },
+                                                    Err(e) => {
+                                                        // Log error and show token with 0 SOL
+                                                        debug!("Error checking liquidity: {}", e);
+                                                        info!("🪙 DIRECT PROCESSING: TOKEN CREATED! {} (mint: {}) 💰 0.00 SOL ❌", 
+                                                            token_data_clone.name.unwrap_or_else(|| "Unknown".to_string()), 
+                                                            mint_address_clone);
+                                                    }
+                                                }
+                                            } else {
+                                                info!("🪙 DIRECT PROCESSING: TOKEN CREATED but bonding curve not found! {}", 
+                                                    mint_address_clone);
+                                            }
+                                        });
+                                    } else {
+                                        warn!("Could not lock API queue, token detection might be delayed");
                                     }
                                     
+                                    // Add message to global queue for processing
+                                    let queue = crate::chainstack::WEBSOCKET_MESSAGES.clone();
+                                    if let Ok(mut queue_guard) = queue.try_lock() {
+                                        queue_guard.push_back(notification.to_owned());
+                                        info!("Added token to websocket messages queue. Current queue size: {}", queue_guard.len());
+                                    }
+                                    
+                                    // Return detected token
                                     return Some(token);
                                 }
                             }
@@ -937,6 +1019,7 @@ pub async fn buy_token(
     Ok(super::api::ApiResponse {
         status: "success".to_string(),
         data: serde_json::json!({"info": "Token purchase simulated"}),
+        mint: mint.to_string(),
     })
 }
 
@@ -952,6 +1035,7 @@ pub async fn sell_token(
     Ok(super::api::ApiResponse {
         status: "success".to_string(),
         data: serde_json::json!({"info": "Token sale simulated"}),
+        mint: mint.to_string(),
     })
 }
 
@@ -1123,7 +1207,7 @@ pub fn calculate_associated_bonding_curve(mint: &str, bonding_curve: &str) -> an
 // Implement the full process_websocket_messages function
 async fn process_websocket_messages(
     websocket_messages: Arc<TokioMutex<VecDeque<String>>>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Get a lock on the queue
     let mut messages_guard = websocket_messages.lock().await;
     
@@ -1190,34 +1274,10 @@ fn handle_notification(notification: String) {
     // Log the notification for debugging
     debug!("Received WebSocket notification");
     
-    // Create a tokio runtime for async operations within this thread
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    
-    // Process the notification in the runtime
+    // Process the notification directly
     if let Some(token) = process_notification(&notification) {
-        // Get a lock on the websocket messages queue
-        if let Ok(mut queue) = WEBSOCKET_MESSAGES.try_lock() {
-            queue.push_back(notification);
-            debug!("Added notification to queue (size: {})", queue.len());
-        } else {
-            error!("Failed to lock websocket messages queue");
-        }
-        
-        // Calculate or estimate liquidity
-        let liquidity = 0.5; // Default value
-        
-        // Determine opportunity status
-        let opportunity_status = "⚡"; // Ultra-fast detection
-        
-        // Log the token information with new format
-        info!("🪙 NEW TOKEN CREATED! {} (mint: {}) 💰 {:.2} SOL {}", 
-            token.token_name, 
-            token.mint_address, 
-            liquidity, 
-            opportunity_status);
+        // Token is already added to NEW_TOKEN_QUEUE in process_notification
+        debug!("Token {} processed by handle_notification", token.mint_address);
     } else {
         debug!("Notification did not contain valid token creation data");
     }

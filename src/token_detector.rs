@@ -307,7 +307,7 @@ async fn connect_to_websocket(wss_endpoint: &str) -> Result<()> {
     }
 }
 
-async fn process_message(text: &str, queue: Arc<Mutex<std::collections::VecDeque<String>>>) -> Result<(), Box<dyn std::error::Error>> {
+async fn process_message(text: &str, queue: Arc<Mutex<std::collections::VecDeque<String>>>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Parse the message
     let data: Value = serde_json::from_str(text)?;
     
@@ -550,16 +550,15 @@ pub fn test_parse_instruction(base64_data: &str) -> Option<DetectorTokenData> {
     }
 }
 
-/// Check token liquidity by examining the balance of the associated bonding curve
-pub async fn check_token_liquidity(
-    mint: &str, 
-    bonding_curve: &str,
-    liquidity_threshold: f64,
-) -> Result<(bool, f64), Box<dyn std::error::Error>> {
-    use solana_client::rpc_client::RpcClient;
-    use solana_sdk::pubkey::Pubkey;
-    use std::str::FromStr;
+// Add a cache for liquidity checks to reduce redundant RPC calls
+lazy_static! {
+    static ref LIQUIDITY_CACHE: Arc<Mutex<HashMap<String, (f64, std::time::Instant)>>> = Arc::new(Mutex::new(HashMap::new()));
+}
 
+// Create or get the RPC client
+async fn get_rpc_client() -> solana_client::rpc_client::RpcClient {
+    use solana_client::rpc_client::RpcClient;
+    
     // Only use Chainstack endpoint for RPC calls
     let rpc_url = std::env::var("CHAINSTACK_ENDPOINT")
         .unwrap_or_else(|_| "https://solana-mainnet.core.chainstack.com/b04d312222d7be6eefd6b31d84a303ab".to_string());
@@ -571,25 +570,159 @@ pub async fn check_token_liquidity(
         rpc_url
     };
     
-    debug!("Using Chainstack RPC URL for liquidity check: {}", rpc_url);
+    debug!("Creating RPC client with URL: {}", rpc_url);
     
     // Create a Solana RPC client with processed commitment level
-    let client = RpcClient::new_with_commitment(
+    RpcClient::new_with_commitment(
         rpc_url,
         solana_sdk::commitment_config::CommitmentConfig::processed()
-    );
+    )
+}
+
+/// Check token liquidity by examining the balance of the associated bonding curve
+pub async fn check_token_liquidity(
+    mint: &str,
+    bonding_curve: &str,
+    liquidity_threshold: f64,
+) -> Result<(bool, f64), Box<dyn std::error::Error + Send + Sync>> {
+    use solana_client::rpc_client::RpcClient;
+    use solana_sdk::pubkey::Pubkey;
+    use std::str::FromStr;
+
+    // Check cache first for recent results
+    let cache_key = format!("{}:{}", mint, bonding_curve);
+    {
+        let cache = LIQUIDITY_CACHE.lock().await;
+        if let Some((balance, timestamp)) = cache.get(&cache_key) {
+            // Use cached value if less than 5 seconds old
+            if timestamp.elapsed() < std::time::Duration::from_secs(5) {
+                debug!("Using cached liquidity for {}: {} SOL", mint, balance);
+                return Ok((*balance >= liquidity_threshold, *balance));
+            }
+        }
+    }
+
+    // Get RPC client - use a faster timeout to reduce delays
+    let client = get_optimized_rpc_client().await;
+
+    // The rent exempt minimum amount in SOL
+    const RENT_EXEMPT_MINIMUM: f64 = 0.00203928;
+
+    // Convert mint address to public key
+    let mint_pubkey = Pubkey::from_str(mint)
+        .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))?;
+
+    // IMPROVEMENT: First try to directly get the primary bonding curve address
+    let (primary_bonding_curve, _) = get_bonding_curve_address(&mint_pubkey);
+    debug!("Checking primary bonding curve: {}", primary_bonding_curve);
+
+    // Check the primary bonding curve first (it's the one that matters most)
+    // Use a separate thread to avoid blocking the async runtime
+    let account_result = tokio::task::spawn_blocking(move || {
+        client.get_account(&primary_bonding_curve)
+    }).await;
+
+    // Process the result
+    match account_result {
+        Ok(result) => match result {
+            Ok(account) => {
+                // Get total balance
+                let total_balance = account.lamports as f64 / 1_000_000_000.0; // Convert lamports to SOL
+
+                // Subtract rent exempt minimum to get actual liquidity
+                let actual_liquidity = (total_balance - RENT_EXEMPT_MINIMUM).max(0.0);
+
+                debug!("Primary bonding curve has {} SOL (after subtracting {} SOL rent)",
+                       actual_liquidity, RENT_EXEMPT_MINIMUM);
+
+                // Update the cache
+                {
+                    let mut cache = LIQUIDITY_CACHE.lock().await;
+                    cache.insert(cache_key, (actual_liquidity, std::time::Instant::now()));
+                }
+
+                return Ok((actual_liquidity >= liquidity_threshold, actual_liquidity));
+            },
+            Err(e) => {
+                debug!("Error getting primary bonding curve account: {}", e);
+                // Return default values to avoid delay
+                return Ok((false, 0.0));
+            }
+        },
+        Err(e) => {
+            debug!("Task error getting primary bonding curve account: {}", e);
+            // Return default values to avoid delay
+            return Ok((false, 0.0));
+        }
+    };
+
+    // We shouldn't reach here due to the early returns above
+    Ok((false, 0.0))
+}
+
+// Create an optimized RPC client with shorter timeouts
+async fn get_optimized_rpc_client() -> solana_client::rpc_client::RpcClient {
+    use solana_client::rpc_client::RpcClient;
+
+    // Only use Chainstack endpoint for RPC calls
+    let rpc_url = std::env::var("CHAINSTACK_ENDPOINT")
+        .unwrap_or_else(|_| "https://solana-mainnet.core.chainstack.com/b04d312222d7be6eefd6b31d84a303ab".to_string());
+
+    // Validate that the URL has a proper schema
+    let rpc_url = if !rpc_url.starts_with("http") {
+        format!("https://{}", rpc_url)
+    } else {
+        rpc_url
+    };
+
+    debug!("Creating optimized RPC client with URL: {}", rpc_url);
+
+    // Create client with shorter timeout
+    RpcClient::new_with_timeout_and_commitment(
+        rpc_url,
+        std::time::Duration::from_secs(2), // 2 second timeout
+        solana_sdk::commitment_config::CommitmentConfig::processed()
+    )
+}
+
+/// Check only the primary bonding curve account liquidity and subtract rent exemption
+/// This is faster than the original function as it only checks one account
+pub async fn check_token_primary_liquidity(
+    mint: &str,
+    liquidity_threshold: f64,
+) -> Result<(bool, f64), Box<dyn std::error::Error + Send + Sync>> {
+    use solana_client::rpc_client::RpcClient;
+    use solana_sdk::pubkey::Pubkey;
+    use std::str::FromStr;
+    
+    // Check cache first for recent results
+    let cache_key = format!("primary:{}", mint);
+    {
+        let cache = LIQUIDITY_CACHE.lock().await;
+        if let Some((balance, timestamp)) = cache.get(&cache_key) {
+            // Use cached value if less than 5 seconds old
+            if timestamp.elapsed() < std::time::Duration::from_secs(5) {
+                debug!("Using cached primary liquidity for {}: {} SOL", mint, balance);
+                return Ok((*balance >= liquidity_threshold, *balance));
+            }
+        }
+    }
+
+    // Get RPC client
+    let client = get_rpc_client().await;
     
     // The rent exempt minimum amount in SOL
     const RENT_EXEMPT_MINIMUM: f64 = 0.00203928;
     
     // Convert mint address to public key
-    let mint_pubkey = Pubkey::from_str(mint)?;
+    let mint_pubkey = Pubkey::from_str(mint)
+        .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))?;
     
-    // IMPROVEMENT: First try to directly get the primary bonding curve address
+    // Get the primary bonding curve address
     let (primary_bonding_curve, _) = get_bonding_curve_address(&mint_pubkey);
-    debug!("Checking primary bonding curve: {}", primary_bonding_curve);
+    debug!("Checking primary bonding curve for liquidity: {}", primary_bonding_curve);
     
-    // Check the primary bonding curve first (it's the one that matters most)
+    // Check the primary bonding curve
     match client.get_account(&primary_bonding_curve) {
         Ok(account) => {
             // Get total balance
@@ -598,109 +731,20 @@ pub async fn check_token_liquidity(
             // Subtract rent exempt minimum to get actual liquidity
             let actual_liquidity = (total_balance - RENT_EXEMPT_MINIMUM).max(0.0);
             
+            // Update the cache
+            {
+                let mut cache = LIQUIDITY_CACHE.lock().await;
+                cache.insert(cache_key, (actual_liquidity, std::time::Instant::now()));
+            }
+            
             debug!("Primary bonding curve has {} SOL (after subtracting {} SOL rent)",
                    actual_liquidity, RENT_EXEMPT_MINIMUM);
-            
-            return Ok((actual_liquidity >= liquidity_threshold, actual_liquidity));
-        },
-        Err(_) => {
-            debug!("Primary bonding curve not found, checking alternative method...");
-        }
-    }
-
-    // If we get here, we need to try the old method as a fallback
-    
-    // Convert bonding curve to public key
-    let bonding_curve_pubkey = match Pubkey::from_str(bonding_curve) {
-        Ok(pubkey) => pubkey,
-        Err(e) => {
-            debug!("Error parsing bonding curve pubkey: {}", e);
-            // Return 0.0 SOL if we can't parse the bonding curve
-            return Ok((false, 0.0));
-        }
-    };
-    
-    // Calculate the associated bonding curve address
-    let associated_bonding_curve = find_associated_bonding_curve(&mint_pubkey, &bonding_curve_pubkey);
-    
-    // Get account info to check liquidity
-    debug!("Checking associated account {} for liquidity (threshold: {} SOL)", associated_bonding_curve, liquidity_threshold);
-    match client.get_account(&associated_bonding_curve) {
-        Ok(account) => {
-            let balance = account.lamports as f64 / 1_000_000_000.0; // Convert lamports to SOL
-            debug!("Found account with {} SOL ({} lamports)", balance, account.lamports);
-            Ok((balance >= liquidity_threshold, balance))
-        },
-        Err(e) => {
-            debug!("Error retrieving associated account {}: {}", associated_bonding_curve, e);
-            
-            // We already tried the primary bonding curve above, so this is a real error
-            debug!("No valid bonding curve account found");
-            
-            // Return the original error
-            Err(format!("Failed to get account info for associated bonding curve: {}", e).into())
-        }
-    }
-}
-
-/// Check only the primary bonding curve account liquidity and subtract rent exemption
-/// This is faster than the original function as it only checks one account
-pub async fn check_token_primary_liquidity(
-    mint: &str,
-    liquidity_threshold: f64,
-) -> Result<(bool, f64), Box<dyn std::error::Error>> {
-    use solana_client::rpc_client::RpcClient;
-    use solana_sdk::pubkey::Pubkey;
-    use std::str::FromStr;
-
-    // The rent exempt minimum amount in SOL
-    const RENT_EXEMPT_MINIMUM: f64 = 0.00203928;
-
-    // Only use Chainstack endpoint for RPC calls
-    let rpc_url = std::env::var("CHAINSTACK_ENDPOINT")
-        .unwrap_or_else(|_| "https://solana-mainnet.core.chainstack.com/b04d312222d7be6eefd6b31d84a303ab".to_string());
-    
-    // Validate that the URL has a proper schema
-    let rpc_url = if !rpc_url.starts_with("http") {
-        format!("https://{}", rpc_url)
-    } else {
-        rpc_url
-    };
-    
-    debug!("Using Chainstack RPC URL for liquidity check: {}", rpc_url);
-    
-    // Create a Solana RPC client with processed commitment level
-    let client = RpcClient::new_with_commitment(
-        rpc_url,
-        solana_sdk::commitment_config::CommitmentConfig::processed()
-    );
-    
-    // Convert mint address to public key
-    let mint_pubkey = Pubkey::from_str(mint)?;
-    
-    // Derive the bonding curve address from the mint
-    let (bonding_curve_pubkey, _) = get_bonding_curve_address(&mint_pubkey);
-    
-    debug!("Checking liquidity for mint: {}", mint);
-    debug!("Derived bonding curve: {}", bonding_curve_pubkey);
-    
-    // Get primary bonding curve account info to check liquidity
-    match client.get_account(&bonding_curve_pubkey) {
-        Ok(account) => {
-            // Get total balance
-            let total_balance = account.lamports as f64 / 1_000_000_000.0; // Convert lamports to SOL
-            
-            // Subtract rent exempt minimum to get actual liquidity
-            let actual_liquidity = (total_balance - RENT_EXEMPT_MINIMUM).max(0.0);
-            
-            debug!("Found liquidity: {} SOL (after rent exemption)", actual_liquidity);
-            
-            // Check if actual liquidity meets threshold
+                   
             Ok((actual_liquidity >= liquidity_threshold, actual_liquidity))
         },
         Err(e) => {
-            warn!("Failed to get bonding curve account info: {}", e);
-            Err(format!("Failed to get account info: {}", e).into())
+            debug!("Error retrieving primary bonding curve account {}: {}", primary_bonding_curve, e);
+            Err(Box::<dyn std::error::Error + Send + Sync>::from(format!("Failed to get account info for primary bonding curve: {}", e)))
         }
     }
 }

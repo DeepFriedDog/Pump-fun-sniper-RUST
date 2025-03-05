@@ -251,7 +251,7 @@ pub async fn run_websocket_test(endpoint: &str) -> Result<Vec<TokenData>, Error>
     let timeout_duration = Duration::from_secs(cycle_duration);
     
     // Max tokens to collect per cycle (to prevent memory issues in indefinite mode)
-    let max_tokens_per_cycle = 100;
+    let max_tokens_per_cycle = 1; // Changed from 100 to 1 to return immediately with token data
     
     // Heartbeat/ping interval - every 30 seconds to keep connection alive
     let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
@@ -271,7 +271,7 @@ pub async fn run_websocket_test(endpoint: &str) -> Result<Vec<TokenData>, Error>
         if test_duration > 0 {
             info!("Status: WebSocket test running. Will listen for {} seconds", test_duration);
         } else {
-            info!("Status: WebSocket monitoring running indefinitely or until max token limit");
+            info!("Status: WebSocket monitoring running indefinitely or until token detection");
         }
     }
           
@@ -283,7 +283,7 @@ pub async fn run_websocket_test(endpoint: &str) -> Result<Vec<TokenData>, Error>
                 if test_duration > 0 {
                     info!("Test timeout reached after {} seconds. Exiting...", test_duration);
                 } else {
-                    info!("Monitoring cycle completed. Returning tokens collected so far.");
+                    info!("Monitoring cycle completed. Total tokens found so far: {}", token_creations);
                 }
                 break;
             }
@@ -295,14 +295,15 @@ pub async fn run_websocket_test(endpoint: &str) -> Result<Vec<TokenData>, Error>
                     warn!("WebSocket connection appears to be dead - no messages for {} seconds", 
                           last_message_time.elapsed().as_secs());
                     
-                    // Let the main loop handle reconnection
-                    return Err(anyhow!("WebSocket connection timeout - no messages received"));
+                    // Return immediately to allow reconnection
+                    return Ok(token_data_list);
                 }
                 
                 // Send a ping to keep the connection alive
                 if let Err(e) = ws_stream.send(Message::Ping(vec![1, 2, 3])).await {
                     warn!("Failed to send ping: {}", e);
-                    // Don't return an error here, just log it - the next message attempt will fail if connection is dead
+                    // Return immediately to allow reconnection
+                    return Ok(token_data_list);
                 } else if !quiet_mode {
                     debug!("Sent ping to keep WebSocket connection alive");
                 }
@@ -343,14 +344,11 @@ pub async fn run_websocket_test(endpoint: &str) -> Result<Vec<TokenData>, Error>
                                 // Parse message as JSON
                                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
                                     if let Some(token_data) = process_websocket_message(&json, &mut token_creations, quiet_mode) {
-                                        // Add token data to our list
+                                        // Return immediately with the token to prevent delay
                                         token_data_list.push(token_data);
                                         
-                                        // In indefinite mode, if we reach the max tokens per cycle, return early
-                                        if test_duration == 0 && token_data_list.len() >= max_tokens_per_cycle {
-                                            info!("Reached maximum tokens per cycle ({}). Returning batch.", max_tokens_per_cycle);
-                                            break;
-                                        }
+                                        // Return the token data immediately instead of waiting
+                                        return Ok(token_data_list);
                                     }
                                 }
                             },
@@ -363,6 +361,7 @@ pub async fn run_websocket_test(endpoint: &str) -> Result<Vec<TokenData>, Error>
                                 debug!("[{}] WebSocket ping received", chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
                                 if let Err(e) = ws_stream.send(Message::Pong(data)).await {
                                     error!("Failed to send pong response: {}", e);
+                                    return Ok(token_data_list);
                                 }
                             },
                             Message::Pong(_) => {
@@ -370,7 +369,7 @@ pub async fn run_websocket_test(endpoint: &str) -> Result<Vec<TokenData>, Error>
                             },
                             Message::Close(frame) => {
                                 info!("[{}] WebSocket close frame received: {:?}", chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true), frame);
-                                return Err(anyhow!("WebSocket connection closed by server"));
+                                return Ok(token_data_list);
                             },
                             _ => {
                                 debug!("[{}] Other WebSocket message type received", chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
@@ -379,23 +378,18 @@ pub async fn run_websocket_test(endpoint: &str) -> Result<Vec<TokenData>, Error>
                     },
                     Some(Err(e)) => {
                         warn!("WebSocket error: {}", e);
-                        return Err(anyhow!("WebSocket error: {}", e));
+                        return Ok(token_data_list);
                     },
                     None => {
                         info!("WebSocket connection closed");
-                        return Err(anyhow!("WebSocket connection closed unexpectedly"));
+                        return Ok(token_data_list);
                     }
                 }
             }
         }
     }
     
-    // Try to gracefully close the connection
-    let _ = ws_stream.send(Message::Close(None)).await;
-    
-    info!("WebSocket test complete. Processed {} messages, found {} new tokens.", 
-         message_count, token_creations);
-    
+    // Don't close the connection, just return the list
     Ok(token_data_list)
 }
 

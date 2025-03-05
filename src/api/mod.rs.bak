@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::collections::{VecDeque, HashMap};
 use tokio::sync::{mpsc, RwLock};
 use futures_util::{SinkExt, StreamExt};
-use tokio_tungstenite::{connect_async, tungstenite::protocol::Message as WsMessage, WebSocketStream, MaybeTlsStream};
+use tokio_tungstenite::{connect_async, tungstenite::{self, protocol::Message as WsMessage}, WebSocketStream, MaybeTlsStream};
 use tokio::net::TcpStream;
 use url::Url;
 use chrono::Utc;
@@ -29,15 +29,14 @@ use solana_sdk::instruction::Instruction;
 use solana_sdk::compute_budget::ComputeBudgetInstruction;
 use solana_sdk::system_instruction::SystemInstruction;
 use solana_sdk::hash::Hash;
-use solana_sdk::signer::keypair::Keypair;
+use solana_sdk::keypair::Keypair;
 use solana_sdk::signature::{Signature, Signer};
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::transaction::TransactionError;
 use tokio_tungstenite::tungstenite::http::Response;
 use crate::config;
-use solana_sdk::transaction::VersionedTransaction;
+use solana_sdk::transaction::{VersionedTransaction, Transaction as SolanaTransaction};
 use bincode;
-use reqwest::Request;
 
 // Lazy static definitions for bonding curve constants and token processing
 lazy_static! {
@@ -163,7 +162,6 @@ pub struct ApiResponse {
     #[serde(flatten)]
     #[allow(dead_code)] // Data field is needed for deserialization but not directly accessed
     pub data: Value, // Used for deserialization, even if not directly accessed
-    pub mint: String, // Adding mint field to match usage
 }
 
 #[derive(Debug, Deserialize)]
@@ -848,40 +846,25 @@ pub async fn fetch_tokens_from_api(client: &Arc<Client>) -> Result<Option<TokenD
 // Modified buy_token function in src/api/mod.rs
 pub async fn buy_token(
     client: &Client,
-    private_key: &str,
-    mint: &str,
+    mint: &Pubkey,
     amount: f64,
-    slippage: f64
-) -> Result<ApiResponse, anyhow::Error> {
-    // Convert private key to keypair
-    let wallet = Keypair::from_base58_string(private_key);
-    
-    // Convert mint string to Pubkey
-    let mint_pubkey = Pubkey::from_str(mint)?;
-    
+    wallet: &Keypair
+) -> Result<(), anyhow::Error> {
     // Prewarm connections if not already done
     prewarm_connections(client).await?;
     
     // Create the buy instruction
-    let instructions = create_buy_instructions(client, &mint_pubkey, amount, &wallet).await?;
+    let instructions = create_buy_instructions(client, mint, amount, wallet).await?;
     
     // Optimize the transaction with all our improvements
-    let optimized_tx = optimize_transaction(client, instructions, &wallet, mint).await?;
+    let optimized_tx = optimize_transaction(client, instructions, wallet, &mint.to_string()).await?;
     
     // Send with optimized settings
     let signature = send_optimized_transaction(client, &optimized_tx).await?;
     
     info!("Token purchase transaction successful: {}", signature);
     
-    // Return ApiResponse with success status
-    Ok(ApiResponse {
-        status: "success".to_string(),
-        data: json!({
-            "transaction": signature.to_string(),
-            "message": "Buy transaction sent successfully"
-        }),
-        mint: mint.to_string(),
-    })
+    Ok(())
 }
 
 pub async fn sell_token(
@@ -919,7 +902,6 @@ pub async fn sell_token(
             "signature": signature.to_string(),
             "message": "Transaction sent successfully"
         }),
-        mint: mint.to_string(),
     };
     
     Ok(api_response)
@@ -1469,15 +1451,7 @@ async fn prewarm_connections(client: &Client) -> Result<(), anyhow::Error> {
     
     // Pre-establish WebSocket connections if enabled
     if config::use_websocket() {
-        // Get the pool size from environment variable, default to 3 if not set
-        let pool_size = std::env::var("WEBSOCKET_CONNECTION_POOL_SIZE")
-            .unwrap_or_else(|_| "3".to_string())
-            .parse::<usize>()
-            .unwrap_or(3);
-            
-        info!("Initializing WebSocket connection pool with {} connections", pool_size);
-        
-        for _ in 0..pool_size {
+        for _ in 0..2 {  // Maintain 2 idle connections
             match establish_websocket_connection().await {
                 Ok(connection) => {
                     let mut pool = WS_CONNECTION_POOL.lock().unwrap_or_else(|e| {
@@ -1495,11 +1469,17 @@ async fn prewarm_connections(client: &Client) -> Result<(), anyhow::Error> {
     // Prefetch and cache recent blockhash
     match get_recent_blockhash(client).await {
         Ok(blockhash) => {
-            let mut cached = CACHED_BLOCKHASH.lock().unwrap();
-            *cached = (blockhash.to_string(), chrono::Utc::now().timestamp() as u64);
+            let mut cached = CACHED_BLOCKHASH.lock().unwrap_or_else(|e| {
+                error!("Failed to lock CACHED_BLOCKHASH: {}", e);
+                panic!("Lock poisoned");
+            });
+            *cached = (blockhash.to_string(), std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs());
             debug!("Cached recent blockhash: {}", blockhash);
         },
-        Err(e) => debug!("Failed to prefetch recent blockhash: {}", e),
+        Err(e) => debug!("Failed to prefetch blockhash: {}", e),
     }
     
     Ok(())
@@ -1553,9 +1533,7 @@ async fn optimize_transaction(
             Hash::from_str(&cached.0)?
         } else {
             debug!("Fetching fresh blockhash");
-            // Create a temporary RPC client to get the blockhash
-            let rpc_client = solana_client::rpc_client::RpcClient::new(chainstack_simple::get_chainstack_endpoint());
-            let fresh_blockhash = rpc_client.get_latest_blockhash()?;
+            let fresh_blockhash = client.get_latest_blockhash().await?;
             
             // Update cache
             let mut cached = CACHED_BLOCKHASH.lock().unwrap();
@@ -1584,14 +1562,11 @@ async fn optimize_transaction(
         &blockhash
     );
     
-    // Create and sign the transaction
-    let mut tx = Transaction::new_unsigned(message);
-    tx.sign(&[payer], blockhash);
+    // Create and sign the versioned transaction
+    let tx = VersionedTransaction::from(Transaction::new_unsigned(message))
+        .sign(&[payer], blockhash);
     
-    // Convert to versioned transaction
-    let versioned_tx = VersionedTransaction::from(tx);
-    
-    Ok(versioned_tx)
+    Ok(tx)
 }
 
 // Create sell instructions function to match create_buy_instructions
@@ -1685,49 +1660,19 @@ async fn send_optimized_transaction(
 async fn establish_websocket_connection() -> Result<(WebSocketStream<MaybeTlsStream<TcpStream>>, Response<()>), anyhow::Error> {
     let ws_url = Url::parse(&config::get_wss_endpoint())?;
     
-    // Use connect_async directly without Request creation
-    let ws_stream_result = connect_async(ws_url).await;
-    
-    // Handle the result of connect_async
-    match ws_stream_result {
-        Ok((stream, _)) => {
-            info!("📡 Connected to websocket");
-            
-            // Attempt to set TCP_NODELAY on the underlying TCP stream if possible
-            if let MaybeTlsStream::Plain(tcp_stream) = stream.get_ref() {
-                if let Err(e) = tcp_stream.set_nodelay(true) {
-                    warn!("Failed to set TCP_NODELAY on WebSocket connection: {}", e);
-                }
-            }
-            
-            // Create a new empty Response<()> instead of using transmute
-            let response_converted = Response::new(());
-            Ok((stream, response_converted))
-        },
+    // Establish connection with better error handling
+    let (ws_stream, response) = match connect_async(ws_url.clone()).await {
+        Ok(conn) => conn,
         Err(e) => {
-            // Try one more time with minimal backoff
-            warn!("Failed to connect to WebSocket, retrying: {}", e);
-            
-            // Wait before retry with minimal backoff (50-100ms)
-            let backoff = rand::thread_rng().gen_range(50..100);
+            error!("WebSocket connection failed: {}", e);
+            // Wait before retry with exponential backoff
+            let backoff = rand::thread_rng().gen_range(100..500);
             tokio::time::sleep(Duration::from_millis(backoff)).await;
-            
-            // Create a new URL for the retry
-            let retry_ws_url = Url::parse(&config::get_wss_endpoint())?;
-            let (stream, _) = connect_async(retry_ws_url).await?;
-            
-            // Attempt to set TCP_NODELAY on the underlying TCP stream if possible
-            if let MaybeTlsStream::Plain(tcp_stream) = stream.get_ref() {
-                if let Err(e) = tcp_stream.set_nodelay(true) {
-                    warn!("Failed to set TCP_NODELAY on WebSocket connection: {}", e);
-                }
-            }
-            
-            // Create a new empty Response<()>
-            let response_converted = Response::new(());
-            Ok((stream, response_converted))
+            connect_async(ws_url).await?
         }
-    }
+    };
+    
+    Ok((ws_stream, response))
 }
 
 async fn create_buy_instructions(
@@ -1755,17 +1700,4 @@ async fn get_recent_blockhash(client: &Client) -> Result<Hash, anyhow::Error> {
 // Helper function to get latest blockhash
 async fn get_latest_blockhash(client: &Client) -> Result<Hash, anyhow::Error> {
     get_recent_blockhash(client).await
-}
-
-fn generate_key() -> String {
-    use base64::{engine::general_purpose::STANDARD, Engine};
-    use rand::Rng;
-    
-    // Generate 16 random bytes
-    let mut key = [0u8; 16];
-    rand::thread_rng().fill(&mut key);
-    
-    // Encode as base64
-    STANDARD.encode(key)
 } 
-

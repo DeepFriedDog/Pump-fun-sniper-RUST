@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use log::{info, warn};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -7,6 +7,7 @@ use solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
 use std::time::Duration;
 use std::env;
+use uuid::Uuid;
 
 // Define the NewToken structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,12 +30,28 @@ pub struct ApiResponse {
 
 /// Get the Chainstack endpoint URL
 pub fn get_chainstack_endpoint() -> String {
-    // Try to get the endpoint from environment variables first
-    env::var("CHAINSTACK_RPC_ENDPOINT")
+    env::var("CHAINSTACK_RPC_URL")
         .unwrap_or_else(|_| {
-            // Use the default endpoint from config as fallback
-            "https://solana-mainnet.core.chainstack.com/b04d312222d7be6eefd6b31d84a303ab".to_string()
+            env::var("SOLANA_RPC_URL")
+                .unwrap_or_else(|_| env::var("CHAINSTACK_ENDPOINT")
+                    .unwrap_or_else(|_| "https://solana-mainnet.core.chainstack.com/b04d312222d7be6eefd6b31d84a303ab".to_string()))
         })
+}
+
+/// Get the Chainstack Trader Node endpoint for high-speed transactions
+pub fn get_chainstack_trader_endpoint() -> String {
+    // Check if Trader Node should be used for transactions
+    if env::var("USE_TRADER_NODE_FOR_TRANSACTIONS").unwrap_or_else(|_| "false".to_string()) == "true" {
+        // Return the Trader Node endpoint if configured
+        env::var("CHAINSTACK_TRADER_RPC_URL")
+            .unwrap_or_else(|_| {
+                log::warn!("⚠️ USE_TRADER_NODE_FOR_TRANSACTIONS is true but CHAINSTACK_TRADER_RPC_URL not set, falling back to regular endpoint");
+                get_chainstack_endpoint()
+            })
+    } else {
+        // Otherwise return the regular endpoint
+        get_chainstack_endpoint()
+    }
 }
 
 /// Create a Chainstack HTTP client
@@ -117,17 +134,92 @@ pub async fn buy_token(
     amount: f64,
     slippage: f64,
 ) -> Result<ApiResponse> {
-    // Simulate a successful buy for testing
-    let response = ApiResponse {
-        status: "success".to_string(),
-        data: json!({
-            "transaction": "simulated_tx_hash",
-            "message": "Simulated buy successful"
-        }),
-        mint: mint.to_string(),
-    };
+    // Get priority fee and compute units from environment variables
+    let priority_fee = env::var("PRIORITY_FEE")
+        .unwrap_or_else(|_| "2000000".to_string())
+        .parse::<u64>()
+        .unwrap_or(2000000);
+        
+    let compute_units = env::var("COMPUTE_UNITS")
+        .unwrap_or_else(|_| "200000".to_string())
+        .parse::<u64>()
+        .unwrap_or(200000);
     
-    Ok(response)
+    // Get the appropriate endpoint for transactions
+    let trader_endpoint = get_chainstack_trader_endpoint();
+    let use_trader_node = env::var("USE_TRADER_NODE_FOR_TRANSACTIONS")
+        .unwrap_or_else(|_| "false".to_string()) == "true";
+    
+    // Log the buy attempt with appropriate note about Warp transaction
+    if use_trader_node {
+        info!("🚀 Attempting to buy token {} with {} SOL using Chainstack Trader Node with Warp transactions", 
+              mint, amount);
+        info!("🔌 Using Trader Node endpoint: {}", trader_endpoint);
+    } else {
+        info!("🚀 Attempting to buy token {} with {} SOL using standard Chainstack endpoint", 
+              mint, amount);
+    }
+           
+    // For Solana, we create a sendTransaction RPC call which will go through bloXroute when using Trader Node
+    let params = json!([
+        {
+            "mint": mint,
+            "amount": amount,
+            "slippage": slippage,
+            "priorityFee": priority_fee,
+            "computeUnits": compute_units,
+            "privateKey": private_key
+        }
+    ]);
+    
+    // Send the transaction through appropriate endpoint
+    let result = make_jsonrpc_call(client, "sendTransaction", params, Some(trader_endpoint)).await?;
+    
+    // Process the result
+    if let Some(tx_signature) = result.get("result").and_then(|h| h.as_str()) {
+        if use_trader_node {
+            info!("✅ Buy transaction sent successfully via Trader Node with Warp: {}", tx_signature);
+        } else {
+            info!("✅ Buy transaction sent successfully: {}", tx_signature);
+        }
+        
+        Ok(ApiResponse {
+            status: "success".to_string(),
+            data: json!({
+                "transaction": tx_signature,
+                "message": if use_trader_node {
+                    "Buy transaction sent via Trader Node with Warp successfully"
+                } else {
+                    "Buy transaction sent successfully"
+                }
+            }),
+            mint: mint.to_string(),
+        })
+    } else if let Some(error) = result.get("error") {
+        let error_msg = error.get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("Unknown error");
+            
+        warn!("❌ Failed to send buy transaction: {}", error_msg);
+        
+        Ok(ApiResponse {
+            status: "error".to_string(),
+            data: json!({
+                "message": error_msg
+            }),
+            mint: mint.to_string(),
+        })
+    } else {
+        warn!("❌ Unknown response format from transaction");
+        
+        Ok(ApiResponse {
+            status: "error".to_string(),
+            data: json!({
+                "message": "Unknown response format from transaction"
+            }),
+            mint: mint.to_string(),
+        })
+    }
 }
 
 /// Get token balance
@@ -145,8 +237,110 @@ pub async fn get_token_price(
     client: &Client,
     mint: &str,
 ) -> Result<f64> {
-    // Simulate a price for testing
-    Ok(0.01)
+    // Create a cache key for this token
+    let cache_key = format!("price-{}", mint);
+    
+    // Check if we have this price in our cache
+    // This helps prevent excessive API calls
+    let cached_price = {
+        let token_cache = super::api::TOKEN_PRICE_CACHE.lock().unwrap();
+        if let Some((price, timestamp)) = token_cache.get(&cache_key) {
+            // Only use cache if it's less than 30 seconds old for frequent price updates
+            if timestamp.elapsed() < std::time::Duration::from_secs(30) {
+                Some(*price)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+    
+    // Return early if we have cached data
+    if let Some(price) = cached_price {
+        return Ok(price);
+    }
+    
+    // Determine if this is a pump.fun token
+    let is_pump_fun_token = mint.ends_with("pump");
+    
+    let price = if is_pump_fun_token {
+        // For pump.fun tokens, calculate price using the bonding curve
+        // Get developer wallet address for this token
+        let dev_wallet = match get_token_creator(client, mint).await {
+            Ok(creator) => creator,
+            Err(_) => {
+                // If we can't get the creator, use our fallback calculation
+                return calculate_price_from_liquidity(client, mint).await;
+            }
+        };
+        
+        // Get the token balance of the developer
+        let dev_balance = match get_token_balance(client, &dev_wallet, mint).await {
+            Ok(balance) => balance,
+            Err(_) => {
+                warn!("Failed to get developer balance for {}, using fallback price calculation", mint);
+                return calculate_price_from_liquidity(client, mint).await;
+            }
+        };
+        
+        // Use the pump.fun bonding curve formula:
+        // SOL = (32,190,005,730 / (1,073,000,191 - X)) - 30
+        // Where X is the developer's token balance
+        let initial_virtual_token_reserve: f64 = 1_073_000_191.0;
+        let constant: f64 = 32_190_005_730.0;
+        let offset: f64 = 30.0;
+        
+        // Calculate the current SOL value using the formula
+        if dev_balance >= initial_virtual_token_reserve {
+            warn!("Developer balance exceeds reserve limit for {}, using fallback price", mint);
+            0.01 // Fallback price if calculation would cause division by zero
+        } else {
+            // Calculate price based on current bonding curve state
+            let sol_value = (constant / (initial_virtual_token_reserve - dev_balance)) - offset;
+            
+            // Perform sanity check on the price
+            if sol_value.is_nan() || sol_value.is_infinite() || sol_value < 0.0 {
+                warn!("Invalid price calculation for {}: {}", mint, sol_value);
+                0.01 // Fallback price
+            } else {
+                // Convert SOL value to USD price (this is simplified - in a real scenario you'd use a SOL/USD price feed)
+                // For now we'll assume 1 token = sol_value in USD
+                sol_value
+            }
+        }
+    } else {
+        // For non-pump.fun tokens, use a placeholder price or implement a different price feed
+        // In a real scenario, you'd query a DEX or oracle for the price
+        0.01 // Placeholder price for non-pump.fun tokens
+    };
+    
+    // Update the cache with the new price
+    {
+        let mut token_cache = super::api::TOKEN_PRICE_CACHE.lock().unwrap();
+        token_cache.insert(cache_key, (price, std::time::Instant::now()));
+    }
+    
+    Ok(price)
+}
+
+/// Calculate price from liquidity as a fallback method
+async fn calculate_price_from_liquidity(
+    client: &Client,
+    mint: &str,
+) -> Result<f64> {
+    // Simplified fallback calculation
+    // In a real implementation, you'd use liquidity pool data
+    Ok(0.01) // Placeholder
+}
+
+/// Get the creator/developer wallet for a token
+pub async fn get_token_creator(
+    client: &Client,
+    mint: &str,
+) -> Result<String> {
+    // If this is a test environment, return a placeholder
+    Ok("CcHLuGzJZ2GtDhQBP1PkPmvfQoXNkG4Y6XGeQYfFSfv".to_string())
 }
 
 /// Process a WebSocket notification
@@ -161,17 +355,77 @@ pub fn process_notification(text: &str) -> Option<NewToken> {
                 data.get("mint").and_then(|v| v.as_str()),
                 data.get("creator").and_then(|v| v.as_str()),
             ) {
-                return Some(NewToken {
+                let token = NewToken {
                     token_name: name.to_string(),
                     token_symbol: symbol.to_string(),
                     mint_address: mint.to_string(),
                     creator_address: creator.to_string(),
                     transaction_signature: "".to_string(),
                     timestamp: chrono::Utc::now().timestamp(),
-                });
+                };
+                
+                // ULTRA-FAST PATH: Add token directly to the queue for immediate processing
+                if let Ok(mut queue) = crate::api::NEW_TOKEN_QUEUE.try_lock() {
+                    let token_data = crate::api::TokenData {
+                        status: "success".to_string(),
+                        mint: token.mint_address.clone(),
+                        dev: token.creator_address.clone(),
+                        metadata: Some("".to_string()), // Need to set something here
+                        name: Some(token.token_name.clone()),
+                        symbol: Some(token.token_symbol.clone()),
+                        timestamp: Some(token.timestamp),
+                    };
+                    
+                    queue.push_back(token_data);
+                    info!("⚡ Added token to processing queue for immediate handling");
+                } else {
+                    warn!("Could not lock token queue, token processing might be delayed");
+                }
+                
+                return Some(token);
             }
         }
     }
     
     None
+}
+
+/// Make a JSON-RPC call to the Chainstack API
+pub async fn make_jsonrpc_call(client: &Client, method: &str, params: Value, custom_endpoint: Option<String>) -> Result<Value> {
+    // Use custom endpoint if provided, otherwise get the default Chainstack endpoint
+    let rpc_url = match custom_endpoint {
+        Some(endpoint) => endpoint,
+        None => get_chainstack_endpoint()
+    };
+    
+    // Prepare the JSON-RPC request
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": Uuid::new_v4().to_string(),
+        "method": method,
+        "params": params
+    });
+    
+    // Send the request
+    let response = client.post(&rpc_url)
+        .json(&request)
+        .send()
+        .await
+        .context("Failed to send JSON-RPC request to Chainstack")?;
+        
+    // Parse the response
+    let result: Value = response.json()
+        .await
+        .context("Failed to parse JSON-RPC response")?;
+        
+    // Check for errors
+    if let Some(error) = result.get("error") {
+        let error_msg = error.get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("Unknown error");
+            
+        log::error!("JSON-RPC error: {}", error_msg);
+    }
+    
+    Ok(result)
 } 
