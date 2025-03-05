@@ -4,10 +4,11 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use solana_sdk::pubkey::Pubkey;
+use std::env;
 use std::str::FromStr;
 use std::time::Duration;
-use std::env;
 use uuid::Uuid;
+use url;
 
 // Define the NewToken structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,18 +31,22 @@ pub struct ApiResponse {
 
 /// Get the Chainstack endpoint URL
 pub fn get_chainstack_endpoint() -> String {
-    env::var("CHAINSTACK_RPC_URL")
-        .unwrap_or_else(|_| {
-            env::var("SOLANA_RPC_URL")
-                .unwrap_or_else(|_| env::var("CHAINSTACK_ENDPOINT")
-                    .unwrap_or_else(|_| "https://solana-mainnet.core.chainstack.com/b04d312222d7be6eefd6b31d84a303ab".to_string()))
+    env::var("CHAINSTACK_RPC_URL").unwrap_or_else(|_| {
+        env::var("SOLANA_RPC_URL").unwrap_or_else(|_| {
+            env::var("CHAINSTACK_ENDPOINT").unwrap_or_else(|_| {
+                "https://solana-mainnet.core.chainstack.com/b04d312222d7be6eefd6b31d84a303ab"
+                    .to_string()
+            })
         })
+    })
 }
 
 /// Get the Chainstack Trader Node endpoint for high-speed transactions
 pub fn get_chainstack_trader_endpoint() -> String {
     // Check if Trader Node should be used for transactions
-    if env::var("USE_TRADER_NODE_FOR_TRANSACTIONS").unwrap_or_else(|_| "false".to_string()) == "true" {
+    if env::var("USE_TRADER_NODE_FOR_TRANSACTIONS").unwrap_or_else(|_| "false".to_string())
+        == "true"
+    {
         // Return the Trader Node endpoint if configured
         env::var("CHAINSTACK_TRADER_RPC_URL")
             .unwrap_or_else(|_| {
@@ -69,18 +74,46 @@ pub fn create_chainstack_client() -> Client {
 /// Get the authenticated WebSocket URL
 pub fn get_authenticated_wss_url() -> String {
     // Try to get the endpoint from environment variables first
-    env::var("CHAINSTACK_WSS_ENDPOINT")
-        .unwrap_or_else(|_| {
-            // Use the default endpoint from config as fallback
-            "wss://solana-mainnet.core.chainstack.com/b04d312222d7be6eefd6b31d84a303ab".to_string()
-        })
+    let ws_endpoint = env::var("CHAINSTACK_WSS_ENDPOINT").unwrap_or_else(|_| {
+        // Use the default endpoint from config as fallback
+        "wss://solana-mainnet.core.chainstack.com/b04d312222d7be6eefd6b31d84a303ab".to_string()
+    });
+    
+    // Check if we need to use authentication
+    let use_auth = env::var("USE_CHAINSTACK_AUTH")
+        .unwrap_or_else(|_| "false".to_string())
+        .to_lowercase() == "true";
+    
+    if use_auth {
+        warn!("WebSocket authentication via URL is enabled, but this might not work with all providers");
+        
+        // Some WebSocket providers use a different format for authentication
+        // Let's try the base64 encoded Authorization header approach
+        let username = env::var("CHAINSTACK_USERNAME").unwrap_or_default();
+        let password = env::var("CHAINSTACK_PASSWORD").unwrap_or_default();
+        
+        if !username.is_empty() && !password.is_empty() {
+            // For WebSocket connections, we need to modify the connection code in websocket_test.rs
+            // and websocket_reconnect.rs to include the Authorization header
+            // For now, we'll just log a warning and return the endpoint
+            info!("WebSocket authentication credentials will be used in the connection code");
+            
+            // We'll return the URL as is - the actual auth will happen in the connection code
+            return ws_endpoint;
+        } else {
+            warn!("USE_CHAINSTACK_AUTH is true but username or password is missing");
+        }
+    }
+    
+    // Return the original endpoint
+    ws_endpoint
 }
 
 /// Create a Solana RPC client using the given RPC URL
 pub fn create_solana_client(rpc_url: &str) -> solana_client::rpc_client::RpcClient {
     use solana_client::rpc_client::RpcClient;
     use solana_sdk::commitment_config::CommitmentConfig;
-    
+
     // Get a valid Chainstack endpoint URL with proper schema
     let endpoint = if !rpc_url.is_empty() && rpc_url != "default" {
         // Use provided URL if it exists
@@ -92,16 +125,18 @@ pub fn create_solana_client(rpc_url: &str) -> solana_client::rpc_client::RpcClie
         url
     } else {
         // Otherwise get from env or use default
-        let env_url = std::env::var("CHAINSTACK_ENDPOINT")
-            .unwrap_or_else(|_| "https://solana-mainnet.core.chainstack.com/b04d312222d7be6eefd6b31d84a303ab".to_string());
-            
+        let env_url = std::env::var("CHAINSTACK_ENDPOINT").unwrap_or_else(|_| {
+            "https://solana-mainnet.core.chainstack.com/b04d312222d7be6eefd6b31d84a303ab"
+                .to_string()
+        });
+
         if !env_url.starts_with("http") {
             format!("https://{}", env_url)
         } else {
             env_url
         }
     };
-    
+
     // Create client with "processed" commitment config for fastest response
     RpcClient::new_with_commitment(endpoint, CommitmentConfig::processed())
 }
@@ -110,19 +145,19 @@ pub fn create_solana_client(rpc_url: &str) -> solana_client::rpc_client::RpcClie
 pub fn calculate_associated_bonding_curve(mint: &str, bonding_curve: &str) -> Result<String> {
     let mint_pubkey = Pubkey::from_str(mint)?;
     let bonding_curve_pubkey = Pubkey::from_str(bonding_curve)?;
-    
+
     // Calculate the associated bonding curve address
     let seeds = &[
         b"bonding_curve",
         mint_pubkey.as_ref(),
         bonding_curve_pubkey.as_ref(),
     ];
-    
+
     let (derived_address, _) = Pubkey::find_program_address(
         seeds,
         &Pubkey::from_str("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P").unwrap(),
     );
-    
+
     Ok(derived_address.to_string())
 }
 
@@ -139,27 +174,30 @@ pub async fn buy_token(
         .unwrap_or_else(|_| "2000000".to_string())
         .parse::<u64>()
         .unwrap_or(2000000);
-        
+
     let compute_units = env::var("COMPUTE_UNITS")
         .unwrap_or_else(|_| "200000".to_string())
         .parse::<u64>()
         .unwrap_or(200000);
-    
+
     // Get the appropriate endpoint for transactions
     let trader_endpoint = get_chainstack_trader_endpoint();
     let use_trader_node = env::var("USE_TRADER_NODE_FOR_TRANSACTIONS")
-        .unwrap_or_else(|_| "false".to_string()) == "true";
-    
+        .unwrap_or_else(|_| "false".to_string())
+        == "true";
+
     // Log the buy attempt with appropriate note about Warp transaction
     if use_trader_node {
         info!("🚀 Attempting to buy token {} with {} SOL using Chainstack Trader Node with Warp transactions", 
               mint, amount);
         info!("🔌 Using Trader Node endpoint: {}", trader_endpoint);
     } else {
-        info!("🚀 Attempting to buy token {} with {} SOL using standard Chainstack endpoint", 
-              mint, amount);
+        info!(
+            "🚀 Attempting to buy token {} with {} SOL using standard Chainstack endpoint",
+            mint, amount
+        );
     }
-           
+
     // For Solana, we create a sendTransaction RPC call which will go through bloXroute when using Trader Node
     let params = json!([
         {
@@ -171,18 +209,22 @@ pub async fn buy_token(
             "privateKey": private_key
         }
     ]);
-    
+
     // Send the transaction through appropriate endpoint
-    let result = make_jsonrpc_call(client, "sendTransaction", params, Some(trader_endpoint)).await?;
-    
+    let result =
+        make_jsonrpc_call(client, "sendTransaction", params, Some(trader_endpoint)).await?;
+
     // Process the result
     if let Some(tx_signature) = result.get("result").and_then(|h| h.as_str()) {
         if use_trader_node {
-            info!("✅ Buy transaction sent successfully via Trader Node with Warp: {}", tx_signature);
+            info!(
+                "✅ Buy transaction sent successfully via Trader Node with Warp: {}",
+                tx_signature
+            );
         } else {
             info!("✅ Buy transaction sent successfully: {}", tx_signature);
         }
-        
+
         Ok(ApiResponse {
             status: "success".to_string(),
             data: json!({
@@ -196,12 +238,13 @@ pub async fn buy_token(
             mint: mint.to_string(),
         })
     } else if let Some(error) = result.get("error") {
-        let error_msg = error.get("message")
+        let error_msg = error
+            .get("message")
             .and_then(|m| m.as_str())
             .unwrap_or("Unknown error");
-            
+
         warn!("❌ Failed to send buy transaction: {}", error_msg);
-        
+
         Ok(ApiResponse {
             status: "error".to_string(),
             data: json!({
@@ -211,7 +254,7 @@ pub async fn buy_token(
         })
     } else {
         warn!("❌ Unknown response format from transaction");
-        
+
         Ok(ApiResponse {
             status: "error".to_string(),
             data: json!({
@@ -223,23 +266,16 @@ pub async fn buy_token(
 }
 
 /// Get token balance
-pub async fn get_token_balance(
-    client: &Client,
-    wallet: &str,
-    mint: &str,
-) -> Result<f64> {
+pub async fn get_token_balance(client: &Client, wallet: &str, mint: &str) -> Result<f64> {
     // Simulate a balance for testing
     Ok(100.0)
 }
 
 /// Get token price
-pub async fn get_token_price(
-    client: &Client,
-    mint: &str,
-) -> Result<f64> {
+pub async fn get_token_price(client: &Client, mint: &str) -> Result<f64> {
     // Create a cache key for this token
     let cache_key = format!("price-{}", mint);
-    
+
     // Check if we have this price in our cache
     // This helps prevent excessive API calls
     let cached_price = {
@@ -255,15 +291,15 @@ pub async fn get_token_price(
             None
         }
     };
-    
+
     // Return early if we have cached data
     if let Some(price) = cached_price {
         return Ok(price);
     }
-    
+
     // Determine if this is a pump.fun token
     let is_pump_fun_token = mint.ends_with("pump");
-    
+
     let price = if is_pump_fun_token {
         // For pump.fun tokens, calculate price using the bonding curve
         // Get developer wallet address for this token
@@ -274,31 +310,37 @@ pub async fn get_token_price(
                 return calculate_price_from_liquidity(client, mint).await;
             }
         };
-        
+
         // Get the token balance of the developer
         let dev_balance = match get_token_balance(client, &dev_wallet, mint).await {
             Ok(balance) => balance,
             Err(_) => {
-                warn!("Failed to get developer balance for {}, using fallback price calculation", mint);
+                warn!(
+                    "Failed to get developer balance for {}, using fallback price calculation",
+                    mint
+                );
                 return calculate_price_from_liquidity(client, mint).await;
             }
         };
-        
+
         // Use the pump.fun bonding curve formula:
         // SOL = (32,190,005,730 / (1,073,000,191 - X)) - 30
         // Where X is the developer's token balance
         let initial_virtual_token_reserve: f64 = 1_073_000_191.0;
         let constant: f64 = 32_190_005_730.0;
         let offset: f64 = 30.0;
-        
+
         // Calculate the current SOL value using the formula
         if dev_balance >= initial_virtual_token_reserve {
-            warn!("Developer balance exceeds reserve limit for {}, using fallback price", mint);
+            warn!(
+                "Developer balance exceeds reserve limit for {}, using fallback price",
+                mint
+            );
             0.01 // Fallback price if calculation would cause division by zero
         } else {
             // Calculate price based on current bonding curve state
             let sol_value = (constant / (initial_virtual_token_reserve - dev_balance)) - offset;
-            
+
             // Perform sanity check on the price
             if sol_value.is_nan() || sol_value.is_infinite() || sol_value < 0.0 {
                 warn!("Invalid price calculation for {}: {}", mint, sol_value);
@@ -314,31 +356,25 @@ pub async fn get_token_price(
         // In a real scenario, you'd query a DEX or oracle for the price
         0.01 // Placeholder price for non-pump.fun tokens
     };
-    
+
     // Update the cache with the new price
     {
         let mut token_cache = super::api::TOKEN_PRICE_CACHE.lock().unwrap();
         token_cache.insert(cache_key, (price, std::time::Instant::now()));
     }
-    
+
     Ok(price)
 }
 
 /// Calculate price from liquidity as a fallback method
-async fn calculate_price_from_liquidity(
-    client: &Client,
-    mint: &str,
-) -> Result<f64> {
+async fn calculate_price_from_liquidity(client: &Client, mint: &str) -> Result<f64> {
     // Simplified fallback calculation
     // In a real implementation, you'd use liquidity pool data
     Ok(0.01) // Placeholder
 }
 
 /// Get the creator/developer wallet for a token
-pub async fn get_token_creator(
-    client: &Client,
-    mint: &str,
-) -> Result<String> {
+pub async fn get_token_creator(client: &Client, mint: &str) -> Result<String> {
     // If this is a test environment, return a placeholder
     Ok("CcHLuGzJZ2GtDhQBP1PkPmvfQoXNkG4Y6XGeQYfFSfv".to_string())
 }
@@ -363,7 +399,7 @@ pub fn process_notification(text: &str) -> Option<NewToken> {
                     transaction_signature: "".to_string(),
                     timestamp: chrono::Utc::now().timestamp(),
                 };
-                
+
                 // ULTRA-FAST PATH: Add token directly to the queue for immediate processing
                 if let Ok(mut queue) = crate::api::NEW_TOKEN_QUEUE.try_lock() {
                     let token_data = crate::api::TokenData {
@@ -375,29 +411,34 @@ pub fn process_notification(text: &str) -> Option<NewToken> {
                         symbol: Some(token.token_symbol.clone()),
                         timestamp: Some(token.timestamp),
                     };
-                    
+
                     queue.push_back(token_data);
                     info!("⚡ Added token to processing queue for immediate handling");
                 } else {
                     warn!("Could not lock token queue, token processing might be delayed");
                 }
-                
+
                 return Some(token);
             }
         }
     }
-    
+
     None
 }
 
 /// Make a JSON-RPC call to the Chainstack API
-pub async fn make_jsonrpc_call(client: &Client, method: &str, params: Value, custom_endpoint: Option<String>) -> Result<Value> {
+pub async fn make_jsonrpc_call(
+    client: &Client,
+    method: &str,
+    params: Value,
+    custom_endpoint: Option<String>,
+) -> Result<Value> {
     // Use custom endpoint if provided, otherwise get the default Chainstack endpoint
     let rpc_url = match custom_endpoint {
         Some(endpoint) => endpoint,
-        None => get_chainstack_endpoint()
+        None => get_chainstack_endpoint(),
     };
-    
+
     // Prepare the JSON-RPC request
     let request = json!({
         "jsonrpc": "2.0",
@@ -405,27 +446,30 @@ pub async fn make_jsonrpc_call(client: &Client, method: &str, params: Value, cus
         "method": method,
         "params": params
     });
-    
+
     // Send the request
-    let response = client.post(&rpc_url)
+    let response = client
+        .post(&rpc_url)
         .json(&request)
         .send()
         .await
         .context("Failed to send JSON-RPC request to Chainstack")?;
-        
+
     // Parse the response
-    let result: Value = response.json()
+    let result: Value = response
+        .json()
         .await
         .context("Failed to parse JSON-RPC response")?;
-        
+
     // Check for errors
     if let Some(error) = result.get("error") {
-        let error_msg = error.get("message")
+        let error_msg = error
+            .get("message")
             .and_then(|m| m.as_str())
             .unwrap_or("Unknown error");
-            
+
         log::error!("JSON-RPC error: {}", error_msg);
     }
-    
+
     Ok(result)
-} 
+}

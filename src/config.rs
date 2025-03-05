@@ -1,8 +1,8 @@
-use solana_program::pubkey::Pubkey;
-use std::str::FromStr;
 use dotenv::dotenv;
-use std::env;
 use lazy_static::lazy_static;
+use solana_program::pubkey::Pubkey;
+use std::env;
+use std::str::FromStr;
 
 // WebSocket endpoint for the token monitor
 pub fn get_wss_endpoint() -> String {
@@ -14,7 +14,8 @@ pub fn get_wss_endpoint() -> String {
 }
 
 // Default WebSocket endpoint for the token monitor
-pub const WSS_ENDPOINT: &str = "wss://solana-mainnet.core.chainstack.com/b04d312222d7be6eefd6b31d84a303ab";
+pub const WSS_ENDPOINT: &str =
+    "wss://solana-mainnet.core.chainstack.com/b04d312222d7be6eefd6b31d84a303ab";
 
 lazy_static! {
     // Pump.fun program ID
@@ -63,5 +64,6 @@ pub fn use_websocket() -> bool {
     dotenv().ok(); // Load .env file if exists
     env::var("USE_WEBSOCKET")
         .unwrap_or_else(|_| "true".to_string())
-        .to_lowercase() == "true"
-} 
+        .to_lowercase()
+        == "true"
+}

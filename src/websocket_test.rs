@@ -1,6 +1,7 @@
-use anyhow::{Result, Error, anyhow};
+use anyhow::{anyhow, Error, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use bs58;
+use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use log::{debug, error, info, warn};
 use serde_json::{json, Value};
@@ -9,7 +10,6 @@ use std::str::FromStr;
 use std::time::{Duration, Instant};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use url::Url;
-use chrono::Utc;
 
 use crate::config::{ATA_PROGRAM_ID, PUMP_PROGRAM_ID, TOKEN_PROGRAM_ID};
 
@@ -20,7 +20,7 @@ pub fn find_associated_bonding_curve(mint: &Pubkey, bonding_curve: &Pubkey) -> P
         TOKEN_PROGRAM_ID.as_ref(),
         mint.as_ref(),
     ];
-    
+
     let (derived_address, _) = Pubkey::find_program_address(seeds, &ATA_PROGRAM_ID);
     derived_address
 }
@@ -28,7 +28,10 @@ pub fn find_associated_bonding_curve(mint: &Pubkey, bonding_curve: &Pubkey) -> P
 /// Parse the create instruction data
 fn parse_create_instruction(data: &[u8]) -> Option<TokenData> {
     if data.len() < 8 {
-        debug!("Data too short to be a valid instruction: {} bytes", data.len());
+        debug!(
+            "Data too short to be a valid instruction: {} bytes",
+            data.len()
+        );
         return None;
     }
 
@@ -44,21 +47,21 @@ fn parse_create_instruction(data: &[u8]) -> Option<TokenData> {
             debug!("Offset out of bounds when reading string length");
             return None;
         }
-        
+
         let length = u32::from_le_bytes([
-            data[*offset], 
-            data[*offset + 1], 
-            data[*offset + 2], 
-            data[*offset + 3]
+            data[*offset],
+            data[*offset + 1],
+            data[*offset + 2],
+            data[*offset + 3],
         ]) as usize;
-        
+
         *offset += 4;
-        
+
         if *offset + length > data.len() {
             debug!("String content would exceed data bounds");
             return None;
         }
-        
+
         let value = match std::str::from_utf8(&data[*offset..*offset + length]) {
             Ok(s) => s.to_string(),
             Err(e) => {
@@ -66,10 +69,10 @@ fn parse_create_instruction(data: &[u8]) -> Option<TokenData> {
                 return None;
             }
         };
-        
+
         *offset += length;
         debug!("Read string: {}", value);
-        
+
         Some(value)
     };
 
@@ -79,13 +82,13 @@ fn parse_create_instruction(data: &[u8]) -> Option<TokenData> {
             debug!("Offset out of bounds when reading pubkey");
             return None;
         }
-        
+
         let pubkey_data = &data[*offset..*offset + 32];
         *offset += 32;
-        
+
         let encoded = bs58::encode(pubkey_data).into_string();
         debug!("Read pubkey: {}", encoded);
-        
+
         Some(encoded)
     };
 
@@ -97,7 +100,7 @@ fn parse_create_instruction(data: &[u8]) -> Option<TokenData> {
             return None;
         }
     };
-    
+
     let symbol = match read_string(data, &mut offset) {
         Some(symbol) => symbol,
         None => {
@@ -105,7 +108,7 @@ fn parse_create_instruction(data: &[u8]) -> Option<TokenData> {
             return None;
         }
     };
-    
+
     let uri = match read_string(data, &mut offset) {
         Some(uri) => uri,
         None => {
@@ -113,7 +116,7 @@ fn parse_create_instruction(data: &[u8]) -> Option<TokenData> {
             return None;
         }
     };
-    
+
     let mint = match read_pubkey(data, &mut offset) {
         Some(mint) => mint,
         None => {
@@ -121,7 +124,7 @@ fn parse_create_instruction(data: &[u8]) -> Option<TokenData> {
             return None;
         }
     };
-    
+
     let bonding_curve = match read_pubkey(data, &mut offset) {
         Some(bonding_curve) => bonding_curve,
         None => {
@@ -129,7 +132,7 @@ fn parse_create_instruction(data: &[u8]) -> Option<TokenData> {
             return None;
         }
     };
-    
+
     let user = match read_pubkey(data, &mut offset) {
         Some(user) => user,
         None => {
@@ -141,7 +144,7 @@ fn parse_create_instruction(data: &[u8]) -> Option<TokenData> {
     debug!("Successfully parsed token data: {} ({})", name, symbol);
     Some(TokenData {
         name,
-        symbol, 
+        symbol,
         uri,
         mint,
         bonding_curve,
@@ -161,7 +164,7 @@ pub struct TokenData {
     pub name: String,
     pub symbol: String,
     pub uri: String,
-    pub mint: String, 
+    pub mint: String,
     pub bonding_curve: String,
     pub user: String,
     pub tx_signature: String,
@@ -170,20 +173,61 @@ pub struct TokenData {
 /// Runs a simple WebSocket test to verify the connection and token detection capabilities
 pub async fn run_websocket_test(endpoint: &str) -> Result<Vec<TokenData>, Error> {
     info!("Starting WebSocket test, connecting to: {}", endpoint);
+
+    // Check if we need to use authentication
+    let use_auth = std::env::var("USE_CHAINSTACK_AUTH")
+        .unwrap_or_else(|_| "false".to_string())
+        .to_lowercase() == "true";
+    
+    let username = if use_auth {
+        std::env::var("CHAINSTACK_USERNAME").unwrap_or_default()
+    } else {
+        String::new()
+    };
+    
+    let password = if use_auth {
+        std::env::var("CHAINSTACK_PASSWORD").unwrap_or_default()
+    } else {
+        String::new()
+    };
+    
+    // Parse the WebSocket URL
+    let mut url_string = endpoint.to_string();
+    
+    // If authentication is enabled and credentials are provided, modify the URL
+    if use_auth && !username.is_empty() && !password.is_empty() {
+        info!("Using basic authentication for WebSocket connection");
+        
+        // For basic auth in WebSockets, we need to include credentials in the URL
+        if let Ok(mut url) = Url::parse(&url_string) {
+            // Set credentials in URL (format: wss://username:password@hostname/path)
+            if url.scheme() == "wss" || url.scheme() == "ws" {
+                if let Err(_) = url.set_username(&username) {
+                    warn!("Failed to set username for WebSocket URL");
+                }
+                if let Err(_) = url.set_password(Some(&password)) {
+                    warn!("Failed to set password for WebSocket URL");
+                }
+                url_string = url.to_string();
+                info!("Using authenticated WebSocket URL with embedded credentials");
+            }
+        }
+    }
     
     // Parse the URL and add query parameters for keep-alive if needed
-    let mut url = Url::parse(endpoint).map_err(|e| anyhow!("Failed to parse WebSocket URL: {}", e))?;
-    
+    let mut url = Url::parse(&url_string)
+        .map_err(|e| anyhow!("Failed to parse WebSocket URL: {}", e))?;
+
     // Some WebSocket servers support keep-alive via query parameters
     if !url.query_pairs().any(|(k, _)| k == "keepalive") {
         url.query_pairs_mut().append_pair("keepalive", "true");
     }
-    
+
     // Connection retry logic
     let mut retry_attempts = 0;
     let max_retries = 3; // Retry connection up to 3 times within this function
     let retry_delay = Duration::from_secs(2);
-    
+
     // Try to establish the WebSocket connection with retries
     let mut ws_stream = loop {
         match connect_async(&url).await {
@@ -191,90 +235,104 @@ pub async fn run_websocket_test(endpoint: &str) -> Result<Vec<TokenData>, Error>
             Err(e) => {
                 retry_attempts += 1;
                 if retry_attempts >= max_retries {
-                    return Err(anyhow!("Failed to connect to WebSocket after {} attempts: {}", max_retries, e));
+                    return Err(anyhow!(
+                        "Failed to connect to WebSocket after {} attempts: {}",
+                        max_retries,
+                        e
+                    ));
                 }
-                
-                warn!("WebSocket connection attempt {} failed: {}. Retrying in {} seconds...", 
-                      retry_attempts, e, retry_delay.as_secs());
-                      
+
+                warn!(
+                    "WebSocket connection attempt {} failed: {}. Retrying in {} seconds...",
+                    retry_attempts,
+                    e,
+                    retry_delay.as_secs()
+                );
+
                 tokio::time::sleep(retry_delay).await;
             }
         }
     };
-    
+
     // Pump.fun program ID for token creation
     let pump_program_id = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
-    
-    // Set to "processed" commitment for faster detection
+
+    // Set to "confirmed" commitment for faster detection
     let subscription_request = json!({
         "id": 1,
         "jsonrpc": "2.0",
         "method": "logsSubscribe",
         "params": [
             {"mentions": [pump_program_id]},
-            {"commitment": "processed"}
+            {"commitment": "confirmed"}
         ]
-    }).to_string();
-    
+    })
+    .to_string();
+
     // Check if we're in quiet mode
     let quiet_mode = std::env::args().any(|arg| arg == "--quiet" || arg == "-q");
-    
+
     if !quiet_mode {
         info!("Sending subscription request: {}", subscription_request);
     }
-    
+
     // Send the subscription request
-    ws_stream.send(Message::Text(subscription_request)).await
+    ws_stream
+        .send(Message::Text(subscription_request))
+        .await
         .map_err(|e| anyhow!("Failed to send subscription request: {}", e))?;
-    
+
     info!("WebSocket connection established, waiting for token creation events...");
-    
+
     // Create tracking variables
     let mut message_count = 0;
     let mut token_creations = 0;
     let start_time = Instant::now();
-    
+
     // Get the test duration from env or default to 0 (indefinite)
     // A duration of 0 means run until connection error or max token limit
     let test_duration = std::env::var("MONITOR_DURATION")
         .unwrap_or_else(|_| "0".to_string())
         .parse::<u64>()
         .unwrap_or(0);
-    
+
     // Default to 2 minutes per cycle if no duration is specified
-    let cycle_duration = if test_duration > 0 { 
-        test_duration 
-    } else { 
+    let cycle_duration = if test_duration > 0 {
+        test_duration
+    } else {
         120 // 2 minute default cycle when running indefinitely
     };
-    
+
     let timeout_duration = Duration::from_secs(cycle_duration);
-    
+
     // Max tokens to collect per cycle (to prevent memory issues in indefinite mode)
     let max_tokens_per_cycle = 1; // Changed from 100 to 1 to return immediately with token data
-    
+
     // Heartbeat/ping interval - every 30 seconds to keep connection alive
     let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
-    
+
     // Status update interval - every 30 seconds
     let mut status_interval = tokio::time::interval(Duration::from_secs(30));
-    
+
     // Last message received time for connection health monitoring
     let mut last_message_time = Instant::now();
     let max_idle_time = Duration::from_secs(60); // Consider connection dead after 60s with no messages
-    
+
     // Vector to store token data
     let mut token_data_list = Vec::new();
-    
+
     // Log initial status
     if !quiet_mode {
         if test_duration > 0 {
-            info!("Status: WebSocket test running. Will listen for {} seconds", test_duration);
+            info!(
+                "Status: WebSocket test running. Will listen for {} seconds",
+                test_duration
+            );
         } else {
             info!("Status: WebSocket monitoring running indefinitely or until token detection");
         }
     }
-          
+
     // Process messages
     loop {
         tokio::select! {
@@ -287,18 +345,18 @@ pub async fn run_websocket_test(endpoint: &str) -> Result<Vec<TokenData>, Error>
                 }
                 break;
             }
-            
+
             // Send heartbeat ping
             _ = ping_interval.tick() => {
                 // Check if connection seems dead (no messages for too long)
                 if last_message_time.elapsed() > max_idle_time {
-                    warn!("WebSocket connection appears to be dead - no messages for {} seconds", 
+                    warn!("WebSocket connection appears to be dead - no messages for {} seconds",
                           last_message_time.elapsed().as_secs());
-                    
+
                     // Return immediately to allow reconnection
                     return Ok(token_data_list);
                 }
-                
+
                 // Send a ping to keep the connection alive
                 if let Err(e) = ws_stream.send(Message::Ping(vec![1, 2, 3])).await {
                     warn!("Failed to send ping: {}", e);
@@ -308,28 +366,28 @@ pub async fn run_websocket_test(endpoint: &str) -> Result<Vec<TokenData>, Error>
                     debug!("Sent ping to keep WebSocket connection alive");
                 }
             }
-            
+
             // Status update interval
             _ = status_interval.tick() => {
                 let elapsed = start_time.elapsed();
-                
+
                 if test_duration > 0 {
                     let remaining = timeout_duration.saturating_sub(elapsed);
                     let mins = remaining.as_secs() / 60;
                     let secs = remaining.as_secs() % 60;
-                    
+
                     if !quiet_mode {
-                        info!("Status: Processed {} messages, found {} new tokens. Test ends in {}m{}s", 
+                        info!("Status: Processed {} messages, found {} new tokens. Test ends in {}m{}s",
                               message_count, token_creations, mins, secs);
                     }
                 } else {
                     if !quiet_mode {
-                        info!("Status: Processed {} messages, found {} new tokens. Monitoring indefinitely.", 
+                        info!("Status: Processed {} messages, found {} new tokens. Monitoring indefinitely.",
                               message_count, token_creations);
                     }
                 }
             }
-            
+
             // Process messages
             result = ws_stream.next() => {
                 match result {
@@ -337,7 +395,7 @@ pub async fn run_websocket_test(endpoint: &str) -> Result<Vec<TokenData>, Error>
                         // Update the last message timestamp whenever we receive any message
                         last_message_time = Instant::now();
                         message_count += 1;
-                        
+
                         // Handle different message types
                         match message {
                             Message::Text(text) => {
@@ -346,7 +404,7 @@ pub async fn run_websocket_test(endpoint: &str) -> Result<Vec<TokenData>, Error>
                                     if let Some(token_data) = process_websocket_message(&json, &mut token_creations, quiet_mode) {
                                         // Return immediately with the token to prevent delay
                                         token_data_list.push(token_data);
-                                        
+
                                         // Return the token data immediately instead of waiting
                                         return Ok(token_data_list);
                                     }
@@ -388,13 +446,17 @@ pub async fn run_websocket_test(endpoint: &str) -> Result<Vec<TokenData>, Error>
             }
         }
     }
-    
+
     // Don't close the connection, just return the list
     Ok(token_data_list)
 }
 
 /// Process a WebSocket message to extract token data if it's a token creation event
-fn process_websocket_message(message: &serde_json::Value, token_creation_count: &mut usize, quiet_mode: bool) -> Option<TokenData> {
+fn process_websocket_message(
+    message: &serde_json::Value,
+    token_creation_count: &mut usize,
+    quiet_mode: bool,
+) -> Option<TokenData> {
     // Check if this is a subscription confirmation
     if let Some(id) = message.get("id").and_then(|v| v.as_i64()) {
         if !quiet_mode {
@@ -402,7 +464,7 @@ fn process_websocket_message(message: &serde_json::Value, token_creation_count: 
         }
         return None;
     }
-    
+
     // Check if this is a notification
     if let Some(method) = message.get("method").and_then(|v| v.as_str()) {
         if method == "logsNotification" {
@@ -414,20 +476,24 @@ fn process_websocket_message(message: &serde_json::Value, token_creation_count: 
                             if !quiet_mode {
                                 info!("Log entry count: {}", logs.len());
                             }
-                            
+
                             // ONLY check for "Create" instruction in logs - ignore Buy events as requested
-                            let contains_create = logs.iter()
-                                .any(|log| log.as_str()
-                                    .map_or(false, |s| s.contains("Program log: Instruction: Create")));
-                            
+                            let contains_create = logs.iter().any(|log| {
+                                log.as_str().map_or(false, |s| {
+                                    s.contains("Program log: Instruction: Create")
+                                })
+                            });
+
                             if contains_create {
                                 // Found a token creation event!
                                 *token_creation_count += 1;
-                                
-                                if let Some(signature) = value.get("signature").and_then(|v| v.as_str()) {
+
+                                if let Some(signature) =
+                                    value.get("signature").and_then(|v| v.as_str())
+                                {
                                     // Extract and parse program data
                                     let mut program_data_base64 = String::new();
-                                    
+
                                     // Try to find and parse program data
                                     for log in logs {
                                         if let Some(log_str) = log.as_str() {
@@ -435,34 +501,53 @@ fn process_websocket_message(message: &serde_json::Value, token_creation_count: 
                                                 if !quiet_mode {
                                                     info!("Program data found: {}", log_str);
                                                 }
-                                                
+
                                                 // Extract base64 data part
-                                                if let Some(data_part) = log_str.strip_prefix("Program data: ") {
+                                                if let Some(data_part) =
+                                                    log_str.strip_prefix("Program data: ")
+                                                {
                                                     program_data_base64 = data_part.to_string();
-                                                    
+
                                                     // Decode the base64 data
-                                                    if let Ok(decoded_data) = BASE64.decode(data_part) {
+                                                    if let Ok(decoded_data) =
+                                                        BASE64.decode(data_part)
+                                                    {
                                                         if !quiet_mode {
                                                             info!("Successfully decoded program data ({} bytes)", decoded_data.len());
                                                         }
-                                                        
+
                                                         // Parse the token details
-                                                        if let Some(mut token_data) = parse_create_instruction(&decoded_data) {
+                                                        if let Some(mut token_data) =
+                                                            parse_create_instruction(&decoded_data)
+                                                        {
                                                             // Set the transaction signature
-                                                            token_data.tx_signature = signature.to_string();
-                                                            
+                                                            token_data.tx_signature =
+                                                                signature.to_string();
+
                                                             // Only proceed with valid tokens
                                                             // Check if the mint address ends with "pump" which indicates a valid token
-                                                            if token_data.mint.ends_with("pump") || token_data.name != "Unknown" {
+                                                            if token_data.mint.ends_with("pump")
+                                                                || token_data.name != "Unknown"
+                                                            {
                                                                 // Create a clone for async liquidity checking
-                                                                let token_data_clone = token_data.clone();
-                                                                
+                                                                let token_data_clone =
+                                                                    token_data.clone();
+
                                                                 // Spawn a task to check liquidity asynchronously
                                                                 tokio::spawn(async move {
                                                                     // Get MIN_LIQUIDITY from environment variable
-                                                                    let min_liquidity_str = std::env::var("MIN_LIQUIDITY").unwrap_or_else(|_| "4.0".to_string());
-                                                                    let min_liquidity = min_liquidity_str.parse::<f64>().unwrap_or(4.0);
-                                                                    
+                                                                    let min_liquidity_str =
+                                                                        std::env::var(
+                                                                            "MIN_LIQUIDITY",
+                                                                        )
+                                                                        .unwrap_or_else(|_| {
+                                                                            "4.0".to_string()
+                                                                        });
+                                                                    let min_liquidity =
+                                                                        min_liquidity_str
+                                                                            .parse::<f64>()
+                                                                            .unwrap_or(4.0);
+
                                                                     // Use the token_detector function for liquidity check
                                                                     match crate::token_detector::check_token_liquidity(
                                                                         &token_data_clone.mint,
@@ -490,32 +575,62 @@ fn process_websocket_message(message: &serde_json::Value, token_creation_count: 
                                                                         }
                                                                     }
                                                                 });
-                                                                
+
                                                                 // Only show detailed logs if not in quiet mode
                                                                 if !quiet_mode {
                                                                     // Display the extracted token details
                                                                     info!("=== NEWLY MINTED TOKEN DETAILS ===");
-                                                                    info!("Token Name: {}", token_data.name);
-                                                                    info!("Token Symbol: {}", token_data.symbol);
-                                                                    info!("Token URI: {}", token_data.uri);
-                                                                    info!("Mint Address: {}", token_data.mint);
-                                                                    info!("Bonding Curve Address: {}", token_data.bonding_curve);
-                                                                    info!("Creator Address: {}", token_data.user);
-                                                                
+                                                                    info!(
+                                                                        "Token Name: {}",
+                                                                        token_data.name
+                                                                    );
+                                                                    info!(
+                                                                        "Token Symbol: {}",
+                                                                        token_data.symbol
+                                                                    );
+                                                                    info!(
+                                                                        "Token URI: {}",
+                                                                        token_data.uri
+                                                                    );
+                                                                    info!(
+                                                                        "Mint Address: {}",
+                                                                        token_data.mint
+                                                                    );
+                                                                    info!(
+                                                                        "Bonding Curve Address: {}",
+                                                                        token_data.bonding_curve
+                                                                    );
+                                                                    info!(
+                                                                        "Creator Address: {}",
+                                                                        token_data.user
+                                                                    );
+
                                                                     // Calculate associated bonding curve
-                                                                    if let Ok(mint_pubkey) = Pubkey::from_str(&token_data.mint) {
-                                                                        if let Ok(bonding_curve_pubkey) = Pubkey::from_str(&token_data.bonding_curve) {
+                                                                    if let Ok(mint_pubkey) =
+                                                                        Pubkey::from_str(
+                                                                            &token_data.mint,
+                                                                        )
+                                                                    {
+                                                                        if let Ok(
+                                                                            bonding_curve_pubkey,
+                                                                        ) = Pubkey::from_str(
+                                                                            &token_data
+                                                                                .bonding_curve,
+                                                                        ) {
                                                                             let associated_bonding_curve = find_associated_bonding_curve(&mint_pubkey, &bonding_curve_pubkey);
                                                                             info!("Associated Bonding Curve: {}", associated_bonding_curve);
                                                                         }
                                                                     }
-                                                                
-                                                                    info!("Transaction Signature: {}", signature);
-                                                                
+
+                                                                    info!(
+                                                                        "Transaction Signature: {}",
+                                                                        signature
+                                                                    );
+
                                                                     // Print a separator for readability
                                                                     info!("==================================================================");
                                                                 }
-                                                                
+
                                                                 return Some(token_data);
                                                             } else if !quiet_mode {
                                                                 debug!("Filtered out invalid token with mint: {}", token_data.mint);
@@ -542,6 +657,6 @@ fn process_websocket_message(message: &serde_json::Value, token_creation_count: 
             }
         }
     }
-    
+
     None
 }

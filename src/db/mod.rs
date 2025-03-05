@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use log::info;
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
 use std::sync::{Arc, Mutex, Once};
 
 static INIT: Once = Once::new();
@@ -27,13 +27,12 @@ pub struct Trade {
 /// Initialize the database with option to reset pending trades
 pub fn init_db(reset_pending: bool) -> Result<()> {
     info!("Starting database initialization...");
-    
-    let conn = Connection::open("./database.db")
-        .context("Failed to open database file")?;
-    
+
+    let conn = Connection::open("./database.db").context("Failed to open database file")?;
+
     info!("Successfully opened the database file: ./database.db");
     info!("Creating (or verifying) the 'trades' table...");
-    
+
     conn.execute(
         "CREATE TABLE IF NOT EXISTS trades (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -47,11 +46,12 @@ pub fn init_db(reset_pending: bool) -> Result<()> {
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )",
         [],
-    ).context("Failed to create trades table")?;
-    
+    )
+    .context("Failed to create trades table")?;
+
     info!("Table 'trades' created or confirmed to exist.");
     info!("Creating (or verifying) the trigger 'update_trades_updated_at'...");
-    
+
     conn.execute(
         "CREATE TRIGGER IF NOT EXISTS update_trades_updated_at
         AFTER UPDATE ON trades
@@ -62,10 +62,11 @@ pub fn init_db(reset_pending: bool) -> Result<()> {
             WHERE rowid = NEW.rowid;
         END;",
         [],
-    ).context("Failed to create update trigger")?;
-    
+    )
+    .context("Failed to create update trigger")?;
+
     info!("Trigger 'update_trades_updated_at' created or confirmed to exist.");
-    
+
     // If reset_pending is true, mark all pending trades as sold
     if reset_pending {
         info!("Resetting any pending trades...");
@@ -75,15 +76,15 @@ pub fn init_db(reset_pending: bool) -> Result<()> {
         ).context("Failed to reset pending trades")?;
         info!("All pending trades have been reset to 'sold'.");
     }
-    
+
     info!("Database initialization complete.");
-    
+
     unsafe {
         INIT.call_once(|| {
             DB_CONNECTION = Some(Arc::new(Mutex::new(conn)));
         });
     }
-    
+
     Ok(())
 }
 
@@ -95,7 +96,9 @@ pub fn get_db() -> Result<Arc<Mutex<Connection>>> {
         if let Some(conn) = &DB_CONNECTION {
             Ok(Arc::clone(conn))
         } else {
-            Err(anyhow::anyhow!("Database not initialized. Call init_db() first."))
+            Err(anyhow::anyhow!(
+                "Database not initialized. Call init_db() first."
+            ))
         }
     }
 }
@@ -105,12 +108,12 @@ pub fn get_db() -> Result<Arc<Mutex<Connection>>> {
 pub fn get_pending_trades() -> Result<Vec<Trade>> {
     let db = get_db()?;
     let conn = db.lock().unwrap();
-    
+
     let mut stmt = conn.prepare("SELECT * FROM trades WHERE status = 'pending'")?;
     let trade_iter = stmt.query_map([], |row| {
         let created_at: String = row.get(7)?;
         let updated_at: String = row.get(8)?;
-        
+
         Ok(Trade {
             id: row.get(0)?,
             mint: row.get(1)?,
@@ -123,12 +126,12 @@ pub fn get_pending_trades() -> Result<Vec<Trade>> {
             updated_at,
         })
     })?;
-    
+
     let mut trades = Vec::new();
     for trade in trade_iter {
         trades.push(trade?);
     }
-    
+
     Ok(trades)
 }
 
@@ -137,12 +140,12 @@ pub fn get_pending_trades() -> Result<Vec<Trade>> {
 pub fn get_all_trades() -> Result<Vec<Trade>> {
     let db = get_db()?;
     let conn = db.lock().unwrap();
-    
+
     let mut stmt = conn.prepare("SELECT * FROM trades ORDER BY created_at DESC")?;
     let trade_iter = stmt.query_map([], |row| {
         let created_at: String = row.get(7)?;
         let updated_at: String = row.get(8)?;
-        
+
         Ok(Trade {
             id: row.get(0)?,
             mint: row.get(1)?,
@@ -155,12 +158,12 @@ pub fn get_all_trades() -> Result<Vec<Trade>> {
             updated_at,
         })
     })?;
-    
+
     let mut trades = Vec::new();
     for trade in trade_iter {
         trades.push(trade?);
     }
-    
+
     Ok(trades)
 }
 
@@ -169,15 +172,18 @@ pub fn get_all_trades() -> Result<Vec<Trade>> {
 pub fn insert_trade(mint: &str, tokens: &str, buy_price: f64) -> Result<()> {
     let db = get_db()?;
     let conn = db.lock().unwrap();
-    
+
     conn.execute(
         "INSERT INTO trades (mint, tokens, buy_price, current_price, sell_price, status)
         VALUES (?, ?, ?, ?, ?, ?)",
         params![mint, tokens, buy_price, 0.0, 0.0, "pending"],
     )?;
-    
-    info!("Bought token: {} -> inserted into 'trades' (pending).", mint);
-    
+
+    info!(
+        "Bought token: {} -> inserted into 'trades' (pending).",
+        mint
+    );
+
     Ok(())
 }
 
@@ -186,7 +192,7 @@ pub fn insert_trade(mint: &str, tokens: &str, buy_price: f64) -> Result<()> {
 pub fn update_trade_price(id: i64, current_price: f64) -> Result<()> {
     let db = get_db()?;
     let conn = db.lock().unwrap();
-    
+
     conn.execute(
         "UPDATE trades
         SET current_price = ?,
@@ -194,7 +200,7 @@ pub fn update_trade_price(id: i64, current_price: f64) -> Result<()> {
         WHERE id = ?",
         params![current_price, id],
     )?;
-    
+
     Ok(())
 }
 
@@ -203,7 +209,7 @@ pub fn update_trade_price(id: i64, current_price: f64) -> Result<()> {
 pub fn update_trade_sold(id: i64, sell_price: f64) -> Result<()> {
     let db = get_db()?;
     let conn = db.lock().unwrap();
-    
+
     conn.execute(
         "UPDATE trades
         SET sell_price = ?,
@@ -212,7 +218,7 @@ pub fn update_trade_sold(id: i64, sell_price: f64) -> Result<()> {
         WHERE id = ?",
         params![sell_price, id],
     )?;
-    
+
     Ok(())
 }
 
@@ -221,13 +227,13 @@ pub fn update_trade_sold(id: i64, sell_price: f64) -> Result<()> {
 pub fn count_pending_trades() -> Result<i64> {
     let db = get_db()?;
     let conn = db.lock().unwrap();
-    
+
     let count: i64 = conn.query_row(
         "SELECT COUNT(*) as pendingCount FROM trades WHERE status='pending'",
         [],
         |row| row.get(0),
     )?;
-    
+
     Ok(count)
 }
 
@@ -236,15 +242,15 @@ pub fn count_pending_trades() -> Result<i64> {
 pub fn clear_pending_trades() -> Result<usize> {
     let db = get_db()?;
     let conn = db.lock().unwrap();
-    
+
     let affected_rows = conn.execute(
         "UPDATE trades SET status = 'sold', updated_at = CURRENT_TIMESTAMP WHERE status = 'pending'",
         [],
     )?;
-    
+
     if affected_rows > 0 {
         info!("Cleared {} pending trades", affected_rows);
     }
-    
+
     Ok(affected_rows)
-} 
+}

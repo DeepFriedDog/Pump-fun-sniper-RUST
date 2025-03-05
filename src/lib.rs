@@ -1,13 +1,18 @@
-#![allow(unused)]
+﻿#![allow(unused)]
 
-pub mod chainstack;
 pub mod api;
-pub mod token_detector;
-pub mod config;
+// Use the new chainstack module
+pub mod chainstack_new;
+pub mod chainstack_simple;
 pub mod checks;
+pub mod config;
 pub mod db;
 pub mod rpc_latency_test;
 pub mod tests;
-pub mod websocket_test;
+pub mod token_detector;
+pub mod token_parser;
 pub mod websocket_reconnect;
-pub mod chainstack_simple; 
+pub mod websocket_test;
+
+// Re-export the chainstack_new module as chainstack for backward compatibility
+pub use chainstack_new as chainstack;
