@@ -1380,7 +1380,7 @@ async fn start_websocket_price_monitor(
                     warn!("WebSocket error: {}", e);
 
                     // Implement exponential backoff for reconnection
-                    let backoff = rand::thread_rng().gen_range(500..3000);
+                    let backoff = rand::thread_rng().gen_range(500, 3000);
                     tokio::time::sleep(Duration::from_millis(backoff)).await;
 
                     // Attempt to reconnect (handled in main WebSocket management code)
@@ -1860,7 +1860,7 @@ async fn establish_websocket_connection(
             warn!("Failed to connect to WebSocket, retrying: {}", e);
 
             // Wait before retry with minimal backoff (50-100ms)
-            let backoff = rand::thread_rng().gen_range(50..100);
+            let backoff = rand::thread_rng().gen_range(50, 100);
             tokio::time::sleep(Duration::from_millis(backoff)).await;
 
             // Create a new URL for the retry

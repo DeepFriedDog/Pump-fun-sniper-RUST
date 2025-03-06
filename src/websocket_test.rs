@@ -290,7 +290,7 @@ pub async fn run_websocket_test(endpoint: &str) -> Result<Vec<TokenData>, Error>
     // Pump.fun program ID for token creation
     let pump_program_id = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 
-    // Set to "confirmed" commitment for faster detection
+    // Set to "processed" commitment for fastest detection
     let subscription_request = json!({
         "id": 1,
         "jsonrpc": "2.0",

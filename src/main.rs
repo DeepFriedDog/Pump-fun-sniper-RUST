@@ -1,5 +1,4 @@
 #![allow(unused)]
-#![feature(proc_macro_hygiene)]
 
 // Module declarations
 mod api;

@@ -191,7 +191,7 @@ pub async fn subscribe_to_account(account: &str) -> Result<()> {
             account,
             {
                 "encoding": "base64",
-                "commitment": "confirmed"
+                "commitment": "processed"
             }
         ]
     }).to_string();

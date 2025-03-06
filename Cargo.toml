@@ -44,7 +44,9 @@ solana-client = "=1.16.25"
 regex = "1.10"
 rusqlite = { version = "0.33.0", features = ["bundled"] }
 thiserror = "2.0.11"
-rand = "0.8.5"
+rand = "=0.7.3"
+rand_core = "=0.5.1"
+rand_chacha = "=0.2.2"
 uuid = { version = "1.3", features = ["v4"] }
 sha2 = "0.10"
 bincode = "1.3.3"
@@ -53,18 +55,23 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4.5.31", features = ["derive"] }
 http = "1.2.0"
 
-# Fix for ark-bn254 compile error
+# Fix for ark-bn254 compile error - using older, more stable versions
 [dependencies.ark-ff]
 version = "=0.3.0"
+features = ["std"]
 
 [dependencies.ark-ec]
 version = "=0.3.0"
+features = ["std"]
 
 [dependencies.ark-bn254]
-version = "=0.3.0"
+version = "=0.3.0" 
+features = ["std"]
 
 [dependencies.ark-serialize]
 version = "=0.3.0"
+features = ["std"]
 
 [dependencies.ark-std]
 version = "=0.3.0"
+features = ["std"]
