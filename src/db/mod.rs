@@ -17,9 +17,13 @@ pub struct Trade {
     pub current_price: f64,
     #[allow(dead_code)] // Used when selling tokens but flagged as unused
     pub sell_price: f64,
+    pub buy_liquidity: f64,
+    pub sell_liquidity: f64,
     #[allow(dead_code)] // Used to determine if a token is pending or sold but flagged as unused
     pub status: String,
     pub created_at: String,
+    pub detection_time: i64,  // Timestamp in milliseconds for token detection
+    pub buy_time: i64,        // Timestamp in milliseconds for successful buy
     #[allow(dead_code)] // Used for tracking when records are updated but flagged as unused
     pub updated_at: String,
 }
@@ -41,8 +45,12 @@ pub fn init_db(reset_pending: bool) -> Result<()> {
             buy_price REAL,
             current_price REAL,
             sell_price REAL,
+            buy_liquidity REAL DEFAULT 0,
+            sell_liquidity REAL DEFAULT 0,
             status TEXT CHECK(status IN ('pending', 'sold')),
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            detection_time INTEGER DEFAULT 0,
+            buy_time INTEGER DEFAULT 0,
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )",
         [],
@@ -111,8 +119,8 @@ pub fn get_pending_trades() -> Result<Vec<Trade>> {
 
     let mut stmt = conn.prepare("SELECT * FROM trades WHERE status = 'pending'")?;
     let trade_iter = stmt.query_map([], |row| {
-        let created_at: String = row.get(7)?;
-        let updated_at: String = row.get(8)?;
+        let created_at: String = row.get(9)?;
+        let updated_at: String = row.get(12)?;
 
         Ok(Trade {
             id: row.get(0)?,
@@ -121,8 +129,12 @@ pub fn get_pending_trades() -> Result<Vec<Trade>> {
             buy_price: row.get(3)?,
             current_price: row.get(4)?,
             sell_price: row.get(5)?,
-            status: row.get(6)?,
+            buy_liquidity: row.get(6)?,
+            sell_liquidity: row.get(7)?,
+            status: row.get(8)?,
             created_at,
+            detection_time: row.get(10)?,
+            buy_time: row.get(11)?,
             updated_at,
         })
     })?;
@@ -143,8 +155,8 @@ pub fn get_all_trades() -> Result<Vec<Trade>> {
 
     let mut stmt = conn.prepare("SELECT * FROM trades ORDER BY created_at DESC")?;
     let trade_iter = stmt.query_map([], |row| {
-        let created_at: String = row.get(7)?;
-        let updated_at: String = row.get(8)?;
+        let created_at: String = row.get(9)?;
+        let updated_at: String = row.get(12)?;
 
         Ok(Trade {
             id: row.get(0)?,
@@ -153,8 +165,12 @@ pub fn get_all_trades() -> Result<Vec<Trade>> {
             buy_price: row.get(3)?,
             current_price: row.get(4)?,
             sell_price: row.get(5)?,
-            status: row.get(6)?,
+            buy_liquidity: row.get(6)?,
+            sell_liquidity: row.get(7)?,
+            status: row.get(8)?,
             created_at,
+            detection_time: row.get(10)?,
+            buy_time: row.get(11)?,
             updated_at,
         })
     })?;
@@ -169,19 +185,26 @@ pub fn get_all_trades() -> Result<Vec<Trade>> {
 
 /// Insert a new trade into the database
 #[inline]
-pub fn insert_trade(mint: &str, tokens: &str, buy_price: f64) -> Result<()> {
+pub fn insert_trade(
+    mint: &str, 
+    tokens: &str, 
+    buy_price: f64, 
+    buy_liquidity: f64, 
+    detection_time: i64, 
+    buy_time: i64
+) -> Result<()> {
     let db = get_db()?;
     let conn = db.lock().unwrap();
 
     conn.execute(
-        "INSERT INTO trades (mint, tokens, buy_price, current_price, sell_price, status)
-        VALUES (?, ?, ?, ?, ?, ?)",
-        params![mint, tokens, buy_price, 0.0, 0.0, "pending"],
+        "INSERT INTO trades (mint, tokens, buy_price, current_price, sell_price, buy_liquidity, sell_liquidity, status, detection_time, buy_time)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        params![mint, tokens, buy_price, 0.0, 0.0, buy_liquidity, 0.0, "pending", detection_time, buy_time],
     )?;
 
     info!(
-        "Bought token: {} -> inserted into 'trades' (pending).",
-        mint
+        "Bought token: {} -> inserted into 'trades' (pending). Detection to buy: {}ms",
+        mint, buy_time - detection_time
     );
 
     Ok(())
@@ -206,18 +229,18 @@ pub fn update_trade_price(id: i64, current_price: f64) -> Result<()> {
 
 /// Update a trade to sold status
 #[inline]
-pub fn update_trade_sold(id: i64, sell_price: f64) -> Result<()> {
+pub fn update_trade_sold(id: i64, sell_price: f64, sell_liquidity: f64) -> Result<()> {
     let db = get_db()?;
     let conn = db.lock().unwrap();
 
     conn.execute(
         "UPDATE trades
-        SET sell_price = ?,
-            status = 'sold',
-            updated_at = datetime('now','localtime')
+        SET status = 'sold', sell_price = ?, sell_liquidity = ?
         WHERE id = ?",
-        params![sell_price, id],
+        params![sell_price, sell_liquidity, id],
     )?;
+
+    info!("Updated trade {} to sold with price {} and liquidity {}", id, sell_price, sell_liquidity);
 
     Ok(())
 }

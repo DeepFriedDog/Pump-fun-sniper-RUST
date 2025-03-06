@@ -80,7 +80,7 @@ async fn extract_tokens_with_websocket(
         "method": "logsSubscribe",
         "params": [
             { "mentions": [PUMP_PROGRAM_ID] },
-            { "commitment": "confirmed" }
+            { "commitment": "processed" }
         ]
     })
     .to_string();

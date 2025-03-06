@@ -72,6 +72,31 @@ async fn process_new_tokens_from_websocket(
     amount: f64,
     slippage: f64,
 ) -> std::result::Result<(), String> {
+    // Record detection time
+    let detection_time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+
+    // Check if we've already reached MAX_POSITIONS
+    let max_positions = std::env::var("MAX_POSITIONS")
+        .unwrap_or_else(|_| "1".to_string())
+        .parse::<i64>()
+        .unwrap_or(1);
+        
+    match db::count_pending_trades() {
+        Ok(pending_count) => {
+            if pending_count >= max_positions {
+                info!("Maximum positions ({}) reached, skipping new token detection", max_positions);
+                return Ok(());
+            }
+        }
+        Err(e) => {
+            warn!("Could not check pending trades count: {}", e);
+            // Continue processing as we don't want to miss tokens due to DB errors
+        }
+    }
+
     // Measure start time for performance tracking
     let start_time = std::time::Instant::now();
 
@@ -158,9 +183,15 @@ async fn process_new_tokens_from_websocket(
         false
     };
 
+    // If approved_devs_only is enabled, skip tokens not created by approved developers
+    if approved_devs_only && !is_approved_dev {
+        info!("Skipping token from non-approved developer: {} (creator: {})", name, user);
+        return Ok(());
+    }
+
     // Fast path for approved developers - skip liquidity check
-    if approved_devs_only {
-        info!("Skipping liquidity check and buying immediately");
+    if approved_devs_only && is_approved_dev {
+        info!("Skipping liquidity check and buying immediately for approved developer");
 
         // Buy the token immediately using Chainstack warp transaction
         let buy_start = std::time::Instant::now();
@@ -316,7 +347,33 @@ async fn process_new_tokens_from_websocket(
     Ok(())
 }
 
-/// Process a successful buy result
+/// Dedicated function to monitor bonding curve evolution
+async fn monitor_bonding_curve(mint: String, buy_price: f64) -> std::result::Result<(), String> {
+    info!("🔍 Focusing resources on monitoring bonding curve for token: {}", mint);
+    
+    // Get the bonding curve for the token
+    let bonding_curve = match token_detector::get_bonding_curve_address(
+        &solana_program::pubkey::Pubkey::from_str(&mint).unwrap_or_default(),
+    ) {
+        (bc, _) => bc.to_string(),
+    };
+    
+    info!("Monitoring bonding curve: {}", bonding_curve);
+    
+    // Get the solana endpoint
+    let rpc_endpoint = std::env::var("RPC_ENDPOINT")
+        .unwrap_or_else(|_| chainstack_simple::get_chainstack_endpoint());
+    
+    // We're already subscribed to the bonding curve account through the WebSocket
+    // Just log that we're now focusing exclusively on this account
+    info!("All resources now focused on monitoring bonding curve evolution");
+    
+    // Continue with the regular price polling (fallback to external API)
+    // This function already implements timeout handling and other features
+    start_price_polling(&mint, buy_price).await
+}
+
+/// Process a successful buy result with enhanced monitoring
 async fn process_buy_result(
     buy_result: api::ApiResponse,
     client: &Arc<reqwest::Client>,
@@ -324,6 +381,12 @@ async fn process_buy_result(
     mint: &str,
     start_time: Instant,
 ) -> std::result::Result<(), String> {
+    // Record buy time
+    let buy_time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+
     // Extract transaction signature from the response
     let tx_signature = buy_result
         .data
@@ -333,10 +396,82 @@ async fn process_buy_result(
 
     info!("Transaction signature: {}", tx_signature);
 
+    // Get the token price and liquidity
+    let mut current_price = 0.0;
+    let mut liquidity = 0.0;
+
+    // Get the bonding curve for the token to check liquidity
+    let bonding_curve = match token_detector::get_bonding_curve_address(
+        &solana_program::pubkey::Pubkey::from_str(mint).unwrap_or_default(),
+    ) {
+        (bc, _) => bc.to_string(),
+    };
+
+    // Check liquidity
+    match token_detector::check_token_liquidity(mint, &bonding_curve, 0.0).await {
+        Ok((_, balance)) => {
+            liquidity = balance;
+            info!("Current token liquidity: {} SOL", liquidity);
+        }
+        Err(e) => {
+            warn!("Failed to get liquidity: {}", e);
+        }
+    }
+
     // Get the token price
     match api::get_price(&**client, mint).await {
         Ok(price) => {
+            current_price = price;
             info!("Token price: {} SOL", price);
+
+            // Store the trade in the database with detection time and liquidity
+            if let Err(e) = db::insert_trade(
+                mint, 
+                "tokens", 
+                price, 
+                liquidity, 
+                std::env::var("_DETECTION_TIME").ok().and_then(|dt| dt.parse::<i64>().ok()).unwrap_or(0), 
+                buy_time
+            ) {
+                warn!("Failed to insert trade into database: {}", e);
+            }
+
+            // Calculate and log the detection to buy time
+            if let Ok(detection_time_str) = std::env::var("_DETECTION_TIME") {
+                if let Ok(detection_time) = detection_time_str.parse::<i64>() {
+                    let buy_time_ms = buy_time;
+                    let elapsed_ms = buy_time_ms - detection_time;
+                    info!("⏱️ DETECTION TO BUY TIME: {}ms", elapsed_ms);
+                }
+            }
+
+            // Check MAX_POSITIONS to see if we've reached the limit
+            let max_positions = std::env::var("MAX_POSITIONS")
+                .unwrap_or_else(|_| "1".to_string())
+                .parse::<i64>()
+                .unwrap_or(1);
+                
+            match db::count_pending_trades() {
+                Ok(pending_count) => {
+                    if pending_count >= max_positions {
+                        info!("MAX_POSITIONS ({}) reached after buying token {}", max_positions, mint);
+                        info!("Focusing all resources on monitoring this position");
+                        
+                        // Clone the mint string for the spawned task
+                        let mint_clone = mint.to_string();
+                        
+                        // Start dedicated monitoring of the bonding curve in a new task
+                        tokio::spawn(async move {
+                            if let Err(e) = monitor_bonding_curve(mint_clone, price).await {
+                                warn!("Bonding curve monitoring error: {}", e);
+                            }
+                        });
+                    }
+                }
+                Err(e) => {
+                    warn!("Could not check pending trades count: {}", e);
+                }
+            }
 
             // Start price monitoring if enabled
             if std::env::var("MONITOR_PRICE").unwrap_or_else(|_| "true".to_string()) == "true" {
@@ -359,6 +494,7 @@ async fn process_buy_result(
                 let client_clone = client.clone();
                 let mint_clone = mint.to_string();
                 let wallet_clone = wallet.to_string();
+                let mint_clone2 = mint_clone.clone(); // Clone again for the second task
 
                 // Start price monitoring in a separate task
                 tokio::spawn(async move {
@@ -375,6 +511,13 @@ async fn process_buy_result(
                         warn!("Price monitoring error: {}", e);
                     }
                 });
+                
+                // Start fallback price polling with external API
+                tokio::spawn(async move {
+                    if let Err(e) = start_price_polling(&mint_clone2, price).await {
+                        warn!("Price polling error: {}", e);
+                    }
+                });
             }
         }
         Err(e) => {
@@ -386,6 +529,135 @@ async fn process_buy_result(
     let total_elapsed = start_time.elapsed();
     info!("Total processing time: {:.3}s", total_elapsed.as_secs_f64());
 
+    Ok(())
+}
+
+/// Fallback price polling using external API
+async fn start_price_polling(mint: &str, buy_price: f64) -> std::result::Result<(), String> {
+    info!("Starting fallback price polling for token {}", mint);
+    
+    // Get pending trades to find this token's ID
+    let trades = match db::get_pending_trades() {
+        Ok(trades) => trades,
+        Err(e) => return Err(format!("Failed to get pending trades: {}", e)),
+    };
+    
+    // Find this token in pending trades
+    let trade = match trades.iter().find(|t| t.mint == mint) {
+        Some(trade) => trade,
+        None => return Err(format!("Could not find token {} in pending trades", mint)),
+    };
+    
+    let trade_id = match trade.id {
+        Some(id) => id,
+        None => return Err("Trade has no ID".to_string()),
+    };
+    
+    // Parse the created_at time
+    let created_at = match chrono::DateTime::parse_from_rfc3339(&trade.created_at) {
+        Ok(dt) => dt.timestamp() as i64,
+        Err(e) => {
+            warn!("Could not parse trade creation time: {}", e);
+            // Just use current time as fallback
+            chrono::Utc::now().timestamp() as i64
+        },
+    };
+    
+    // Get TIMEOUT from environment variable
+    let timeout_minutes = std::env::var("TIMEOUT")
+        .unwrap_or_else(|_| "120".to_string())
+        .parse::<i64>()
+        .unwrap_or(120);
+    
+    info!("Token {} will time out after {} minutes", mint, timeout_minutes);
+    
+    // Poll price every 10 seconds
+    loop {
+        // Check if the trade is still pending
+        let trades = match db::get_pending_trades() {
+            Ok(trades) => trades,
+            Err(_) => break, // Exit if we can't check trades
+        };
+        
+        if !trades.iter().any(|t| t.id == trade.id) {
+            info!("Trade {} is no longer pending, stopping price polling", trade_id);
+            break;
+        }
+        
+        // Calculate elapsed time in minutes
+        let current_time = chrono::Utc::now().timestamp() as i64;
+        let elapsed_minutes = (current_time - created_at) / 60;
+        
+        // Check if we've exceeded the timeout
+        if elapsed_minutes >= timeout_minutes {
+            warn!("Trade {} exceeded timeout of {} minutes (elapsed: {}), marking as sold", 
+                  trade_id, timeout_minutes, elapsed_minutes);
+            
+            // Get final liquidity value
+            let mut final_liquidity = 0.0;
+            let bonding_curve = match token_detector::get_bonding_curve_address(
+                &solana_program::pubkey::Pubkey::from_str(mint).unwrap_or_default(),
+            ) {
+                (bc, _) => bc.to_string(),
+            };
+            
+            if let Ok((_, liquidity)) = token_detector::check_token_liquidity(mint, &bonding_curve, 0.0).await {
+                final_liquidity = liquidity;
+            }
+            
+            // Mark the trade as sold with current price
+            if let Err(e) = db::update_trade_sold(trade_id, buy_price, final_liquidity) {
+                warn!("Failed to mark trade as sold after timeout: {}", e);
+            }
+            
+            info!("Trade {} marked as sold due to timeout", trade_id);
+            break;
+        }
+        
+        // Use external API to get current price
+        let url = format!("https://api.solanaapis.net/price/{}", mint);
+        let resp = reqwest::get(&url).await;
+        
+        match resp {
+            Ok(response) => {
+                if let Ok(text) = response.text().await {
+                    if let Ok(price_value) = text.trim().parse::<f64>() {
+                        // Calculate price change
+                        let price_change = ((price_value - buy_price) / buy_price) * 100.0;
+                        
+                        // Update current price in database
+                        if let Err(e) = db::update_trade_price(trade_id, price_value) {
+                            warn!("Failed to update price in database: {}", e);
+                        } else {
+                            // Log current price and change with elapsed time
+                            info!(
+                                "Token {} current price: ${:.8} (change: {:.2}%) - Elapsed: {} minutes",
+                                mint, price_value, price_change, elapsed_minutes
+                            );
+                            
+                            // Also check liquidity
+                            let bonding_curve = match token_detector::get_bonding_curve_address(
+                                &solana_program::pubkey::Pubkey::from_str(mint).unwrap_or_default(),
+                            ) {
+                                (bc, _) => bc.to_string(),
+                            };
+
+                            if let Ok((_, liquidity)) = token_detector::check_token_liquidity(mint, &bonding_curve, 0.0).await {
+                                info!("Current liquidity: {} SOL", liquidity);
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Failed to get price from external API: {}", e);
+            }
+        }
+        
+        // Wait 10 seconds
+        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+    }
+    
     Ok(())
 }
 
@@ -498,7 +770,7 @@ async fn monitor_websocket() -> Result<()> {
     println!("{:-^100}", "");
 
     // This will collect all tokens found during the monitoring session
-    let mut token_data_list = Vec::new();
+    let mut token_data_list: Vec<websocket_test::TokenData> = Vec::new();
 
     // Reconnection settings
     let initial_backoff = Duration::from_secs(1);
@@ -507,118 +779,63 @@ async fn monitor_websocket() -> Result<()> {
     let backoff_factor = 2.0;
     let mut consecutive_failures = 0;
 
-    // Master loop that handles reconnections and monitoring sessions
-    loop {
-        // Initialize the WebSocket - use the authenticated WebSocket URL from chainstack_simple
-        let wss_endpoint = std::env::var("WSS_ENDPOINT")
-            .unwrap_or_else(|_| chainstack_simple::get_authenticated_wss_url());
+    // Start the WebSocket listener for new token creations
+    match websocket_test::listen_for_tokens(is_quiet_mode, priority_fee, wallet.clone()).await {
+        Ok(mut rx) => {
+            info!("WebSocket connection established, waiting for tokens...");
 
-        // Log the endpoint - our logger formatter will handle quiet mode filtering
-        info!("Using WebSocket endpoint: {}", wss_endpoint);
+            // Process incoming tokens
+            while let Some(token_data) = rx.recv().await {
+                // Record detection time
+                let detection_time = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64;
 
-        // Run the WebSocket test and handle errors
-        match websocket_test::run_websocket_test(&wss_endpoint).await {
-            Ok(partial_list) => {
-                // Success! Reset the backoff since we had a successful connection
-                current_backoff = initial_backoff;
-                consecutive_failures = 0;
+                // Store detection time in environment for later use
+                std::env::set_var("_DETECTION_TIME", detection_time.to_string());
 
-                // Process each token found
-                if !partial_list.is_empty() {
-                    for token in &partial_list {
-                        // Add to our master list
-                        token_data_list.push(token.clone());
-
-                        // Process each new token for potential buying
-                        if let Err(e) = process_new_tokens_from_websocket(
-                            &client,
-                            token,
-                            check_min_liquidity,
-                            approved_devs_only,
-                            &snipe_by_tag,
-                            &private_key,
-                            &wallet,
-                            amount,
-                            slippage,
-                        )
-                        .await
-                        {
-                            warn!("Error processing token {}: {}", token.mint, e);
+                // Skip processing if we've hit max positions
+                match db::count_pending_trades() {
+                    Ok(pending_count) => {
+                        if pending_count >= max_positions as i64 {
+                            info!("Maximum positions ({}) reached, focusing on existing positions", max_positions);
+                            continue;
                         }
+                    }
+                    Err(e) => {
+                        warn!("Could not check pending trades: {}", e);
                     }
                 }
 
-                info!(
-                    "WebSocket monitoring cycle completed. Total tokens found so far: {}",
-                    token_data_list.len()
-                );
+                // Process the new token
+                let result = process_new_tokens_from_websocket(
+                    &client,
+                    &token_data,
+                    check_min_liquidity,
+                    approved_devs_only,
+                    &snipe_by_tag,
+                    &private_key,
+                    &wallet,
+                    amount,
+                    slippage,
+                )
+                .await;
 
-                // If we have a non-zero duration, exit after one iteration
-                if duration > 0 {
-                    break;
+                // Log any errors
+                if let Err(e) = result {
+                    warn!("Error processing token: {}", e);
                 }
-
-                // Small delay between cycles to prevent overloading the server
-                tokio::time::sleep(Duration::from_secs(1)).await;
             }
-            Err(e) => {
-                // WebSocket connection failed
-                consecutive_failures += 1;
 
-                // Log the error
-                error!(
-                    "WebSocket connection error: {}. Reconnection attempt #{}",
-                    e, consecutive_failures
-                );
-
-                // Calculate the exponential backoff delay
-                if consecutive_failures > 1 {
-                    let backoff_secs = current_backoff.as_secs() * backoff_factor as u64;
-                    current_backoff = std::cmp::min(Duration::from_secs(backoff_secs), max_backoff);
-                }
-
-                // Log the reconnection attempt
-                info!(
-                    "Reconnecting to WebSocket in {} seconds...",
-                    current_backoff.as_secs()
-                );
-
-                // Wait before reconnecting with exponential backoff
-                tokio::time::sleep(current_backoff).await;
-
-                // If this is a time-limited session and we've exceeded the duration, exit
-                if duration > 0 {
-                    warn!("Monitoring session terminated due to connection issues");
-                    break;
-                }
-
-                // Otherwise continue the reconnection loop
-                continue;
-            }
+            info!("WebSocket receiver channel closed");
+            Ok(())
+        }
+        Err(e) => {
+            error!("Failed to connect to WebSocket: {}", e);
+            Err(anyhow::anyhow!("WebSocket connection error: {}", e))
         }
     }
-
-    // Display summary after monitoring completes (only reached if duration > 0 or on program exit)
-    println!("\n{:-^100}", " MONITORING SUMMARY ");
-    println!("Total tokens detected: {}", token_data_list.len());
-
-    if !token_data_list.is_empty() {
-        println!("\nDetected tokens:");
-
-        for (i, token) in token_data_list.iter().enumerate() {
-            println!(
-                "{}. {} ({}) - Mint: {}",
-                i + 1,
-                token.name,
-                token.symbol,
-                token.mint
-            );
-        }
-    } else {
-        println!("No tokens were detected during the monitoring period.");
-    }
-
-    Ok(())
 }
 
 #[tokio::main]

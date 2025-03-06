@@ -135,15 +135,6 @@ pub async fn check_minimum_liquidity(
 /// Check if the token developer is in the approved list
 #[inline]
 pub async fn check_approved_devs(dev_wallet: &str) -> Result<bool> {
-    // Check if APPROVED_DEVS_ONLY is set to true
-    let approved_devs_only =
-        std::env::var("APPROVED_DEVS_ONLY").unwrap_or_else(|_| "false".to_string()) == "true";
-
-    if !approved_devs_only {
-        // If the feature is not enabled, pass the check
-        return Ok(true);
-    }
-
     // Load the approved developers list
     let approved_devs_path = Path::new("src/approved-devs.json");
 

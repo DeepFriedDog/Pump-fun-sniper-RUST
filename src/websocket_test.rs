@@ -8,10 +8,43 @@ use serde_json::{json, Value};
 use solana_program::pubkey::Pubkey;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
-use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+use tokio::sync::mpsc;
+use tokio_tungstenite::{connect_async, tungstenite::protocol::{Message, WebSocketConfig}, tungstenite::handshake::client::Request};
 use url::Url;
+use http::{HeaderMap, HeaderValue};
+use uuid;
 
 use crate::config::{ATA_PROGRAM_ID, PUMP_PROGRAM_ID, TOKEN_PROGRAM_ID};
+use crate::chainstack_simple;
+
+/// Creates a fresh WebSocket connection with custom headers to prevent history accumulation
+async fn connect_fresh(url_str: &str) -> Result<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>> {
+    // Parse the URL
+    let url = Url::parse(url_str)?;
+    
+    // Create a fresh URL with a unique query parameter to force a new connection
+    let mut fresh_url = url.clone();
+    fresh_url.query_pairs_mut()
+        .append_pair("fresh_session", &uuid::Uuid::new_v4().to_string());
+    
+    // Create a fresh URL string
+    let fresh_url_str = fresh_url.to_string();
+    
+    // Use a custom WebSocket config with larger message size limits
+    let config = WebSocketConfig {
+        max_message_size: Some(64 << 20),     // 64 MB
+        max_frame_size: Some(16 << 20),       // 16 MB
+        accept_unmasked_frames: false,
+        max_send_queue: Some(32),             // Maximum pending messages in outgoing queue
+    };
+    
+    // Connect using the standard method but with our custom config
+    // This handles all the protocol headers correctly
+    let (stream, _) = tokio_tungstenite::connect_async_with_config(&fresh_url_str, Some(config)).await?;
+    
+    info!("Established fresh WebSocket connection with no history");
+    Ok(stream)
+}
 
 /// Finds the associated bonding curve for a given mint and bonding curve.
 pub fn find_associated_bonding_curve(mint: &Pubkey, bonding_curve: &Pubkey) -> Pubkey {
@@ -264,7 +297,7 @@ pub async fn run_websocket_test(endpoint: &str) -> Result<Vec<TokenData>, Error>
         "method": "logsSubscribe",
         "params": [
             {"mentions": [pump_program_id]},
-            {"commitment": "confirmed"}
+            {"commitment": "processed"}
         ]
     })
     .to_string();
@@ -659,4 +692,117 @@ fn process_websocket_message(
     }
 
     None
+}
+
+/// Listen for new tokens and send them through a channel
+pub async fn listen_for_tokens(
+    quiet_mode: bool,
+    priority_fee: u64,
+    wallet: String,
+) -> Result<mpsc::Receiver<TokenData>> {
+    // Create a channel for sending token data
+    let (tx, rx) = mpsc::channel(100);
+    
+    // Get the WebSocket endpoint with a fresh session ID to avoid accumulated history
+    let wss_endpoint = std::env::var("WSS_ENDPOINT")
+        .unwrap_or_else(|_| chainstack_simple::get_fresh_wss_url());
+    
+    info!("Starting WebSocket listener with fresh connection: {}", wss_endpoint);
+    info!("Using processed commitment level for fastest token detection");
+    
+    // Start the WebSocket listener in a separate task
+    tokio::spawn(async move {
+        let mut consecutive_failures = 0;
+        let initial_backoff = Duration::from_secs(1);
+        let max_backoff = Duration::from_secs(60);
+        let mut current_backoff = initial_backoff;
+        let backoff_factor = 2.0;
+        
+        loop {
+            match run_websocket_listener(&wss_endpoint, &tx, quiet_mode).await {
+                Ok(_) => {
+                    // Reset backoff on success
+                    current_backoff = initial_backoff;
+                    consecutive_failures = 0;
+                    info!("WebSocket listener completed successfully");
+                },
+                Err(e) => {
+                    consecutive_failures += 1;
+                    error!("WebSocket listener error: {}. Reconnection attempt #{}", e, consecutive_failures);
+                    
+                    // Calculate exponential backoff
+                    if consecutive_failures > 1 {
+                        let backoff_secs = current_backoff.as_secs() * backoff_factor as u64;
+                        current_backoff = std::cmp::min(Duration::from_secs(backoff_secs), max_backoff);
+                    }
+                    
+                    info!("Reconnecting to WebSocket in {} seconds...", current_backoff.as_secs());
+                    tokio::time::sleep(current_backoff).await;
+                }
+            }
+        }
+    });
+    
+    Ok(rx)
+}
+
+/// Run the WebSocket listener and send tokens through the channel
+async fn run_websocket_listener(
+    endpoint: &str,
+    tx: &mpsc::Sender<TokenData>,
+    quiet_mode: bool,
+) -> Result<()> {
+    // Parse the WebSocket URL
+    let url = Url::parse(endpoint)?;
+    
+    // Connect to the WebSocket using our fresh connection method
+    let ws_stream = connect_fresh(endpoint).await?;
+    info!("WebSocket connection established with fresh session");
+    
+    // Split the WebSocket stream
+    let (mut write, mut read) = ws_stream.split();
+    
+    // Subscribe to the Pump.fun program logs
+    let subscribe_msg = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "logsSubscribe",
+        "params": [
+            {
+                "mentions": [PUMP_PROGRAM_ID.to_string()]
+            },
+            {
+                "commitment": "processed"
+            }
+        ]
+    });
+    
+    // Send the subscription request
+    write.send(Message::Text(subscribe_msg.to_string())).await?;
+    info!("Sent subscription request for Pump.fun program logs");
+    
+    // Process incoming messages
+    while let Some(msg_result) = read.next().await {
+        match msg_result {
+            Ok(msg) => {
+                if let Message::Text(text) = msg {
+                    // Parse the message as JSON
+                    if let Ok(json) = serde_json::from_str::<Value>(&text) {
+                        // Process the message to extract token data
+                        if let Some(token_data) = process_websocket_message(&json, &mut 0, quiet_mode) {
+                            // Send the token data through the channel
+                            if let Err(e) = tx.send(token_data).await {
+                                error!("Failed to send token data through channel: {}", e);
+                            }
+                        }
+                    }
+                }
+            },
+            Err(e) => {
+                return Err(anyhow!("WebSocket error: {}", e));
+            }
+        }
+    }
+    
+    Ok(())
 }

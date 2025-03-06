@@ -98,15 +98,32 @@ pub fn get_authenticated_wss_url() -> String {
             // For now, we'll just log a warning and return the endpoint
             info!("WebSocket authentication credentials will be used in the connection code");
             
-            // We'll return the URL as is - the actual auth will happen in the connection code
             return ws_endpoint;
-        } else {
-            warn!("USE_CHAINSTACK_AUTH is true but username or password is missing");
         }
     }
     
-    // Return the original endpoint
+    // Return the regular endpoint if no special handling is needed
     ws_endpoint
+}
+
+/// Get a fresh WebSocket URL that forces a new session
+/// 
+/// This adds a unique session ID to the WebSocket URL to ensure
+/// that each startup of the application gets a brand new connection
+/// with no accumulated history or buffered events.
+pub fn get_fresh_wss_url() -> String {
+    // Get the base URL
+    let base_url = get_authenticated_wss_url();
+    
+    // Generate a unique session ID
+    let session_id = Uuid::new_v4().to_string();
+    
+    // Add the session ID as a query parameter
+    if base_url.contains('?') {
+        format!("{}&fresh_session={}", base_url, session_id)
+    } else {
+        format!("{}?fresh_session={}", base_url, session_id)
+    }
 }
 
 /// Create a Solana RPC client using the given RPC URL

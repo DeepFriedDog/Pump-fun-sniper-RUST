@@ -292,7 +292,7 @@ async fn connect_to_websocket(wss_endpoint: &str) -> Result<()> {
         "method": "logsSubscribe",
         "params": [
             {"mentions": [program_id]},
-            {"commitment": "confirmed"}
+            {"commitment": "processed"}
         ]
     });
 

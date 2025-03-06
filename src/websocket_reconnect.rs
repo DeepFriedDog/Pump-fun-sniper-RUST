@@ -180,14 +180,14 @@ pub async fn subscribe_to_pump_program(
     // Pump.fun program ID for token creation
     let pump_program_id = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 
-    // Set to "confirmed" commitment for faster detection
+    // Set to "processed" commitment for fastest detection
     let subscription_request = serde_json::json!({
         "id": 1,
         "jsonrpc": "2.0",
         "method": "logsSubscribe",
         "params": [
             {"mentions": [pump_program_id]},
-            {"commitment": "confirmed"}
+            {"commitment": "processed"}
         ]
     })
     .to_string();
