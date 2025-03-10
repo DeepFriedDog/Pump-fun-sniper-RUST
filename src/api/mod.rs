@@ -711,55 +711,31 @@ pub async fn fetch_new_tokens(client: &Arc<Client>) -> Result<TokenData> {
         size
     };
 
-    // Loop through the queue until we find a valid token
-    loop {
-        // Check if we have any tokens in the WebSocket queue
-        let token_option = {
-            let mut queue = NEW_TOKEN_QUEUE.lock().unwrap();
+    // Check if we have any tokens in the WebSocket queue
+    let token_option = {
+        let mut queue = NEW_TOKEN_QUEUE.lock().unwrap();
+        queue.pop_front()
+    };
 
-            // Debug the queue size
-            let queue_size = queue.len();
-            if queue_size > 0 {
-                info!("📋 WebSocket queue contains {} tokens", queue_size);
+    if let Some(token) = token_option {
+        info!("✅ Found token in WebSocket queue: {}", token.mint);
+        info!("   Name: {:?}", token.name);
+        info!("   Symbol: {:?}", token.symbol);
+        info!("   Developer: {}", token.dev);
+        info!("   Metadata: {:?}", token.metadata);
+        info!("   Timestamp: {:?}", token.timestamp);
 
-                // Log the first token details
-                if let Some(first) = queue.front() {
-                    info!(
-                        "🔍 First token in queue: mint={}, name={:?}, dev={}",
-                        first.mint, first.name, first.dev
-                    );
-                }
-
-                queue.pop_front()
-            } else {
-                info!("📋 WebSocket queue is empty, nothing to fetch");
-                None
-            }
+        // Check remaining queue size after popping
+        let remaining = {
+            let queue = NEW_TOKEN_QUEUE.lock().unwrap();
+            queue.len()
         };
+        info!(
+            "📋 Remaining tokens in WebSocket queue after fetch: {}",
+            remaining
+        );
 
-        if let Some(token) = token_option {
-            info!("✅ Found token in WebSocket queue: {}", token.mint);
-            info!("   Name: {:?}", token.name);
-            info!("   Symbol: {:?}", token.symbol);
-            info!("   Developer: {}", token.dev);
-            info!("   Metadata: {:?}", token.metadata);
-            info!("   Timestamp: {:?}", token.timestamp);
-
-            // Check remaining queue size after popping
-            let remaining = {
-                let queue = NEW_TOKEN_QUEUE.lock().unwrap();
-                queue.len()
-            };
-            info!(
-                "📋 Remaining tokens in WebSocket queue after fetch: {}",
-                remaining
-            );
-
-            return Ok(token); // No need for extra API call - we have all data from logs
-        }
-
-        // No tokens in queue
-        break;
+        return Ok(token); // No need for extra API call - we have all data from logs
     }
 
     // If we're in TESTING_MODE, generate a synthetic token for testing
@@ -1231,10 +1207,12 @@ async fn start_websocket_price_monitor(
     highest_price: Arc<Mutex<f64>>,
     lowest_price: Arc<Mutex<f64>>,
 ) -> Result<()> {
+    let mint_owned = mint.to_string();
+
     // Get bonding curve address for the token
     let bonding_curve = match chainstack_simple::calculate_associated_bonding_curve(
         mint,
-        &get_token_creator(mint).await?,
+        &get_token_creator(&mint_owned).await?,
     ) {
         Ok(curve) => curve,
         Err(e) => {
@@ -1287,20 +1265,10 @@ async fn start_websocket_price_monitor(
         account_pubkey
     );
 
-    // Clone values before moving into tokio::spawn
-    let mint_owned = mint.to_string();
-    let take_profit_price = take_profit_price;
-    let stop_loss_price = stop_loss_price;
-    let initial_price = initial_price;
-    let highest_price = highest_price.clone();
-    let lowest_price = lowest_price.clone();
-
-    // Initialize variables for price tracking
-    let mut last_log = Instant::now();
-
     // Spawn a task to handle the websocket messages
     tokio::spawn(async move {
         // Process incoming messages
+        let mut last_log = std::time::Instant::now();
         while let Some(msg) = read.next().await {
             match msg {
                 Ok(WsMessage::Text(text)) => {
@@ -1462,10 +1430,12 @@ async fn start_polling_price_monitor(
     let highest_price_clone = highest_price.clone();
     let lowest_price_clone = lowest_price.clone();
 
+    // Initialize variables for price tracking
+    let mut last_log = std::time::Instant::now();
+
     // Spawn a new task for monitoring
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(price_check_interval_ms));
-        let mut last_log = Instant::now();
 
         loop {
             interval.tick().await;

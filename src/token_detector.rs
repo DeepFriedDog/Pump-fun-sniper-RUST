@@ -17,6 +17,7 @@ use tokio::sync::Mutex;
 use tokio::time::sleep;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use url::Url;
+use tokio::time::timeout;
 
 // Import from config
 use crate::config::{ATA_PROGRAM_ID, PUMP_PROGRAM_ID, TOKEN_PROGRAM_ID};
@@ -518,9 +519,10 @@ async fn process_message(
                                             let token_data_clone = token_data.clone();
 
                                             // IMMEDIATELY log the token detection with pending liquidity status
-                                            info!("🪙 NEW TOKEN DETECTED! {} (mint: {}) 💰 Checking liquidity...", 
-                                                token_data_clone.name, 
-                                                token_data_clone.mint);
+                                            let is_quiet_mode = std::env::args().any(|arg| arg == "--quiet");
+                                            if !is_quiet_mode {
+                                                info!("🪙 NEW TOKEN DETECTED! {} (mint: {}) 💰 Checking liquidity...", token_data_clone.name, token_data_clone.mint);
+                                            }
 
                                             // Convert to NewToken and add to the queue IMMEDIATELY
                                             let mut new_token: NewToken = token_data.into();
@@ -581,6 +583,9 @@ async fn process_message(
 
                                             // Spawn a task to check liquidity asynchronously as a SEPARATE step
                                             tokio::spawn(async move {
+                                                // Add check for quiet mode flag
+                                                let is_quiet_mode = std::env::args().any(|arg| arg == "--quiet");
+
                                                 // Get MIN_LIQUIDITY from environment variable
                                                 let min_liquidity_str =
                                                     std::env::var("MIN_LIQUIDITY")
@@ -597,25 +602,20 @@ async fn process_message(
                                                 .await
                                                 {
                                                     Ok((has_liquidity, sol_amount)) => {
-                                                        // Update the token creation with liquidity info
-                                                        let check_mark = if has_liquidity {
-                                                            "✅"
+                                                        let check_mark = if has_liquidity { "✅" } else { "❌" };
+                                                        if is_quiet_mode {
+                                                            info!("DETECTED NEW TOKEN: {} ({}) {:.2} SOL {}", token_data_clone.name, token_data_clone.mint, sol_amount, check_mark);
                                                         } else {
-                                                            "❌"
-                                                        };
-
-                                                        info!("💰 LIQUIDITY UPDATE: {} (mint: {}) {:.2} SOL {}", 
-                                                            token_data_clone.name, 
-                                                            token_data_clone.mint, 
-                                                            sol_amount, 
-                                                            check_mark);
-                                                    }
+                                                            info!("💰 LIQUIDITY UPDATE: {} (mint: {}) {:.2} SOL {}", token_data_clone.name, token_data_clone.mint, sol_amount, check_mark);
+                                                        }
+                                                    },
                                                     Err(e) => {
-                                                        // Log error and show token with 0 SOL
                                                         debug!("Error checking liquidity: {}", e);
-                                                        info!("💰 LIQUIDITY UPDATE: {} (mint: {}) 0.00 SOL ❌", 
-                                                            token_data_clone.name, 
-                                                            token_data_clone.mint);
+                                                        if is_quiet_mode {
+                                                            info!("DETECTED NEW TOKEN: {} ({}) 0.00 SOL ❌", token_data_clone.name, token_data_clone.mint);
+                                                        } else {
+                                                            info!("💰 LIQUIDITY UPDATE: {} (mint: {}) 0.00 SOL ❌", token_data_clone.name, token_data_clone.mint);
+                                                        }
                                                     }
                                                 }
                                             });
@@ -650,9 +650,10 @@ async fn process_message(
                                                     let token_data_clone = token_data.clone();
 
                                                     // IMMEDIATELY log the token detection with pending liquidity status
-                                                    info!("🪙 NEW TOKEN DETECTED! {} (mint: {}) 💰 Checking liquidity...", 
-                                                        token_data_clone.name, 
-                                                        token_data_clone.mint);
+                                                    let is_quiet_mode = std::env::args().any(|arg| arg == "--quiet");
+                                                    if !is_quiet_mode {
+                                                        info!("🪙 NEW TOKEN DETECTED! {} (mint: {}) 💰 Checking liquidity...", token_data_clone.name, token_data_clone.mint);
+                                                    }
 
                                                     // Convert to NewToken and add to the queue IMMEDIATELY
                                                     let mut new_token: NewToken = token_data.into();
@@ -715,6 +716,9 @@ async fn process_message(
 
                                                     // Spawn a task to check liquidity asynchronously as a SEPARATE step
                                                     tokio::spawn(async move {
+                                                        // Add check for quiet mode flag
+                                                        let is_quiet_mode = std::env::args().any(|arg| arg == "--quiet");
+
                                                         // Get MIN_LIQUIDITY from environment variable
                                                         let min_liquidity_str =
                                                             std::env::var("MIN_LIQUIDITY")
@@ -734,28 +738,20 @@ async fn process_message(
                                                         .await
                                                         {
                                                             Ok((has_liquidity, sol_amount)) => {
-                                                                // Update the token creation with liquidity info
-                                                                let check_mark = if has_liquidity {
-                                                                    "✅"
+                                                                let check_mark = if has_liquidity { "✅" } else { "❌" };
+                                                                if is_quiet_mode {
+                                                                    info!("DETECTED NEW TOKEN: {} ({}) {:.2} SOL {}", token_data_clone.name, token_data_clone.mint, sol_amount, check_mark);
                                                                 } else {
-                                                                    "❌"
-                                                                };
-
-                                                                info!("💰 LIQUIDITY UPDATE: {} (mint: {}) {:.2} SOL {}", 
-                                                                    token_data_clone.name, 
-                                                                    token_data_clone.mint, 
-                                                                    sol_amount, 
-                                                                    check_mark);
-                                                            }
+                                                                    info!("💰 LIQUIDITY UPDATE: {} (mint: {}) {:.2} SOL {}", token_data_clone.name, token_data_clone.mint, sol_amount, check_mark);
+                                                                }
+                                                            },
                                                             Err(e) => {
-                                                                // Log error and show token with 0 SOL
-                                                                debug!(
-                                                                    "Error checking liquidity: {}",
-                                                                    e
-                                                                );
-                                                                info!("💰 LIQUIDITY UPDATE: {} (mint: {}) 0.00 SOL ❌", 
-                                                                    token_data_clone.name, 
-                                                                    token_data_clone.mint);
+                                                                debug!("Error checking liquidity: {}", e);
+                                                                if is_quiet_mode {
+                                                                    info!("DETECTED NEW TOKEN: {} ({}) 0.00 SOL ❌", token_data_clone.name, token_data_clone.mint);
+                                                                } else {
+                                                                    info!("💰 LIQUIDITY UPDATE: {} (mint: {}) 0.00 SOL ❌", token_data_clone.name, token_data_clone.mint);
+                                                                }
                                                             }
                                                         }
                                                     });
@@ -819,155 +815,47 @@ async fn get_rpc_client() -> solana_client::rpc_client::RpcClient {
     )
 }
 
-/// Check token liquidity by examining the balance of the associated bonding curve
-pub async fn check_token_liquidity(
-    mint: &str,
-    bonding_curve: &str,
-    liquidity_threshold: f64,
-) -> Result<(bool, f64), Box<dyn std::error::Error + Send + Sync>> {
-    use solana_client::rpc_client::RpcClient;
+/// New liquidity check using RPC (from commit c0b1a813cf5e3e22aebe2b233b6a2a4240ece528)
+pub async fn check_token_liquidity(mint: &str, _bonding_curve: &str, liquidity_threshold: f64) -> Result<(bool, f64)> {
     use solana_sdk::pubkey::Pubkey;
-    use std::str::FromStr;
-
-    // CRITICAL PERFORMANCE OPTIMIZATION:
-    // Since we've identified that transaction data may not be persisted yet when we receive the log event,
-    // we need to have ultra-fast fallback paths to avoid delaying token detection.
-    // For extremely low liquidity thresholds (under 1 SOL), we'll optimize for speed over accuracy.
-    if liquidity_threshold < 1.0 {
-        // For small thresholds, return immediately with assumed liquidity to avoid any delay
-        // This ensures we detect tokens instantly regardless of transaction persistence
-        debug!("⚡ ULTRA FAST PATH: Using assumed liquidity for threshold < 1.0 SOL");
-        return Ok((true, 1.0));
-    }
-
+    use std::time::Duration;
+    
     // Check cache first for recent results
-    let cache_key = format!("{}:{}", mint, bonding_curve);
+    let cache_key = format!("primary:{}", mint);
     {
         let cache = LIQUIDITY_CACHE.lock().await;
         if let Some((balance, timestamp)) = cache.get(&cache_key) {
-            // Use cached value if less than 30 seconds old (increased from 5 seconds)
-            // This helps avoid repeated RPC calls for the same token
-            if timestamp.elapsed() < std::time::Duration::from_secs(30) {
-                debug!("Using cached liquidity for {}: {:.2} SOL", mint, balance);
+            if timestamp.elapsed() < Duration::from_secs(5) {
+                debug!("Using cached primary liquidity for {}: {} SOL", mint, balance);
                 return Ok((*balance >= liquidity_threshold, *balance));
             }
         }
     }
-
-    // Get RPC client - use a faster timeout to reduce delays
-    let client = get_optimized_rpc_client().await;
-
+    
+    let client = get_rpc_client().await;
+    let mint_pubkey = Pubkey::from_str(mint).map_err(|e| anyhow!("Invalid mint pubkey: {}", e))?;
+    let (primary_bonding_curve, _) = get_bonding_curve_address(&mint_pubkey);
+    
     // The rent exempt minimum amount in SOL
     const RENT_EXEMPT_MINIMUM: f64 = 0.00203928;
-
-    // Convert mint address to public key
-    let mint_pubkey = match Pubkey::from_str(mint) {
-        Ok(pubkey) => pubkey,
-        Err(e) => {
-            debug!("Invalid mint address: {}", e);
-            // Cache the error result to avoid repeated failures
-            let mut cache = LIQUIDITY_CACHE.lock().await;
-            cache.insert(cache_key, (0.0, std::time::Instant::now()));
-            return Ok((false, 0.0));
-        }
-    };
-
-    // IMPROVEMENT: First try to directly get the primary bonding curve address
-    let (primary_bonding_curve, _) = get_bonding_curve_address(&mint_pubkey);
-    debug!("Checking primary bonding curve: {}", primary_bonding_curve);
-
-    // Use a VERY aggressive timeout for the RPC call to avoid blocking
-    let account_result = tokio::time::timeout(
-        std::time::Duration::from_millis(100), // Extremely low timeout (100ms) to avoid delays
-        tokio::task::spawn_blocking(move || client.get_account(&primary_bonding_curve)),
-    )
-    .await;
-
-    // Process the result
-    match account_result {
-        Ok(task_result) => match task_result {
-            Ok(result) => match result {
-                Ok(account) => {
-                    // Get total balance
-                    let total_balance = account.lamports as f64 / 1_000_000_000.0; // Convert lamports to SOL
-
-                    // Subtract rent exempt minimum to get actual liquidity
-                    let actual_liquidity = (total_balance - RENT_EXEMPT_MINIMUM).max(0.0);
-
-                    debug!(
-                        "Primary bonding curve has {:.2} SOL (after subtracting {:.8} SOL rent)",
-                        actual_liquidity, RENT_EXEMPT_MINIMUM
-                    );
-
-                    // Update the cache
-                    {
-                        let mut cache = LIQUIDITY_CACHE.lock().await;
-                        cache.insert(cache_key, (actual_liquidity, std::time::Instant::now()));
-                    }
-
-                    // Check if the token meets the liquidity threshold
-                    let has_sufficient_liquidity = if liquidity_threshold <= 0.0 {
-                        // Special case: if threshold is 0, any non-zero liquidity is sufficient
-                        actual_liquidity > 0.0
-                    } else {
-                        actual_liquidity >= liquidity_threshold
-                    };
-
-                    Ok((has_sufficient_liquidity, actual_liquidity))
-                }
-                Err(e) => {
-                    debug!("Error getting account: {}", e);
-                    // Cache the error result to avoid repeated failures
-                    let mut cache = LIQUIDITY_CACHE.lock().await;
-                    cache.insert(cache_key, (0.0, std::time::Instant::now()));
-                    Ok((false, 0.0))
-                }
-            },
-            Err(e) => {
-                debug!("Spawn blocking error: {}", e);
-                // Cache the error result to avoid repeated failures
+    match client.get_account(&primary_bonding_curve) {
+        Ok(account) => {
+            let total_balance = account.lamports as f64 / 1_000_000_000.0;
+            let actual_liquidity = (total_balance - RENT_EXEMPT_MINIMUM).max(0.0);
+            
+            // Update the cache
+            {
                 let mut cache = LIQUIDITY_CACHE.lock().await;
-                cache.insert(cache_key, (0.0, std::time::Instant::now()));
-                Ok((false, 0.0))
+                cache.insert(cache_key, (actual_liquidity, std::time::Instant::now()));
             }
+            
+            debug!("Primary bonding curve has {} SOL (after subtracting {} SOL rent)", actual_liquidity, RENT_EXEMPT_MINIMUM);
+            Ok((actual_liquidity >= liquidity_threshold, actual_liquidity))
         },
         Err(e) => {
-            // This means the timeout occurred - log it but provide a fast response
-            debug!("⚡ ULTRA FAST PATH: Timeout getting account: {}. Using fallback to avoid delaying token detection.", e);
-            // Cache the timeout result to avoid repeated timeouts
-            let mut cache = LIQUIDITY_CACHE.lock().await;
-            cache.insert(cache_key, (0.0, std::time::Instant::now()));
-            // In case of timeout, assume there's liquidity if threshold is low to avoid missing opportunities
-            let assume_liquidity = liquidity_threshold < 0.5;
-            Ok((assume_liquidity, 0.1)) // Return 0.1 SOL as a conservative estimate
+            Err(anyhow!("Failed to get account info for primary bonding curve: {}", e))
         }
     }
-}
-
-// Create an optimized RPC client with shorter timeouts
-async fn get_optimized_rpc_client() -> solana_client::rpc_client::RpcClient {
-    use solana_client::rpc_client::RpcClient;
-
-    // Only use Chainstack endpoint for RPC calls
-    let rpc_url = std::env::var("CHAINSTACK_ENDPOINT").unwrap_or_else(|_| {
-        "https://solana-mainnet.core.chainstack.com/b04d312222d7be6eefd6b31d84a303ab".to_string()
-    });
-
-    // Validate that the URL has a proper schema
-    let rpc_url = if !rpc_url.starts_with("http") {
-        format!("https://{}", rpc_url)
-    } else {
-        rpc_url
-    };
-
-    debug!("Creating optimized RPC client with URL: {}", rpc_url);
-
-    // Create client with ultra-short timeout
-    RpcClient::new_with_timeout_and_commitment(
-        rpc_url,
-        std::time::Duration::from_millis(300), // 300ms timeout for ultra-fast responsiveness
-        solana_sdk::commitment_config::CommitmentConfig::processed(),
-    )
 }
 
 /// Check only the primary bonding curve account liquidity and subtract rent exemption

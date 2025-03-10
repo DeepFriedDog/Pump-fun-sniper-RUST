@@ -1,8 +1,8 @@
 use anyhow::{anyhow, Error, Result};
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use bs58;
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
+use futures_util::future::join_all;
 use log::{debug, error, info, warn};
 use serde_json::{json, Value};
 use solana_program::pubkey::Pubkey;
@@ -17,9 +17,30 @@ use reqwest;
 use std::collections::HashMap;
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_client::rpc_client::RpcClient;
+use lazy_static::lazy_static;
+use dashmap::DashSet;
+use base64::{alphabet, engine::general_purpose::GeneralPurposeConfig, Engine};
 
 use crate::config::{ATA_PROGRAM_ID, PUMP_PROGRAM_ID, TOKEN_PROGRAM_ID};
 use crate::chainstack_simple;
+
+lazy_static! {
+    static ref PROCESSED_TOKENS: DashSet<String> = DashSet::new();
+    static ref MIN_LIQUIDITY_CACHED: f64 = std::env::var("MIN_LIQUIDITY")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(50.0);
+}
+
+const SUBSCRIPTION_MSG: &str = r#"{
+    \"jsonrpc\": \"2.0\",
+    \"id\": 8002,
+    \"method\": \"logsSubscribe\",
+    \"params\": [
+        { \"mentions\": [ \"6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P\" ] },
+        { \"commitment\": \"processed\" }
+    ]
+}"#;
 
 /// Creates a fresh WebSocket connection without extra parameters that might delay message delivery
 /// This approach is based on the older implementation that had more immediate token detection
@@ -27,25 +48,31 @@ async fn connect_fresh(url_str: &str) -> Result<tokio_tungstenite::WebSocketStre
     // Parse the URL
     let url = Url::parse(url_str)?;
     
-    // Generate a unique identifier for this session
-    let session_id = uuid::Uuid::new_v4().to_string();
-    
     // Current timestamp for cache busting
     let current_timestamp_millis = Utc::now().timestamp_millis();
     
     // Create a fresh URL with minimal parameters - just cache busting
     let mut fresh_url = url.clone();
     fresh_url.query_pairs_mut()
-        .append_pair("_", &current_timestamp_millis.to_string());   // Cache busting
+        .append_pair("_", &current_timestamp_millis.to_string());
     
     // Create a fresh URL string
     let fresh_url_str = fresh_url.to_string();
     
-    // Use a standard WebSocket config
     info!("Connecting to WebSocket with minimal parameters: {}", fresh_url_str);
     
     // Direct connection attempt with minimal configuration
     let (stream, _) = connect_async(&fresh_url_str).await?;
+    
+    // Set TCP_NODELAY on underlying TcpStream if available
+    match stream.get_ref() {
+        tokio_tungstenite::MaybeTlsStream::Plain(tcp_stream) => {
+            if let Err(e) = tcp_stream.set_nodelay(true) {
+                warn!("Failed to set TCP_NODELAY on plain TCP stream: {}", e);
+            }
+        },
+        _ => {}
+    }
     
     info!("Connection established successfully");
     info!("Ready to subscribe to token events");
@@ -66,12 +93,10 @@ pub fn find_associated_bonding_curve(mint: &Pubkey, bonding_curve: &Pubkey) -> P
 }
 
 /// Parse the create instruction data
+#[inline(always)]
 fn parse_create_instruction(data: &[u8]) -> Option<TokenData> {
     if data.len() < 8 {
-        debug!(
-            "Data too short to be a valid instruction: {} bytes",
-            data.len()
-        );
+        debug!("Data too short to be a valid instruction: {} bytes", data.len());
         return None;
     }
 
@@ -135,50 +160,32 @@ fn parse_create_instruction(data: &[u8]) -> Option<TokenData> {
     // Parse fields
     let name = match read_string(data, &mut offset) {
         Some(name) => name,
-        None => {
-            debug!("Failed to parse token name");
-            return None;
-        }
+        None => { debug!("Failed to parse token name"); return None; }
     };
 
     let symbol = match read_string(data, &mut offset) {
         Some(symbol) => symbol,
-        None => {
-            debug!("Failed to parse token symbol");
-            return None;
-        }
+        None => { debug!("Failed to parse token symbol"); return None; }
     };
 
     let uri = match read_string(data, &mut offset) {
         Some(uri) => uri,
-        None => {
-            debug!("Failed to parse token URI");
-            return None;
-        }
+        None => { debug!("Failed to parse token URI"); return None; }
     };
 
     let mint = match read_pubkey(data, &mut offset) {
         Some(mint) => mint,
-        None => {
-            debug!("Failed to parse mint address");
-            return None;
-        }
+        None => { debug!("Failed to parse mint address"); return None; }
     };
 
     let bonding_curve = match read_pubkey(data, &mut offset) {
         Some(bonding_curve) => bonding_curve,
-        None => {
-            debug!("Failed to parse bonding curve address");
-            return None;
-        }
+        None => { debug!("Failed to parse bonding curve address"); return None; }
     };
 
     let user = match read_pubkey(data, &mut offset) {
         Some(user) => user,
-        None => {
-            debug!("Failed to parse user address");
-            return None;
-        }
+        None => { debug!("Failed to parse user address"); return None; }
     };
 
     debug!("Successfully parsed token data: {} ({})", name, symbol);
@@ -438,11 +445,13 @@ pub async fn run_websocket_test(endpoint: &str) -> Result<Vec<TokenData>, Error>
         if let Ok(mut url) = Url::parse(&url_string) {
             // Set credentials in URL (format: wss://username:password@hostname/path)
             if url.scheme() == "wss" || url.scheme() == "ws" {
-                if let Err(_) = url.set_username(&username) {
-                    warn!("Failed to set username for WebSocket URL");
+                if url.set_username(&username).is_err() {
+                    error!("Failed to set WebSocket username");
+                    return Err(anyhow!("Failed to set WebSocket username"));
                 }
-                if let Err(_) = url.set_password(Some(&password)) {
-                    warn!("Failed to set password for WebSocket URL");
+                if url.set_password(Some(&password)).is_err() {
+                    error!("Failed to set WebSocket password");
+                    return Err(anyhow!("Failed to set WebSocket password"));
                 }
                 url_string = url.to_string();
                 info!("Using authenticated WebSocket URL with embedded credentials");
@@ -616,11 +625,9 @@ pub async fn run_websocket_test(endpoint: &str) -> Result<Vec<TokenData>, Error>
                         info!("Status: Processed {} messages, found {} new tokens. Test ends in {}m{}s",
                               message_count, token_creations, mins, secs);
                     }
-                } else {
-                    if !quiet_mode {
-                        info!("Status: Processed {} messages, found {} new tokens. Monitoring indefinitely.",
-                              message_count, token_creations);
-                    }
+                } else if !quiet_mode {
+                    info!("Status: Processed {} messages, found {} new tokens. Monitoring indefinitely.",
+                          message_count, token_creations);
                 }
             }
 
@@ -635,13 +642,14 @@ pub async fn run_websocket_test(endpoint: &str) -> Result<Vec<TokenData>, Error>
                         // Handle different message types
                         match message {
                             Message::Text(text) => {
+                                // Only parse if the message is a subscription response (contains "id") or if it indicates a Create event
+                                if !(text.contains("\"id\"") || text.contains("Create")) {
+                                    continue;
+                                }
                                 // Parse message as JSON
                                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
-                                    if let Some(token_data) = process_websocket_message(&json, &mut token_creations, quiet_mode) {
-                                        // Return immediately with the token to prevent delay
+                                    if let Some(token_data) = process_websocket_message(&json, &mut token_creations, quiet_mode).await {
                                         token_data_list.push(token_data);
-
-                                        // Return the token data immediately instead of waiting
                                         return Ok(token_data_list);
                                     }
                                 }
@@ -688,7 +696,7 @@ pub async fn run_websocket_test(endpoint: &str) -> Result<Vec<TokenData>, Error>
 }
 
 /// Process a WebSocket message to extract token data if it's a token creation event
-fn process_websocket_message(
+async fn process_websocket_message(
     message: &serde_json::Value,
     token_creation_count: &mut usize,
     quiet_mode: bool,
@@ -704,19 +712,23 @@ fn process_websocket_message(
     // Check if this is a notification
     if let Some(method) = message.get("method").and_then(|v| v.as_str()) {
         if method == "logsNotification" {
+            // Capture timestamp as soon as logsNotification is received
+            let msg_received_ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64;
             if let Some(params) = message.get("params") {
                 if let Some(result) = params.get("result") {
                     if let Some(value) = result.get("value") {
                         // Extract log data
-                        if let Some(logs) = value.get("logs").and_then(|v| v.as_array()) {
+                        if let Some(logs) = value.get("logs").and_then(|v| v.as_array().cloned()) {
                             if !quiet_mode {
-                                // Changed to debug level - these were too noisy
                                 debug!("Log entry count: {}", logs.len());
                             }
 
                             // ONLY check for "Create" instruction in logs - ignore Buy events as requested
                             let contains_create = logs.iter().any(|log| {
-                                log.as_str().map_or(false, |s| {
+                                log.as_str().is_some_and(|s| {
                                     s.contains("Program log: Instruction: Create")
                                 })
                             });
@@ -743,54 +755,32 @@ fn process_websocket_message(
                                                 }
 
                                                 // Extract base64 data part
-                                                if let Some(data_part) =
-                                                    log_str.strip_prefix("Program data: ")
-                                                {
-                                                    program_data_base64 = data_part.to_string();
-
-                                                    // Decode the base64 data
-                                                    if let Ok(decoded_data) =
-                                                        BASE64.decode(data_part)
-                                                    {
+                                                if let Some(data_part) = log_str.strip_prefix("Program data: ") {
+                                                    let data_owned = data_part.to_string();
+                                                    program_data_base64 = data_owned.clone();
+                                                    // Decode the base64 data using spawn_blocking with our runtime engine
+                                                    let decoded_result = tokio::task::spawn_blocking(move || decode_base64(data_owned.as_str()))
+                                                        .await.ok().and_then(|r| r.ok());
+                                                    if let Some(decoded_data) = decoded_result {
                                                         if !quiet_mode {
                                                             info!("Successfully decoded program data ({} bytes)", decoded_data.len());
                                                         }
 
                                                         // Parse the token details
-                                                        if let Some(mut token_data) =
-                                                            parse_create_instruction(&decoded_data)
-                                                        {
-                                                            // Set the transaction signature
-                                                            token_data.tx_signature =
-                                                                signature.to_string();
-                                                                
-                                                            // IMPORTANT: First calculate detection time at processed level
-                                                            // before doing any additional processing that might add delays
-                                                            let detection_time = SystemTime::now()
-                                                                .duration_since(UNIX_EPOCH)
-                                                                .unwrap_or_default()
-                                                                .as_secs() as i64;
-                                                                
-                                                            // Store the detection time in the token data
-                                                            token_data.detection_time = Some(detection_time);
-                                                            
-                                                            // Set block_time to detection_time since we're not fetching transaction details
-                                                            // This ensures we have a valid timestamp for all downstream processing
-                                                            token_data.block_time = Some(detection_time);
-                                                            
-                                                            // Only proceed with valid tokens
-                                                            // Check if the mint address ends with "pump" which indicates a valid token
-                                                            if token_data.mint.ends_with("pump")
-                                                                || token_data.name != "Unknown"
-                                                            {
-                                                                // Log the token detection immediately for the fastest response
-                                                                info!("🔔 PROCESSED LEVEL - DETECTED NEW TOKEN: {} ({})", 
-                                                                      token_data.name, token_data.mint);
-                                                                
-                                                                // Return the token data - all further processing will happen
-                                                                // in the WebSocket listener loop to avoid await issues
-                                                                return Some(token_data);
+                                                        if let Some(mut token_data) = parse_create_instruction(&decoded_data) {
+                                                            // Deduplication using DashSet: check if this token mint was already processed
+                                                            if !PROCESSED_TOKENS.insert(token_data.mint.clone()) {
+                                                                return None;
                                                             }
+
+                                                            // Set the transaction signature
+                                                            token_data.tx_signature = signature.to_string();
+                                                            
+                                                            // Use current time as detection and block time in milliseconds
+                                                            token_data.detection_time = Some(msg_received_ts);
+                                                            token_data.block_time = Some(msg_received_ts);
+
+                                                            return Some(token_data);
                                                         }
                                                     }
                                                 }
@@ -815,10 +805,11 @@ pub async fn listen_for_tokens(
     priority_fee: u64,
     wallet: String,
 ) -> Result<mpsc::Receiver<TokenData>> {
-    // Create a channel for sending token data
-    let (tx, rx) = mpsc::channel(100);
+    // Create two channels: raw channel and final channel
+    let (raw_tx, mut raw_rx) = mpsc::channel(100);
+    let (final_tx, final_rx) = mpsc::channel(100);
     
-    // Get the WebSocket endpoint from environment with proper authentication
+    // Get the WebSocket endpoint from env
     let wss_endpoint = std::env::var("CHAINSTACK_WSS_ENDPOINT")
         .or_else(|_| std::env::var("WSS_ENDPOINT"))
         .unwrap_or_else(|_| chainstack_simple::get_fresh_wss_url());
@@ -826,102 +817,60 @@ pub async fn listen_for_tokens(
     info!("Starting WebSocket listener with fresh connection: {}", wss_endpoint);
     info!("Using processed commitment level for fastest token detection");
     
-    // Start the WebSocket listener in a separate task
+    // Start the WebSocket listener in a separate task, sending raw tokens
+    {
+        let wss_endpoint_clone = wss_endpoint.clone();
+        let quiet_mode_clone = quiet_mode;
+        let raw_tx_clone = raw_tx.clone();
+        tokio::spawn(async move {
+             if let Err(e) = run_websocket_listener(&wss_endpoint_clone, &raw_tx_clone, quiet_mode_clone).await {
+                 error!("WebSocket listener error: {}", e);
+             }
+        });
+    }
+    
+    // Spawn a batching task to process liquidity checks
     tokio::spawn(async move {
-        let mut consecutive_failures = 0;
-        let initial_backoff = Duration::from_secs(1);
-        let max_backoff = Duration::from_secs(15); // Reduced from 60s to 15s for faster recovery
-        let mut current_backoff = initial_backoff;
-        let backoff_factor = 1.5; // Reduced from 2.0 for faster scaling
-        
-        // Track how many times we've reconnected due to token detection timeouts
-        let mut timeout_reconnects = 0;
-        let max_timeout_reconnects = 3;  // After this many timeouts, try a different strategy
-        
-        loop {
-            match run_websocket_listener(&wss_endpoint, &tx, quiet_mode).await {
-                Ok(_) => {
-                    // Reset backoff on success
-                    current_backoff = initial_backoff;
-                    consecutive_failures = 0;
-                    
-                    // Also reset timeout reconnects on a clean exit
-                    timeout_reconnects = 0;
-                    
-                    // If we got here with no errors, still wait briefly before reconnecting
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                },
-                Err(e) => {
-                    consecutive_failures += 1;
-                    
-                    // Check if this is a forced timeout reconnect due to no tokens
-                    if e.to_string().contains("no token detection within timeout period") {
-                        // If we've been running for at least 10 minutes with no tokens,
-                        // it might just be that no tokens are being created
-                        if consecutive_failures > 10 {
-                            // Don't keep forcing reconnects if there are likely just no new tokens
-                            info!("No tokens detected for an extended period - normal operation, continuing to monitor");
-                            // Wait longer between reconnects when no tokens are being created
-                            tokio::time::sleep(Duration::from_secs(30)).await;
-                            continue;
-                        }
-                        
-                        timeout_reconnects += 1;
-                        warn!("Timeout reconnect #{} due to no token detection", timeout_reconnects);
-                        
-                        if timeout_reconnects >= max_timeout_reconnects {
-                            // After several timeout failures, we need a more aggressive approach
-                            warn!("Multiple token detection timeouts - trying connection with different parameters");
-                            
-                            // Try a completely different URL to see if that helps
-                            let fresh_url = chainstack_simple::get_fresh_wss_url();
-                            if fresh_url != wss_endpoint {
-                                info!("Switching to a different WebSocket endpoint: {}", fresh_url);
-                                
-                                // Wait a bit longer to let all resources be cleaned up
-                                tokio::time::sleep(Duration::from_secs(2)).await;
-                                
-                                // Run with the new endpoint but reset the timeout count
-                                let new_result = run_websocket_listener(&fresh_url, &tx, quiet_mode).await;
-                                if new_result.is_ok() {
-                                    timeout_reconnects = 0;
-                                }
-                            } else {
-                                // Force a complete node re-connection by waiting longer
-                                warn!("Forcing complete node re-connection with longer wait");
-                                tokio::time::sleep(Duration::from_secs(5)).await;
-                            }
-                            
-                            // Reset the counter regardless of outcome
-                            timeout_reconnects = 0;
-                        } else {
-                            // For timeout reconnects, use a shorter backoff
-                            tokio::time::sleep(Duration::from_millis(500)).await;
-                            continue;
-                        }
-                    } else if e.to_string().contains("Connection silence timeout") {
-                        // This is a dead connection, reconnect immediately
-                        warn!("Connection silence detected - reconnecting immediately");
-                        continue;
-                    }
-                    
-                    warn!(
-                        "WebSocket connection failed: {}. Retrying in {} seconds...",
-                        e, current_backoff.as_secs()
-                    );
-                    
-                    // Exponential backoff for non-timeout failures
-                    tokio::time::sleep(current_backoff).await;
-                    
-                    // Update backoff for next attempt
-                    let backoff_secs = (current_backoff.as_secs() as f64 * backoff_factor) as u64;
-                    current_backoff = std::cmp::min(Duration::from_secs(backoff_secs), max_backoff);
-                }
-            }
-        }
+         let liquidity_threshold: f64 = *MIN_LIQUIDITY_CACHED;
+         loop {
+             let mut batch = Vec::new();
+             // Wait for first token
+             match raw_rx.recv().await {
+                 Some(token) => batch.push(token),
+                 None => break, // channel closed
+             }
+             // Drain additional tokens with a 10ms timeout
+             loop {
+                 match tokio::time::timeout(Duration::from_millis(10), raw_rx.recv()).await {
+                     Ok(Some(token)) => batch.push(token),
+                     _ => break,
+                 }
+             }
+             // Process the batch concurrently using FuturesUnordered
+             let mut unordered = futures_util::stream::FuturesUnordered::new();
+             for token_data in batch {
+                 let final_tx_clone = final_tx.clone();
+                 unordered.push(async move {
+                     match crate::token_detector::check_token_liquidity(&token_data.mint, &token_data.bonding_curve, liquidity_threshold).await {
+                         Ok((has_liquidity, sol_amount)) => {
+                             let symbol = if has_liquidity { "✅" } else { "❌" };
+                             info!("🔔 PROCESSED LEVEL - DETECTED NEW TOKEN: {} ({}) {:.2} SOL {}", token_data.name, token_data.mint, sol_amount, symbol);
+                         },
+                         Err(e) => {
+                             warn!("Liquidity check failed for token {} ({}): {}", token_data.name, token_data.mint, e);
+                             info!("🔔 PROCESSED LEVEL - DETECTED NEW TOKEN: {} ({}) 0.00 SOL ❌", token_data.name, token_data.mint);
+                         }
+                     }
+                     if let Err(e) = final_tx_clone.send(token_data).await {
+                         error!("Failed to send token data through final channel: {}", e);
+                     }
+                 });
+             }
+             while let Some(_) = unordered.next().await {}
+         }
     });
     
-    Ok(rx)
+    Ok(final_rx)
 }
 
 /// Run the WebSocket listener and send tokens through the channel
@@ -930,7 +879,10 @@ async fn run_websocket_listener(
     tx: &mpsc::Sender<TokenData>,
     quiet_mode: bool,
 ) -> Result<()> {
-    // First, check if the node is fully synced before proceeding
+    let tx = tx.clone();  // Added to ensure tx is available in async closures
+
+    // Measure node sync check timing.
+    let sync_start = Instant::now();
     if let Ok(is_synced) = check_node_sync_status(endpoint).await {
         if !is_synced {
             warn!("Node is not fully synced, token detection might be delayed");
@@ -938,6 +890,8 @@ async fn run_websocket_listener(
             info!("Node is fully synced and ready for connections");
         }
     }
+    let sync_duration = sync_start.elapsed().as_millis();
+    info!("Node sync check took {} ms", sync_duration);
     
     // Parse the WebSocket URL
     let url = Url::parse(endpoint)?;
@@ -975,23 +929,25 @@ async fn run_websocket_listener(
     let subscribe_msg = Message::Text(
         json!({
             "jsonrpc": "2.0",
-            "id": subscription_id,
+            "id": 8002,
             "method": "logsSubscribe",
             "params": [
                 {
                     "mentions": [ PUMP_PROGRAM_ID.to_string() ]
                 },
                 {
-                    "commitment": "processed"  // Important: use processed for fastest notifications
+                    "commitment": "processed"
                 }
             ]
-        }).to_string()
+        })
+        .to_string()
     );
-    
-    // Send the subscription request immediately without flushing
+    let sub_start = Instant::now();
     if let Err(e) = write.send(subscribe_msg).await {
         return Err(anyhow!("Failed to send subscription request: {}", e));
     }
+    let sub_duration = sub_start.elapsed().as_millis();
+    info!("Subscription request sent in {} ms", sub_duration);
     
     info!("WebSocket subscription sent with id: {}", subscription_id);
     
@@ -1000,10 +956,6 @@ async fn run_websocket_listener(
     
     // Track when the last token was detected
     let mut last_token_time = Instant::now();
-    
-    // Wait for subscription confirmation and then process messages
-    let mut subscription_confirmed = false;
-    let mut current_subscription_id: Option<u64> = None;
     
     // Processing loop - we'll keep this structure from the current code
     // to properly track timing and handle messages
@@ -1058,8 +1010,12 @@ async fn run_websocket_listener(
                 
                 match msg {
                     Message::Text(text) => {
-                        // Parse the message as JSON
-                        if let Ok(json) = serde_json::from_str::<Value>(&text) {
+                        // Only parse if the message is a subscription response (contains "id") or if it indicates a Create event
+                        if !(text.contains("\"id\"") || text.contains("Create")) {
+                            continue;
+                        }
+                        // Parse message as JSON
+                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
                             // Track message types
                             if let Some(method) = json.get("method").and_then(|m| m.as_str()) {
                                 *message_stats.method_counts.entry(method.to_string()).or_insert(0) += 1;
@@ -1071,107 +1027,8 @@ async fn run_websocket_listener(
                                 }
                             }
                             
-                            // Process the message to extract token data
-                            if let Some(token_data) = process_websocket_message(&json, &mut token_creation_count, quiet_mode) {
-                                // Flag that we detected a token, to avoid forced reconnect
-                                token_detected = true;
-                                
-                                // Calculate detection time from connection start and subscription
-                                let detection_time = message_stats.connection_start.elapsed();
-                                let time_since_last = last_token_time.elapsed();
-                                last_token_time = Instant::now();
-                                let time_since_subscription = subscription_start.elapsed();
-                                
-                                // Get the detection timestamp from the token data or calculate it now
-                                let detection_timestamp = token_data.detection_time.unwrap_or_else(|| {
-                                    SystemTime::now()
-                                        .duration_since(UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_secs() as i64
-                                });
-                                
-                                // Display detection information at PROCESSED commitment level
-                                info!("Token detected after {}ms from connection start ({} since subscription): {} ({}ms since last token)",
-                                    detection_time.as_millis(), 
-                                    time_since_subscription.as_millis(),
-                                    token_data.mint, 
-                                    time_since_last.as_millis());
-                                
-                                // IMMEDIATE ACTION: Check liquidity and prepare for buying at PROCESSED level
-                                // This happens without waiting for confirmed/finalized status
-                                let token_data_clone = token_data.clone();
-                                let mint = token_data_clone.mint.clone();
-                                let bonding_curve = token_data_clone.bonding_curve.clone();
-                                
-                                // 1. IMMEDIATELY start processing buy transaction in separate task
-                                tokio::spawn(async move {
-                                    // This would interact with your buying logic and bonding curve checks
-                                    info!("🚀 IMMEDIATE ACTION: Starting liquidity check for {} at PROCESSED level", 
-                                          mint);
-                                    
-                                    // CRITICAL PERFORMANCE OPTIMIZATION:
-                                    // To completely eliminate latency caused by waiting for transaction metadata
-                                    // to be persisted, we use a fast path for low liquidity thresholds
-                                    let liquidity_threshold = 3.0; // Min liquidity
-                                    
-                                    if liquidity_threshold < 5.0 {
-                                        // For tokens requiring less than 5 SOL liquidity, we can immediately proceed
-                                        // A full liquidity check will still happen but won't block token detection
-                                        info!("⚡ INSTANT DETECTION: Bypassing full liquidity check for faster token detection");
-                                        info!("Assumed bonding curve liquidity: 1.0 SOL (instant path), Required: {:.2} SOL", 
-                                              liquidity_threshold);
-                                              
-                                        // Fire-and-forget the full liquidity check in a separate task
-                                        let mint_clone = mint.clone();
-                                        let bonding_curve_clone = bonding_curve.clone();
-                                        tokio::spawn(async move {
-                                            match crate::token_detector::check_token_liquidity(
-                                                &mint_clone,
-                                                &bonding_curve_clone,
-                                                liquidity_threshold
-                                            ).await {
-                                                Ok((has_liquidity, sol_amount)) => {
-                                                    info!("Full bonding curve check complete: {:.2} SOL", sol_amount);
-                                                },
-                                                Err(e) => {
-                                                    warn!("Background liquidity check failed: {}", e);
-                                                }
-                                            }
-                                        });
-                                        
-                                        // Immediately continue with token detection
-                                        info!("✅ Fast path PASSED - Continuing with token processing");
-                                    } else {
-                                        // Only for higher liquidity thresholds do we wait for the full check
-                                        match crate::token_detector::check_token_liquidity(
-                                            &mint,
-                                            &bonding_curve,
-                                            liquidity_threshold
-                                        ).await {
-                                            Ok((has_liquidity, sol_amount)) => {
-                                                info!("Bonding curve liquidity: {:.2} SOL, Required: {:.2} SOL", 
-                                                    sol_amount, liquidity_threshold);
-                                                    
-                                                if has_liquidity {
-                                                    info!("✅ Liquidity check PASSED (PROCESSED level) - Preparing buy transaction");
-                                                    // Call your buy function here
-                                                } else {
-                                                    info!("❌ Liquidity check FAILED (PROCESSED level) - Skipping buy");
-                                                }
-                                            },
-                                            Err(e) => {
-                                                warn!("Failed to check liquidity at PROCESSED level: {}", e);
-                                            }
-                                        }
-                                    }
-                                });
-                                
-                                // 2. ASYNCHRONOUSLY fetch additional transaction details for logging/display
-                                // REMOVED: No longer fetching transaction details which can delay processing
-                                // Instead, we log that we're skipping this step for faster processing
-                                info!("⏱️ CONFIRMED DETAILS: Block time to detection latency: 0ms (transaction details skipped for faster processing)");
-                                
-                                // Send the token data through the channel for further processing
+                        // Process the message to extract token data
+                            if let Some(token_data) = process_websocket_message(&json, &mut token_creation_count, quiet_mode).await {
                                 if let Err(e) = tx.send(token_data).await {
                                     error!("Failed to send token data through channel: {}", e);
                                 }
@@ -1232,4 +1089,13 @@ impl MessageStats {
             next_report_time: now,
         }
     }
+}
+
+// Internal base64 decoder function to avoid constant evaluation issues
+fn decode_base64(input: &str) -> Result<Vec<u8>, base64::DecodeError> {
+    // Using the engine directly at runtime
+    base64::engine::general_purpose::GeneralPurpose::new(
+        &base64::alphabet::STANDARD, 
+        base64::engine::general_purpose::GeneralPurposeConfig::new()
+    ).decode(input)
 }

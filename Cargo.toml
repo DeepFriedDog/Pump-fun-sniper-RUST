@@ -8,10 +8,6 @@ default-run = "pumpfun-sniper"
 bin = []
 
 [[bin]]
-name = "test_token_logs"
-path = "src/bin/test_token_logs.rs"
-
-[[bin]]
 name = "simple_extract_tokens"
 path = "src/bin/simple_extract_tokens.rs"
 
@@ -54,6 +50,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4.5.31", features = ["derive"] }
 http = "1.2.0"
+dashmap = "6.1.0"
 
 # Fix for ark-bn254 compile error - using older, more stable versions
 [dependencies.ark-ff]

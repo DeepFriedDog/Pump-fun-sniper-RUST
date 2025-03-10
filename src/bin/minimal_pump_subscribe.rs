@@ -2,8 +2,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use solana_program::pubkey::Pubkey;
 use std::str::FromStr;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::mpsc;
+use std::time::Instant;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use url::Url;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -26,7 +25,6 @@ struct TokenData {
     bonding_curve: String,
     user: String,
     associated_bonding_curve: String,
-    detection_time: u64,
 }
 
 // Finds the associated bonding curve for a given mint and bonding curve
@@ -63,10 +61,6 @@ fn parse_create_instruction(data: &[u8]) -> Option<TokenData> {
         bonding_curve: String::new(),
         user: String::new(),
         associated_bonding_curve: String::new(),
-        detection_time: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
     };
     
     // Parse string fields (name, symbol, uri)
@@ -153,7 +147,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     info!("Subscription request sent in {}ms", subscribe_time.elapsed().as_millis());
     
     // Process messages
-    let subscription_start = Instant::now();
+    let _subscription_start = Instant::now();
     let mut tokens_detected = 0;
     
     info!("Listening for token creation events. Press Ctrl+C to stop.");
@@ -172,11 +166,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 // Log the message type for debugging
                 if let Some(method) = data.get("method").and_then(|m| m.as_str()) {
                     if method == "logsNotification" {
-                        // First message after subscription - record time
-                        if tokens_detected == 0 {
-                            info!("First notification received after {}ms", subscription_start.elapsed().as_millis());
-                        }
-                        
                         // Extract logs from the notification
                         if let Some(logs) = data.get("params")
                             .and_then(|p| p.get("result"))
@@ -203,13 +192,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                             match BASE64.decode(encoded_data) {
                                                 Ok(decoded_data) => {
                                                     if let Some(token_data) = parse_create_instruction(&decoded_data) {
-                                                        // Calculate detection latency
-                                                        let detection_latency = subscription_start.elapsed().as_millis();
-                                                        
                                                         tokens_detected += 1;
-                                                        
-                                                        // Print token data
-                                                        info!("🔔 NEW TOKEN DETECTED (#{}) after {}ms", tokens_detected, detection_latency);
+                                                        info!("NEW TOKEN DETECTED (#{})", tokens_detected);
                                                         info!("Signature: {}", signature);
                                                         info!("Name: {}", token_data.name);
                                                         info!("Symbol: {}", token_data.symbol);
@@ -217,8 +201,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                                         info!("Mint: {}", token_data.mint);
                                                         info!("Bonding Curve: {}", token_data.bonding_curve);
                                                         info!("User: {}", token_data.user);
-                                                        info!("Associated Bonding Curve: {}", token_data.associated_bonding_curve);
-                                                        info!("----------------------------------------------");
+                                                        break; // Break to avoid duplicate processing
                                                     }
                                                 },
                                                 Err(e) => {

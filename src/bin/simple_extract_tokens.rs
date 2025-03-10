@@ -1,4 +1,4 @@
-use base64::decode;
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use dotenv::dotenv;
 use futures_util::{SinkExt, StreamExt};
 use log::{debug, error, info, warn};
@@ -48,7 +48,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Sent subscription request for program: {}", PUMP_PROGRAM);
 
     // Process messages
-    let mut subscription_id: Option<u64> = None;
     let mut ping_interval = time::interval(Duration::from_secs(10));
 
     loop {
@@ -63,8 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if let Ok(json_msg) = serde_json::from_str::<Value>(text) {
                                 // Handle subscription confirmation
                                 if json_msg["id"] == 1 && json_msg.get("result").is_some() {
-                                    subscription_id = json_msg["result"].as_u64();
-                                    info!("Subscription confirmed with ID: {:?}", subscription_id);
+                                    info!("Subscription confirmed with ID: {:?}", json_msg["result"].as_u64());
                                 }
 
                                 // Handle log notifications
@@ -157,7 +155,7 @@ struct TokenData {
 
 fn parse_token_data(program_data: &str) -> Result<TokenData, Box<dyn std::error::Error>> {
     // Decode base64 data
-    let data = decode(program_data)?;
+    let data = BASE64.decode(program_data)?;
 
     // The format is specific to Pump.fun token creation data
     // This is a simplified parser - actual parsing might be more complex

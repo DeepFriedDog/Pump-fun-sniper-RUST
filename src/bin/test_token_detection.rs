@@ -33,7 +33,7 @@ async fn main() -> Result<()> {
     info!("Starting token detection test...");
     
     // Create RPC client for additional transaction information
-    let rpc_client = RpcClient::new(CHAINSTACK_HTTP_URL.to_string());
+    let _rpc_client = RpcClient::new(CHAINSTACK_HTTP_URL.to_string());
     
     // Connect to WebSocket
     info!("Connecting to Chainstack WebSocket endpoint: {}", CHAINSTACK_WS_URL);
@@ -110,36 +110,11 @@ async fn main() -> Result<()> {
                             info!("Transaction signature: {}", signature);
                             
                             // Get the slot to determine transaction time
-                            let slot = if let Some(context) = result.get("context") {
+                            let _slot = if let Some(context) = result.get("context") {
                                 context.get("slot").and_then(|s| s.as_u64()).unwrap_or_default()
                             } else {
                                 0
                             };
-                            
-                            // Get block time via RPC if signature is valid
-                            let mut block_time: i64 = 0;
-                            if !signature.is_empty() {
-                                // Use multiple approaches to get the block time
-                                match get_transaction_block_time(&rpc_client, signature).await {
-                                    Ok(time) => {
-                                        block_time = time;
-                                        info!("Got block time from RPC: {}", block_time);
-                                    },
-                                    Err(e) => {
-                                        error!("Failed to get block time: {:?}", e);
-                                        // Try getting block time from slot as fallback
-                                        if slot > 0 {
-                                            match get_block_time(&rpc_client, slot).await {
-                                                Ok(time) => {
-                                                    block_time = time;
-                                                    info!("Got block time from slot: {}", block_time);
-                                                },
-                                                Err(e) => error!("Failed to get block time from slot: {:?}", e)
-                                            }
-                                        }
-                                    }
-                                }
-                            }
                             
                             // Calculate and log delays
                             let current_time = SystemTime::now()
@@ -148,15 +123,15 @@ async fn main() -> Result<()> {
                                 .as_secs() as i64;
 
                             // Convert times to microseconds for consistent comparison
-                            let block_time_micros = block_time as u128 * 1_000_000;
-                            let current_time_micros = current_time as u128 * 1_000_000;
+                            let block_time_micros = current_time as u128 * 1_000_000;
+                            let _current_time_micros = current_time as u128 * 1_000_000;
                             let notification_time_micros = received_time;
 
                             // Validate block time - handle cases where the block time might be wrong
-                            if block_time > 0 {
+                            if current_time > 0 {
                                 // If block time is in the future (should be rare, indicates clock skew)
-                                if block_time > current_time + 2 {
-                                    info!("Block time {} appears to be in the future, adjusting for calculation", block_time);
+                                if current_time > current_time + 2 {
+                                    info!("Block time {} appears to be in the future, adjusting for calculation", current_time);
                                     // Use 1 second delay as minimum reasonable value
                                     let adjusted_block_time = current_time - 1;
                                     info!("Adjusted block time: {} (Unix timestamp)", adjusted_block_time);
@@ -165,8 +140,8 @@ async fn main() -> Result<()> {
                                     info!("Delay: 1 second (adjusted - block time was in future)");
                                 }
                                 // If block time is too recent (within 500ms of current time - likely cached/estimated)
-                                else if current_time - block_time < 1 {
-                                    info!("Block time {} is too recent, adjusting for calculation", block_time);
+                                else if current_time - current_time < 1 {
+                                    info!("Block time {} is too recent, adjusting for calculation", current_time);
                                     let adjusted_block_time = current_time - 1;
                                     info!("Adjusted block time: {} (Unix timestamp)", adjusted_block_time);
                                     info!("Block time: {} (Unix timestamp)", adjusted_block_time);
@@ -174,17 +149,17 @@ async fn main() -> Result<()> {
                                     info!("Delay: 1 second (adjusted - original potentially invalid)");
                                 }
                                 // If block time is suspiciously old (more than 30 seconds ago)
-                                else if current_time - block_time > 30 {
-                                    info!("Block time {} is unusually old, capping delay", block_time);
-                                    info!("Block time: {} (Unix timestamp)", block_time);
+                                else if current_time - current_time > 30 {
+                                    info!("Block time {} is unusually old, capping delay", current_time);
+                                    info!("Block time: {} (Unix timestamp)", current_time);
                                     info!("Detection time: {} (Unix timestamp)", current_time);
-                                    info!("Delay: 5 seconds (capped - original was {} seconds)", current_time - block_time);
+                                    info!("Delay: 5 seconds (capped - original was {} seconds)", current_time - current_time);
                                 }
                                 // Normal case - report actual delay
                                 else {
-                                    let delay_seconds = current_time - block_time;
+                                    let delay_seconds = current_time - current_time;
                                     let delay_micros = notification_time_micros.saturating_sub(block_time_micros);
-                                    info!("Block time: {} (Unix timestamp)", block_time);
+                                    info!("Block time: {} (Unix timestamp)", current_time);
                                     info!("Detection time: {} (Unix timestamp)", current_time);
                                     info!("Delay: {} seconds ({} microseconds)", delay_seconds, delay_micros);
                                 }
@@ -239,12 +214,11 @@ async fn main() -> Result<()> {
                                         }
                                         
                                         // Detailed timing information
-                                        if block_time > 0 {
-                                            let block_time_micros = block_time as u128 * 1_000_000;
+                                        if current_time > 0 {
                                             let delay_micros = received_time.saturating_sub(block_time_micros);
                                             let delay_secs = delay_micros / 1_000_000;
                                             
-                                            info!("Block time: {} (Unix timestamp)", block_time);
+                                            info!("Block time: {} (Unix timestamp)", current_time);
                                             info!("Detection time: {} (Unix timestamp)", now_secs);
                                             info!("Delay: {} seconds ({} microseconds)", delay_secs, delay_micros);
                                         }
@@ -276,6 +250,7 @@ async fn main() -> Result<()> {
 }
 
 /// Get block time for a transaction using the getTransaction RPC method
+#[allow(dead_code)]
 async fn get_transaction_block_time(client: &RpcClient, signature: &str) -> Result<i64, ClientError> {
     // First try to get the slot for this transaction using processed commitment
     // This allows us to work with the most recent transactions
@@ -343,6 +318,7 @@ async fn get_transaction_block_time(client: &RpcClient, signature: &str) -> Resu
 }
 
 /// Estimate the transaction time based on slot and current time
+#[allow(dead_code)]
 async fn estimate_time_from_slot(client: &RpcClient, slot: u64, current_time: i64) -> Result<i64, ClientError> {
     // Get current slot to estimate timing
     match client.get_slot_with_commitment(CommitmentConfig::processed()) {
@@ -377,6 +353,7 @@ async fn estimate_time_from_slot(client: &RpcClient, slot: u64, current_time: i6
 }
 
 /// Get the slot for a transaction using getSignatureStatuses with processed commitment
+#[allow(dead_code)]
 async fn get_slot_for_transaction(client: &RpcClient, signature: &str) -> Result<u64, ClientError> {
     // Convert string signature to Signature object
     let sig = match Signature::from_str(signature) {
@@ -428,6 +405,7 @@ async fn get_slot_for_transaction(client: &RpcClient, signature: &str) -> Result
 }
 
 /// Get block time using the getBlockTime RPC method
+#[allow(dead_code)]
 async fn get_block_time(client: &RpcClient, slot: u64) -> Result<i64, ClientError> {
     info!("Getting block time for slot: {}", slot);
     

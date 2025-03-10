@@ -7,7 +7,6 @@ mod checks;
 mod config;
 mod db;
 mod error;
-mod tests;
 mod token_detector;
 mod websocket_reconnect;
 mod websocket_test;
@@ -240,12 +239,6 @@ async fn process_new_tokens_from_websocket(
         // Use token_detector to check liquidity
         match token_detector::check_token_liquidity(mint, bonding_curve, min_liquidity).await {
             Ok((has_liquidity, balance)) => {
-                // Log the liquidity information first
-                info!(
-                    "Bonding curve liquidity: {:.2} SOL, Required: {:.2} SOL",
-                    balance, min_liquidity
-                );
-
                 // Compare the actual balance with the required minimum
                 if has_liquidity {
                     info!("✅ Liquidity check PASSED - Proceeding with buy");
@@ -876,17 +869,14 @@ async fn main() -> Result<()> {
     // Initialize the logger with custom formatting
     let mut builder = env_logger::Builder::new();
     
-    // In quiet mode, only show token creation logs and the initial header
+    // Quiet mode: filter out Debug logs; show Info and above
     if is_quiet_mode {
-        // Only allow specific log messages in quiet mode
         builder.format(|buf, record| {
-            let msg = format!("{}", record.args());
-            // Show token creation logs and the initial header
-            if msg.contains("NEW TOKEN CREATED") || msg.contains("Starting WebSocket monitor") {
+            if record.level() < log::Level::Info {
+                Ok(())
+            } else {
                 let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
                 writeln!(buf, "{} [{}] {}", timestamp, record.level(), record.args())
-            } else {
-                Ok(()) // Don't print other messages
             }
         });
     } else {
