@@ -106,14 +106,59 @@ pub fn get_authenticated_wss_url() -> String {
     ws_endpoint
 }
 
+/// Prepare a WebSocket URL for direct authentication
+/// 
+/// This modifies a WebSocket URL to include authentication credentials directly
+/// in the URL for providers that support this method. For example:
+/// wss://username:password@hostname/path
+pub fn get_auth_embedded_wss_url() -> String {
+    // Try to get the endpoint from environment variables
+    let ws_endpoint = env::var("CHAINSTACK_WSS_ENDPOINT").unwrap_or_else(|_| {
+        // Use the default endpoint from config as fallback
+        "wss://solana-mainnet.core.chainstack.com/b04d312222d7be6eefd6b31d84a303ab".to_string()
+    });
+    
+    // Check if we need to use authentication
+    let use_auth = env::var("USE_CHAINSTACK_AUTH")
+        .unwrap_or_else(|_| "false".to_string())
+        .to_lowercase() == "true";
+    
+    if use_auth {
+        // Get authentication credentials
+        let username = env::var("CHAINSTACK_USERNAME").unwrap_or_default();
+        let password = env::var("CHAINSTACK_PASSWORD").unwrap_or_default();
+        
+        if !username.is_empty() && !password.is_empty() {
+            // Try to parse the URL to add auth credentials directly
+            if let Ok(mut url) = url::Url::parse(&ws_endpoint) {
+                // Try to set credentials directly in the URL
+                if url.scheme() == "wss" || url.scheme() == "ws" {
+                    if let Err(_) = url.set_username(&username) {
+                        warn!("Failed to set username in WebSocket URL");
+                    }
+                    if let Err(_) = url.set_password(Some(&password)) {
+                        warn!("Failed to set password in WebSocket URL");
+                    }
+                    
+                    // Return the URL with embedded credentials
+                    return url.to_string();
+                }
+            }
+        }
+    }
+    
+    // If authentication isn't needed or fails, just return the original URL
+    ws_endpoint
+}
+
 /// Get a fresh WebSocket URL that forces a new session
 /// 
 /// This adds a unique session ID to the WebSocket URL to ensure
 /// that each startup of the application gets a brand new connection
 /// with no accumulated history or buffered events.
 pub fn get_fresh_wss_url() -> String {
-    // Get the base URL
-    let base_url = get_authenticated_wss_url();
+    // Get the base URL with authentication credentials embedded
+    let base_url = get_auth_embedded_wss_url();
     
     // Generate a unique session ID
     let session_id = Uuid::new_v4().to_string();

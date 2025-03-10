@@ -62,6 +62,8 @@ fn parse_websocket_message(message: &str) -> Result<Vec<TokenData>> {
                         bonding_curve: "".to_string(),
                         user: "".to_string(),
                         tx_signature: signature.to_string(),
+                        block_time: None,
+                        detection_time: None,
                     };
                     tokens.push(token);
                 }

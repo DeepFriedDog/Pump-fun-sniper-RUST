@@ -240,11 +240,13 @@ async fn process_new_tokens_from_websocket(
         // Use token_detector to check liquidity
         match token_detector::check_token_liquidity(mint, bonding_curve, min_liquidity).await {
             Ok((has_liquidity, balance)) => {
+                // Log the liquidity information first
                 info!(
-                    "Bonding curve liquidity: {} SOL, Required: {} SOL",
+                    "Bonding curve liquidity: {:.2} SOL, Required: {:.2} SOL",
                     balance, min_liquidity
                 );
 
+                // Compare the actual balance with the required minimum
                 if has_liquidity {
                     info!("✅ Liquidity check PASSED - Proceeding with buy");
 
@@ -294,7 +296,15 @@ async fn process_new_tokens_from_websocket(
                         );
                     }
                 } else {
-                    info!("❌ Liquidity check FAILED - Skipping buy");
+                    // Only log this message if the token actually fails the liquidity check
+                    if balance < min_liquidity {
+                        info!("❌ Liquidity check FAILED ({:.2} SOL < {:.2} SOL) - Skipping buy", 
+                              balance, min_liquidity);
+                    } else {
+                        // This shouldn't happen but log it in case there's another condition
+                        warn!("⚠️ Liquidity check returned false but balance ({:.2} SOL) >= minimum ({:.2} SOL). Check logic.", 
+                              balance, min_liquidity);
+                    }
                 }
             }
             Err(e) => {
@@ -964,5 +974,94 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Check node sync status
+    let node_endpoint = std::env::var("NODE_ENDPOINT").unwrap_or_else(|_| chainstack_simple::get_chainstack_endpoint());
+    if !check_node_sync_status(&node_endpoint).await? {
+        println!("Warning: Node not fully synced, results may be delayed");
+    }
+
+    Ok(())
+}
+
+/// Adds delays between WebSocket subscription batches to prevent overwhelming the node
+/// This is especially useful when subscribing to many events at once
+async fn batch_subscriptions_with_backpressure<T: Clone>(
+    ws_client: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    subscription_batches: Vec<Vec<T>>,
+    create_subscription_message: impl Fn(&[T]) -> String,
+) -> Result<()> {
+    for batch in subscription_batches {
+        let msg = create_subscription_message(&batch);
+        ws_client.send(tokio_tungstenite::tungstenite::Message::Text(msg)).await?;
+        // Add delay between batches to prevent overwhelming the node
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Ok(())
+}
+
+/// Checks if the blockchain node is fully synced
+async fn check_node_sync_status(node_endpoint: &str) -> Result<bool> {
+    let client = reqwest::Client::new();
+    let response = client.post(node_endpoint)
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_syncing",
+            "params": []
+        }))
+        .send()
+        .await
+        .context("Failed to send sync status request")?
+        .json::<serde_json::Value>()
+        .await
+        .context("Failed to parse sync response")?;
+    
+    if response["result"] == serde_json::json!(false) {
+        info!("Node is fully synced");
+        Ok(true)
+    } else {
+        warn!("Node is still syncing: {:?}", response["result"]);
+        Ok(false)
+    }
+}
+
+/// Warms up the WebSocket connection by waiting for a few blocks
+/// This helps ensure the connection is stable before starting critical operations
+async fn warmup_connection(
+    ws_stream: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>
+) -> Result<()> {
+    info!("Warming up connection...");
+    
+    // Subscribe to new heads (blocks) to verify connection is working
+    let test_sub = tokio_tungstenite::tungstenite::Message::Text(
+        r#"{"jsonrpc":"2.0","id":1,"method":"eth_subscribe","params":["newHeads"]}"#.to_string()
+    );
+    ws_stream.send(test_sub).await.context("Failed to send test subscription")?;
+    
+    // Wait for a few blocks to ensure connection is stable
+    let mut blocks_received = 0;
+    while blocks_received < 3 {
+        match tokio::time::timeout(Duration::from_secs(30), ws_stream.next()).await {
+            Ok(Some(Ok(msg))) => {
+                if let tokio_tungstenite::tungstenite::Message::Text(text) = msg {
+                    if text.contains("newHeads") {
+                        blocks_received += 1;
+                        info!("Received block {}/3 during warmup", blocks_received);
+                    }
+                }
+            },
+            Ok(Some(Err(e))) => {
+                return Err(anyhow::anyhow!("WebSocket error during warmup: {}", e));
+            },
+            Ok(None) => {
+                return Err(anyhow::anyhow!("WebSocket closed during warmup"));
+            },
+            Err(_) => {
+                return Err(anyhow::anyhow!("Timeout waiting for blocks during warmup"));
+            }
+        }
+    }
+    
+    info!("Connection warmed up successfully");
     Ok(())
 }

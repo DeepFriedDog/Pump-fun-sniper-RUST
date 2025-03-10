@@ -1700,8 +1700,9 @@ async fn optimize_transaction(
         } else {
             debug!("Fetching fresh blockhash");
             // Create a temporary RPC client to get the blockhash
-            let rpc_client = solana_client::rpc_client::RpcClient::new(
+            let rpc_client = solana_client::rpc_client::RpcClient::new_with_commitment(
                 chainstack_simple::get_chainstack_endpoint(),
+                CommitmentConfig::processed()
             );
             let fresh_blockhash = rpc_client.get_latest_blockhash()?;
 
@@ -1895,8 +1896,10 @@ async fn create_buy_instructions(
 // Helper function to get recent blockhash from RPC
 async fn get_recent_blockhash(client: &Client) -> Result<Hash, anyhow::Error> {
     // Create an RPC client using the chainstack endpoint
-    let rpc_url = chainstack_simple::get_chainstack_endpoint();
-    let rpc_client = RpcClient::new(rpc_url);
+    let rpc_client = solana_client::rpc_client::RpcClient::new_with_commitment(
+        chainstack_simple::get_chainstack_endpoint(),
+        CommitmentConfig::processed()
+    );
 
     // Get the recent blockhash
     let blockhash = rpc_client.get_latest_blockhash()?;

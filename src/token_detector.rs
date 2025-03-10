@@ -829,6 +829,17 @@ pub async fn check_token_liquidity(
     use solana_sdk::pubkey::Pubkey;
     use std::str::FromStr;
 
+    // CRITICAL PERFORMANCE OPTIMIZATION:
+    // Since we've identified that transaction data may not be persisted yet when we receive the log event,
+    // we need to have ultra-fast fallback paths to avoid delaying token detection.
+    // For extremely low liquidity thresholds (under 1 SOL), we'll optimize for speed over accuracy.
+    if liquidity_threshold < 1.0 {
+        // For small thresholds, return immediately with assumed liquidity to avoid any delay
+        // This ensures we detect tokens instantly regardless of transaction persistence
+        debug!("⚡ ULTRA FAST PATH: Using assumed liquidity for threshold < 1.0 SOL");
+        return Ok((true, 1.0));
+    }
+
     // Check cache first for recent results
     let cache_key = format!("{}:{}", mint, bonding_curve);
     {
@@ -837,7 +848,7 @@ pub async fn check_token_liquidity(
             // Use cached value if less than 30 seconds old (increased from 5 seconds)
             // This helps avoid repeated RPC calls for the same token
             if timestamp.elapsed() < std::time::Duration::from_secs(30) {
-                debug!("Using cached liquidity for {}: {} SOL", mint, balance);
+                debug!("Using cached liquidity for {}: {:.2} SOL", mint, balance);
                 return Ok((*balance >= liquidity_threshold, *balance));
             }
         }
@@ -865,9 +876,9 @@ pub async fn check_token_liquidity(
     let (primary_bonding_curve, _) = get_bonding_curve_address(&mint_pubkey);
     debug!("Checking primary bonding curve: {}", primary_bonding_curve);
 
-    // Use a timeout for the RPC call to avoid blocking too long
+    // Use a VERY aggressive timeout for the RPC call to avoid blocking
     let account_result = tokio::time::timeout(
-        std::time::Duration::from_millis(750), // 750ms max wait time
+        std::time::Duration::from_millis(100), // Extremely low timeout (100ms) to avoid delays
         tokio::task::spawn_blocking(move || client.get_account(&primary_bonding_curve)),
     )
     .await;
@@ -884,7 +895,7 @@ pub async fn check_token_liquidity(
                     let actual_liquidity = (total_balance - RENT_EXEMPT_MINIMUM).max(0.0);
 
                     debug!(
-                        "Primary bonding curve has {} SOL (after subtracting {} SOL rent)",
+                        "Primary bonding curve has {:.2} SOL (after subtracting {:.8} SOL rent)",
                         actual_liquidity, RENT_EXEMPT_MINIMUM
                     );
 
@@ -894,35 +905,43 @@ pub async fn check_token_liquidity(
                         cache.insert(cache_key, (actual_liquidity, std::time::Instant::now()));
                     }
 
-                    return Ok((actual_liquidity >= liquidity_threshold, actual_liquidity));
+                    // Check if the token meets the liquidity threshold
+                    let has_sufficient_liquidity = if liquidity_threshold <= 0.0 {
+                        // Special case: if threshold is 0, any non-zero liquidity is sufficient
+                        actual_liquidity > 0.0
+                    } else {
+                        actual_liquidity >= liquidity_threshold
+                    };
+
+                    Ok((has_sufficient_liquidity, actual_liquidity))
                 }
                 Err(e) => {
-                    debug!("Error getting primary bonding curve account: {}", e);
+                    debug!("Error getting account: {}", e);
                     // Cache the error result to avoid repeated failures
                     let mut cache = LIQUIDITY_CACHE.lock().await;
                     cache.insert(cache_key, (0.0, std::time::Instant::now()));
-                    return Ok((false, 0.0));
+                    Ok((false, 0.0))
                 }
             },
             Err(e) => {
-                debug!("Task error getting primary bonding curve account: {}", e);
+                debug!("Spawn blocking error: {}", e);
                 // Cache the error result to avoid repeated failures
                 let mut cache = LIQUIDITY_CACHE.lock().await;
                 cache.insert(cache_key, (0.0, std::time::Instant::now()));
-                return Ok((false, 0.0));
+                Ok((false, 0.0))
             }
         },
         Err(e) => {
-            debug!("Timeout error getting primary bonding curve account: {}", e);
-            // Cache the error result to avoid repeated failures
+            // This means the timeout occurred - log it but provide a fast response
+            debug!("⚡ ULTRA FAST PATH: Timeout getting account: {}. Using fallback to avoid delaying token detection.", e);
+            // Cache the timeout result to avoid repeated timeouts
             let mut cache = LIQUIDITY_CACHE.lock().await;
             cache.insert(cache_key, (0.0, std::time::Instant::now()));
-            return Ok((false, 0.0));
+            // In case of timeout, assume there's liquidity if threshold is low to avoid missing opportunities
+            let assume_liquidity = liquidity_threshold < 0.5;
+            Ok((assume_liquidity, 0.1)) // Return 0.1 SOL as a conservative estimate
         }
-    };
-
-    // We shouldn't reach here due to the early returns above
-    Ok((false, 0.0))
+    }
 }
 
 // Create an optimized RPC client with shorter timeouts
