@@ -216,6 +216,17 @@ pub async fn listen_for_new_tokens(wss_endpoint: String) -> Result<()> {
     let backoff_factor = 1.5;
 
     loop {
+        // Check if we should stop listening due to a position being taken
+        if std::env::var("_STOP_WEBSOCKET_LISTENER").map(|v| v == "true").unwrap_or(false) {
+            info!("🛑 Detected _STOP_WEBSOCKET_LISTENER flag. Stopping token detection until position is closed.");
+            // Wait for the flag to be cleared
+            while std::env::var("_STOP_WEBSOCKET_LISTENER").map(|v| v == "true").unwrap_or(false) {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                info!("Waiting for current position to close before resuming token detection...");
+            }
+            info!("Token detection lock released. Resuming detection.");
+        }
+
         match connect_to_websocket(&wss_endpoint).await {
             Ok(_) => {
                 // Connection closed normally, reset backoff
@@ -372,9 +383,11 @@ async fn connect_to_websocket(wss_endpoint: &str) -> Result<()> {
     info!("✅ WebSocket setup complete, monitoring for new tokens...");
 
     // Set up ping timer to keep connection alive
-    let mut ping_interval = tokio::time::interval(Duration::from_secs(10));
+    let mut ping_interval = tokio::time::interval(Duration::from_secs(5)); // Ping more frequently (5s instead of 10s)
     let mut last_ping_time = Instant::now();
     let mut last_pong_time = Instant::now();
+    let pong_timeout = Duration::from_secs(10); // Lower timeout for pongs
+    let mut subscribed_bonding_curves = HashMap::new();
 
     // Process incoming messages
     loop {
@@ -392,13 +405,20 @@ async fn connect_to_websocket(wss_endpoint: &str) -> Result<()> {
                     return Err(anyhow!("Ping failed"));
                 }
 
+                // Also send a raw ping frame, which should always receive a pong frame response
+                if let Err(e) = write.send(Message::Ping(vec![1, 2, 3, 4])).await {
+                    error!("Failed to send ping frame: {}", e);
+                }
+
                 debug!("Ping sent to WebSocket server");
                 last_ping_time = Instant::now();
 
-                // Check if we've received pongs recently (within ~20 seconds)
+                // Check if we've received pongs recently
                 let pong_delay = last_ping_time.duration_since(last_pong_time);
-                if pong_delay > Duration::from_secs(20) {
-                    warn!("No pong response received in {} seconds, connection may be stale", pong_delay.as_secs());
+                if pong_delay > pong_timeout {
+                    warn!("No pong response received in {} seconds, reconnecting...", pong_delay.as_secs());
+                    // Force reconnection by returning from this function
+                    return Ok(());
                 }
             }
 
@@ -406,9 +426,9 @@ async fn connect_to_websocket(wss_endpoint: &str) -> Result<()> {
             next_message = read.next() => {
                 match next_message {
                     Some(Ok(Message::Text(text))) => {
-                        debug!("Received WebSocket message");
+                        debug!("Received WebSocket text message");
                         // Process the message
-                        if let Err(e) = process_message(&text, WEBSOCKET_MESSAGES.clone()).await {
+                        if let Err(e) = process_message(&text, WEBSOCKET_MESSAGES.clone(), &mut write, &mut subscribed_bonding_curves).await {
                             warn!("Error processing message: {}", e);
                         }
                     }
@@ -419,6 +439,7 @@ async fn connect_to_websocket(wss_endpoint: &str) -> Result<()> {
                             return Err(anyhow!("Pong failed"));
                         }
                         debug!("Responded to server ping with pong");
+                        last_pong_time = Instant::now();
                     }
                     Some(Ok(Message::Pong(_))) => {
                         debug!("Received pong from server");
@@ -446,6 +467,8 @@ async fn connect_to_websocket(wss_endpoint: &str) -> Result<()> {
 async fn process_message(
     text: &str,
     queue: Arc<Mutex<VecDeque<String>>>,
+    write: &mut futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, tokio_tungstenite::tungstenite::protocol::Message>,
+    subscribed_bonding_curves: &mut HashMap<String, Instant>
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Parse the message as JSON
     let data: Value = serde_json::from_str(text)?;
@@ -498,8 +521,7 @@ async fn process_message(
                                         );
 
                                         // Parse the instruction
-                                        if let Some(token_data) =
-                                            parse_create_instruction(&decoded_data)
+                                        if let Some(token_data) = parse_create_instruction(&decoded_data)
                                         {
                                             // Filter out invalid tokens
                                             if !token_data.mint.ends_with("pump")
@@ -522,6 +544,73 @@ async fn process_message(
                                             let is_quiet_mode = std::env::args().any(|arg| arg == "--quiet");
                                             if !is_quiet_mode {
                                                 info!("🪙 NEW TOKEN DETECTED! {} (mint: {}) 💰 Checking liquidity...", token_data_clone.name, token_data_clone.mint);
+                                            }
+
+                                            // IMMEDIATELY check liquidity with RPC to display the format the user wants
+                                            if let (Ok(mint), Ok(bonding_curve)) = (
+                                                Pubkey::from_str(&mint_str),
+                                                Pubkey::from_str(&bonding_curve_str),
+                                            ) {
+                                                // Get min liquidity threshold
+                                                let min_liquidity = std::env::var("MIN_LIQUIDITY")
+                                                    .unwrap_or_else(|_| "5.0".to_string())
+                                                    .parse::<f64>()
+                                                    .unwrap_or(5.0);
+                                                
+                                                // Check liquidity via direct RPC call for immediate feedback
+                                                match solana_client::rpc_client::RpcClient::new_with_timeout_and_commitment(
+                                                    std::env::var("CHAINSTACK_ENDPOINT").unwrap_or_else(|_| {
+                                                        "https://solana-mainnet.core.chainstack.com/b04d312222d7be6eefd6b31d84a303ab".to_string()
+                                                    }),
+                                                    std::time::Duration::from_millis(500),
+                                                    solana_sdk::commitment_config::CommitmentConfig::processed(),
+                                                ).get_account(&bonding_curve) {
+                                                    Ok(account) => {
+                                                        // Calculate actual liquidity after subtracting rent
+                                                        const RENT_EXEMPT_MINIMUM: f64 = 0.00203928;
+                                                        let total_balance = account.lamports as f64 / 1_000_000_000.0;
+                                                        let actual_liquidity = (total_balance - RENT_EXEMPT_MINIMUM).max(0.0);
+                                                        
+                                                        // Update cache
+                                                        let cache_key = format!("bonding_curve:{}:{}", bonding_curve_str, mint_str);
+                                                        let primary_key = format!("primary:{}", mint_str);
+                                                        {
+                                                            let mut cache = LIQUIDITY_CACHE.lock().await;
+                                                            cache.insert(cache_key, (actual_liquidity, Instant::now()));
+                                                            cache.insert(primary_key, (actual_liquidity, Instant::now()));
+                                                        }
+                                                        
+                                                        // Display in the requested format
+                                                        let has_liquidity = actual_liquidity >= min_liquidity;
+                                                        let check_mark = if has_liquidity { "✅" } else { "❌" };
+                                                        
+                                                        // Log in the exact format requested
+                                                        info!("🔔 PROCESSED LEVEL - DETECTED NEW TOKEN: {} ({}) {:.2} SOL {}", 
+                                                              token_data_clone.name, mint_str, actual_liquidity, check_mark);
+                                                        
+                                                        // Add the follow-up message about liquidity check
+                                                        if has_liquidity {
+                                                            info!("✅ Liquidity check PASSED - Proceeding with buy");
+                                                        } else {
+                                                            info!("❌ Liquidity check FAILED ({:.2} SOL < {:.2} SOL) - Skipping buy", 
+                                                                  actual_liquidity, min_liquidity);
+                                                        }
+
+                                                        // Also subscribe to the bonding curve for real-time updates
+                                                        let associated_curve = find_associated_bonding_curve(&mint, &bonding_curve);
+                                                        info!("Associated Bonding Curve: {}", associated_curve);
+                                                        
+                                                        // Subscribe to the bonding curve to get real-time liquidity updates
+                                                        subscribe_to_bonding_curve(write, &mint_str, &bonding_curve_str, subscribed_bonding_curves).await?;
+                                                    },
+                                                    Err(_) => {
+                                                        // If RPC call fails, still log but with zero liquidity
+                                                        info!("🔔 PROCESSED LEVEL - DETECTED NEW TOKEN: {} ({}) 0.00 SOL ❌", 
+                                                              token_data_clone.name, mint_str);
+                                                        info!("❌ Liquidity check FAILED (0.00 SOL < {:.2} SOL) - Skipping buy", 
+                                                              min_liquidity);
+                                                    }
+                                                }
                                             }
 
                                             // Convert to NewToken and add to the queue IMMEDIATELY
@@ -554,71 +643,6 @@ async fn process_message(
                                                 crate::api::NEW_TOKEN_QUEUE.lock().unwrap();
                                             api_queue.push_back(token_data);
                                             info!("Added token to API queue. Current API queue size: {}", api_queue.len());
-
-                                            // Calculate associated bonding curve
-                                            if let (Ok(mint), Ok(bonding_curve)) = (
-                                                Pubkey::from_str(&mint_str),
-                                                Pubkey::from_str(&bonding_curve_str),
-                                            ) {
-                                                let associated_curve =
-                                                    find_associated_bonding_curve(
-                                                        &mint,
-                                                        &bonding_curve,
-                                                    );
-                                                info!(
-                                                    "Associated Bonding Curve: {}",
-                                                    associated_curve
-                                                );
-                                            }
-
-                                            // Process the token in chainstack module
-                                            if let Some(token) =
-                                                chainstack_simple::process_notification(text)
-                                            {
-                                                info!(
-                                                    "Token processed by chainstack: {} ({})",
-                                                    token.token_name, token.mint_address
-                                                );
-                                            }
-
-                                            // Spawn a task to check liquidity asynchronously as a SEPARATE step
-                                            tokio::spawn(async move {
-                                                // Add check for quiet mode flag
-                                                let is_quiet_mode = std::env::args().any(|arg| arg == "--quiet");
-
-                                                // Get MIN_LIQUIDITY from environment variable
-                                                let min_liquidity_str =
-                                                    std::env::var("MIN_LIQUIDITY")
-                                                        .unwrap_or_else(|_| "4.0".to_string());
-                                                let min_liquidity =
-                                                    min_liquidity_str.parse::<f64>().unwrap_or(4.0);
-
-                                                // Check actual liquidity
-                                                match check_token_liquidity(
-                                                    &token_data_clone.mint,
-                                                    &token_data_clone.bonding_curve,
-                                                    min_liquidity,
-                                                )
-                                                .await
-                                                {
-                                                    Ok((has_liquidity, sol_amount)) => {
-                                                        let check_mark = if has_liquidity { "✅" } else { "❌" };
-                                                        if is_quiet_mode {
-                                                            info!("DETECTED NEW TOKEN: {} ({}) {:.2} SOL {}", token_data_clone.name, token_data_clone.mint, sol_amount, check_mark);
-                                                        } else {
-                                                            info!("💰 LIQUIDITY UPDATE: {} (mint: {}) {:.2} SOL {}", token_data_clone.name, token_data_clone.mint, sol_amount, check_mark);
-                                                        }
-                                                    },
-                                                    Err(e) => {
-                                                        debug!("Error checking liquidity: {}", e);
-                                                        if is_quiet_mode {
-                                                            info!("DETECTED NEW TOKEN: {} ({}) 0.00 SOL ❌", token_data_clone.name, token_data_clone.mint);
-                                                        } else {
-                                                            info!("💰 LIQUIDITY UPDATE: {} (mint: {}) 0.00 SOL ❌", token_data_clone.name, token_data_clone.mint);
-                                                        }
-                                                    }
-                                                }
-                                            });
                                         }
                                     }
                                     Err(e) => {
@@ -655,15 +679,84 @@ async fn process_message(
                                                         info!("🪙 NEW TOKEN DETECTED! {} (mint: {}) 💰 Checking liquidity...", token_data_clone.name, token_data_clone.mint);
                                                     }
 
+                                                    // IMMEDIATELY check liquidity with RPC to display the format the user wants
+                                                    if let (Ok(mint), Ok(bonding_curve)) = (
+                                                        Pubkey::from_str(&mint_str),
+                                                        Pubkey::from_str(&bonding_curve_str),
+                                                    ) {
+                                                        // Get min liquidity threshold
+                                                        let min_liquidity = std::env::var("MIN_LIQUIDITY")
+                                                            .unwrap_or_else(|_| "5.0".to_string())
+                                                            .parse::<f64>()
+                                                            .unwrap_or(5.0);
+                                                        
+                                                        // Check liquidity via direct RPC call for immediate feedback
+                                                        match solana_client::rpc_client::RpcClient::new_with_timeout_and_commitment(
+                                                            std::env::var("CHAINSTACK_ENDPOINT").unwrap_or_else(|_| {
+                                                                "https://solana-mainnet.core.chainstack.com/b04d312222d7be6eefd6b31d84a303ab".to_string()
+                                                            }),
+                                                            std::time::Duration::from_millis(500),
+                                                            solana_sdk::commitment_config::CommitmentConfig::processed(),
+                                                        ).get_account(&bonding_curve) {
+                                                            Ok(account) => {
+                                                                // Calculate actual liquidity after subtracting rent
+                                                                const RENT_EXEMPT_MINIMUM: f64 = 0.00203928;
+                                                                let total_balance = account.lamports as f64 / 1_000_000_000.0;
+                                                                let actual_liquidity = (total_balance - RENT_EXEMPT_MINIMUM).max(0.0);
+                                                                
+                                                                // Update cache
+                                                                let cache_key = format!("bonding_curve:{}:{}", bonding_curve_str, mint_str);
+                                                                let primary_key = format!("primary:{}", mint_str);
+                                                                {
+                                                                    let mut cache = LIQUIDITY_CACHE.lock().await;
+                                                                    cache.insert(cache_key, (actual_liquidity, Instant::now()));
+                                                                    cache.insert(primary_key, (actual_liquidity, Instant::now()));
+                                                                }
+                                                                
+                                                                // Display in the requested format
+                                                                let has_liquidity = actual_liquidity >= min_liquidity;
+                                                                let check_mark = if has_liquidity { "✅" } else { "❌" };
+                                                                
+                                                                // Log in the exact format requested
+                                                                info!("🔔 PROCESSED LEVEL - DETECTED NEW TOKEN: {} ({}) {:.2} SOL {}", 
+                                                                      token_data_clone.name, mint_str, actual_liquidity, check_mark);
+                                                                
+                                                                // Add the follow-up message about liquidity check
+                                                                if has_liquidity {
+                                                                    info!("✅ Liquidity check PASSED - Proceeding with buy");
+                                                                } else {
+                                                                    info!("❌ Liquidity check FAILED ({:.2} SOL < {:.2} SOL) - Skipping buy", 
+                                                                          actual_liquidity, min_liquidity);
+                                                                }
+
+                                                                // Also subscribe to the bonding curve for real-time updates
+                                                                let associated_curve = find_associated_bonding_curve(&mint, &bonding_curve);
+                                                                info!("Associated Bonding Curve: {}", associated_curve);
+                                                                
+                                                                // Subscribe to the bonding curve to get real-time liquidity updates
+                                                                subscribe_to_bonding_curve(write, &mint_str, &bonding_curve_str, subscribed_bonding_curves).await?;
+                                                            },
+                                                            Err(_) => {
+                                                                // If RPC call fails, still log but with zero liquidity
+                                                                info!("🔔 PROCESSED LEVEL - DETECTED NEW TOKEN: {} ({}) 0.00 SOL ❌", 
+                                                                      token_data_clone.name, mint_str);
+                                                                info!("❌ Liquidity check FAILED (0.00 SOL < {:.2} SOL) - Skipping buy", 
+                                                                      min_liquidity);
+                                                            }
+                                                        }
+                                                    }
+
                                                     // Convert to NewToken and add to the queue IMMEDIATELY
                                                     let mut new_token: NewToken = token_data.into();
-                                                    new_token.transaction_signature =
-                                                        signature.to_string();
+                                                    new_token.transaction_signature = signature.to_string();
 
                                                     // Add message to global queue for processing IMMEDIATELY
                                                     let mut queue_guard = queue.lock().await;
                                                     queue_guard.push_back(text.to_string());
-                                                    info!("Added token to queue. Current queue size: {}", queue_guard.len());
+                                                    info!(
+                                                        "Added token to queue. Current queue size: {}",
+                                                        queue_guard.len()
+                                                    );
 
                                                     // IMPORTANT: Also add to the API queue that is checked by fetch_new_tokens
                                                     let token_data = crate::api::TokenData {
@@ -675,86 +768,14 @@ async fn process_message(
                                                             bonding_curve_str
                                                         )),
                                                         name: Some(new_token.token_name.clone()),
-                                                        symbol: Some(
-                                                            new_token.token_symbol.clone(),
-                                                        ),
-                                                        timestamp: Some(
-                                                            chrono::Utc::now().timestamp(),
-                                                        ),
+                                                        symbol: Some(new_token.token_symbol.clone()),
+                                                        timestamp: Some(chrono::Utc::now().timestamp()),
                                                     };
 
                                                     let mut api_queue =
                                                         crate::api::NEW_TOKEN_QUEUE.lock().unwrap();
                                                     api_queue.push_back(token_data);
                                                     info!("Added token to API queue. Current API queue size: {}", api_queue.len());
-
-                                                    // Calculate associated bonding curve
-                                                    if let (Ok(mint), Ok(bonding_curve)) = (
-                                                        Pubkey::from_str(&mint_str),
-                                                        Pubkey::from_str(&bonding_curve_str),
-                                                    ) {
-                                                        let associated_curve =
-                                                            find_associated_bonding_curve(
-                                                                &mint,
-                                                                &bonding_curve,
-                                                            );
-                                                        info!(
-                                                            "Associated Bonding Curve: {}",
-                                                            associated_curve
-                                                        );
-                                                    }
-
-                                                    // Process the token in chainstack module
-                                                    if let Some(token) =
-                                                        chainstack_simple::process_notification(
-                                                            text,
-                                                        )
-                                                    {
-                                                        info!("Token processed by chainstack: {} ({})",
-                                                            token.token_name, token.mint_address);
-                                                    }
-
-                                                    // Spawn a task to check liquidity asynchronously as a SEPARATE step
-                                                    tokio::spawn(async move {
-                                                        // Add check for quiet mode flag
-                                                        let is_quiet_mode = std::env::args().any(|arg| arg == "--quiet");
-
-                                                        // Get MIN_LIQUIDITY from environment variable
-                                                        let min_liquidity_str =
-                                                            std::env::var("MIN_LIQUIDITY")
-                                                                .unwrap_or_else(|_| {
-                                                                    "4.0".to_string()
-                                                                });
-                                                        let min_liquidity = min_liquidity_str
-                                                            .parse::<f64>()
-                                                            .unwrap_or(4.0);
-
-                                                        // Check actual liquidity
-                                                        match check_token_liquidity(
-                                                            &token_data_clone.mint,
-                                                            &token_data_clone.bonding_curve,
-                                                            min_liquidity,
-                                                        )
-                                                        .await
-                                                        {
-                                                            Ok((has_liquidity, sol_amount)) => {
-                                                                let check_mark = if has_liquidity { "✅" } else { "❌" };
-                                                                if is_quiet_mode {
-                                                                    info!("DETECTED NEW TOKEN: {} ({}) {:.2} SOL {}", token_data_clone.name, token_data_clone.mint, sol_amount, check_mark);
-                                                                } else {
-                                                                    info!("💰 LIQUIDITY UPDATE: {} (mint: {}) {:.2} SOL {}", token_data_clone.name, token_data_clone.mint, sol_amount, check_mark);
-                                                                }
-                                                            },
-                                                            Err(e) => {
-                                                                debug!("Error checking liquidity: {}", e);
-                                                                if is_quiet_mode {
-                                                                    info!("DETECTED NEW TOKEN: {} ({}) 0.00 SOL ❌", token_data_clone.name, token_data_clone.mint);
-                                                                } else {
-                                                                    info!("💰 LIQUIDITY UPDATE: {} (mint: {}) 0.00 SOL ❌", token_data_clone.name, token_data_clone.mint);
-                                                                }
-                                                            }
-                                                        }
-                                                    });
                                                 }
                                             }
                                             Err(_) => {
@@ -769,8 +790,160 @@ async fn process_message(
                 }
             }
         }
+    } 
+    // Check if this is an account notification (for liquidity updates)
+    else if let Some("accountNotification") = data.get("method").and_then(Value::as_str) {
+        if let Some(account_info) = data
+            .get("params")
+            .and_then(|p| p.get("result"))
+            .and_then(|r| r.get("value"))
+        {
+            let is_quiet_mode = std::env::args().any(|arg| arg == "--quiet");
+            
+            // Extract account data and lamports (SOL balance)
+            let lamports = account_info.get("lamports").and_then(Value::as_u64).unwrap_or(0);
+            let sol_balance = lamports as f64 / 1_000_000_000.0; // Convert lamports to SOL
+            
+            // The rent exempt minimum amount in SOL
+            const RENT_EXEMPT_MINIMUM: f64 = 0.00203928;
+            let actual_liquidity = (sol_balance - RENT_EXEMPT_MINIMUM).max(0.0);
+            
+            // Get the bonding curve address which is included in the subscription ID
+            if let Some(subscription) = data
+                .get("params")
+                .and_then(|p| p.get("subscription"))
+                .and_then(Value::as_str)
+            {
+                // The subscription ID format is "bonding_curve_{address}"
+                if subscription.starts_with("bonding_curve_") {
+                    let parts: Vec<&str> = subscription.split('_').collect();
+                    if parts.len() >= 3 {
+                        let bonding_curve = parts[2];
+                        
+                        // Find the token info from our tracker
+                        let min_liquidity = std::env::var("MIN_LIQUIDITY")
+                                .unwrap_or_else(|_| "5.0".to_string())
+                                .parse::<f64>()
+                                .unwrap_or(5.0);
+                        
+                        let has_liquidity = actual_liquidity >= min_liquidity;
+                        let check_mark = if has_liquidity { "✅" } else { "❌" };
+                        
+                        // First collect mint address and token name
+                        let mut mint_to_update = None;
+                        let mut token_name = String::from("Unknown");
+                        
+                        // Look up matching mint in the cache
+                        {
+                            let cache = LIQUIDITY_CACHE.lock().await;
+                            // Find associated mint by looking at the bonding curve
+                            for (cache_key, _) in cache.iter() {
+                                if cache_key.contains(bonding_curve) {
+                                    if let Some(mint) = cache_key.split(':').last() {
+                                        mint_to_update = Some(mint.to_string());
+                                        // Get token name if possible
+                                        if let Some(name) = get_token_name_for_mint(mint) {
+                                            token_name = name;
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        
+                        // Now update the cache if we found a mint
+                        if let Some(mint) = mint_to_update {
+                            // Log the updated liquidity in the exact format requested
+                            info!("🔔 PROCESSED LEVEL - DETECTED NEW TOKEN: {} ({}) {:.2} SOL {}", 
+                                  token_name, mint, actual_liquidity, check_mark);
+                            
+                            // Add the follow-up message about liquidity check
+                            if has_liquidity {
+                                info!("✅ Liquidity check PASSED - Proceeding with buy");
+                            } else {
+                                info!("❌ Liquidity check FAILED ({:.2} SOL < {:.2} SOL) - Skipping buy", 
+                                    actual_liquidity, min_liquidity);
+                            }
+                            
+                            // Update the cache with the new amount in a separate lock scope
+                            let cache_key = format!("bonding_curve:{}:{}", bonding_curve, mint);
+                            let mut cache = LIQUIDITY_CACHE.lock().await;
+                            cache.insert(cache_key, (actual_liquidity, Instant::now()));
+                            
+                            // Also update primary liquidity cache to make it available for other functions
+                            let primary_cache_key = format!("primary:{}", mint);
+                            cache.insert(primary_cache_key, (actual_liquidity, Instant::now()));
+                        }
+                    }
+                }
+            }
+        }
     }
 
+    Ok(())
+}
+
+// Helper function to get token name from mint address
+fn get_token_name_for_mint(mint: &str) -> Option<String> {
+    // Try to find the token name from recently detected tokens
+    let api_queue = crate::api::NEW_TOKEN_QUEUE.lock().unwrap();
+    for token_data in api_queue.iter() {
+        if token_data.mint == mint {
+            return token_data.name.clone();
+        }
+    }
+    None
+}
+
+// Subscribe to bonding curve account changes to track liquidity in real-time
+async fn subscribe_to_bonding_curve(
+    write: &mut futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, tokio_tungstenite::tungstenite::protocol::Message>,
+    mint: &str, 
+    bonding_curve: &str,
+    subscribed_curves: &mut HashMap<String, Instant>
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Check if we already subscribed to this bonding curve
+    if subscribed_curves.contains_key(bonding_curve) {
+        debug!("Already subscribed to bonding curve: {}", bonding_curve);
+        return Ok(());
+    }
+    
+    // Create a subscription message for the bonding curve account
+    let subscription_id = format!("bonding_curve_{}", bonding_curve);
+    let subscription_message = json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "accountSubscribe",
+        "params": [
+            bonding_curve,
+            {
+                "encoding": "jsonParsed",
+                "commitment": "processed"
+            }
+        ]
+    });
+    
+    // Send the subscription request
+    if let Err(e) = write.send(Message::Text(subscription_message.to_string())).await {
+        warn!("Failed to subscribe to bonding curve {}: {}", bonding_curve, e);
+        return Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("Failed to subscribe to bonding curve: {}", e),
+        )));
+    }
+    
+    debug!("Subscribed to bonding curve {} for mint {}", bonding_curve, mint);
+    
+    // Track this subscription
+    subscribed_curves.insert(bonding_curve.to_string(), Instant::now());
+    
+    // Also update the liquidity cache with an initial entry
+    {
+        let cache_key = format!("bonding_curve:{}:{}", bonding_curve, mint);
+        let mut cache = LIQUIDITY_CACHE.lock().await;
+        cache.insert(cache_key, (0.0, Instant::now()));
+    }
+    
     Ok(())
 }
 
@@ -816,22 +989,36 @@ async fn get_rpc_client() -> solana_client::rpc_client::RpcClient {
 }
 
 /// New liquidity check using RPC (from commit c0b1a813cf5e3e22aebe2b233b6a2a4240ece528)
-pub async fn check_token_liquidity(mint: &str, _bonding_curve: &str, liquidity_threshold: f64) -> Result<(bool, f64)> {
+pub async fn check_token_liquidity(mint: &str, bonding_curve: &str, liquidity_threshold: f64) -> Result<(bool, f64)> {
     use solana_sdk::pubkey::Pubkey;
     use std::time::Duration;
     
-    // Check cache first for recent results
-    let cache_key = format!("primary:{}", mint);
+    // First, check for cached primary values which are most reliable
+    // These are set via the WebSocket notification handlers
+    let primary_cache_key = format!("primary:{}", mint);
     {
         let cache = LIQUIDITY_CACHE.lock().await;
-        if let Some((balance, timestamp)) = cache.get(&cache_key) {
-            if timestamp.elapsed() < Duration::from_secs(5) {
+        if let Some((balance, timestamp)) = cache.get(&primary_cache_key) {
+            if timestamp.elapsed() < Duration::from_secs(10) {
                 debug!("Using cached primary liquidity for {}: {} SOL", mint, balance);
                 return Ok((*balance >= liquidity_threshold, *balance));
             }
         }
     }
     
+    // Next, check for bonding curve cached values
+    let curve_cache_key = format!("bonding_curve:{}:{}", bonding_curve, mint);
+    {
+        let cache = LIQUIDITY_CACHE.lock().await;
+        if let Some((balance, timestamp)) = cache.get(&curve_cache_key) {
+            if timestamp.elapsed() < Duration::from_secs(10) {
+                debug!("Using cached bonding curve liquidity for {}: {} SOL", mint, balance);
+                return Ok((*balance >= liquidity_threshold, *balance));
+            }
+        }
+    }
+    
+    // If we don't have cached values, do an RPC call as a fallback
     let client = get_rpc_client().await;
     let mint_pubkey = Pubkey::from_str(mint).map_err(|e| anyhow!("Invalid mint pubkey: {}", e))?;
     let (primary_bonding_curve, _) = get_bonding_curve_address(&mint_pubkey);
@@ -843,16 +1030,44 @@ pub async fn check_token_liquidity(mint: &str, _bonding_curve: &str, liquidity_t
             let total_balance = account.lamports as f64 / 1_000_000_000.0;
             let actual_liquidity = (total_balance - RENT_EXEMPT_MINIMUM).max(0.0);
             
-            // Update the cache
+            // Update both cache entries
             {
                 let mut cache = LIQUIDITY_CACHE.lock().await;
-                cache.insert(cache_key, (actual_liquidity, std::time::Instant::now()));
+                cache.insert(primary_cache_key, (actual_liquidity, std::time::Instant::now()));
+                cache.insert(curve_cache_key, (actual_liquidity, std::time::Instant::now()));
             }
             
             debug!("Primary bonding curve has {} SOL (after subtracting {} SOL rent)", actual_liquidity, RENT_EXEMPT_MINIMUM);
+            
+            // Log in consistent format for any RPC-based checks too
+            let min_liquidity = std::env::var("MIN_LIQUIDITY")
+                .unwrap_or_else(|_| "5.0".to_string())
+                .parse::<f64>()
+                .unwrap_or(5.0);
+            
+            let has_liquidity = actual_liquidity >= liquidity_threshold;
+            let check_mark = if has_liquidity { "✅" } else { "❌" };
+            
+            // Get token name if available
+            let token_name = get_token_name_for_mint(mint).unwrap_or_else(|| "Unknown".to_string());
+            
+            // Log consistent output format 
+            info!("🔔 PROCESSED LEVEL - DETECTED NEW TOKEN: {} ({}) {:.2} SOL {}", 
+                  token_name, mint, actual_liquidity, check_mark);
+            
+            // No need to log follow-up message since main.rs will handle that based on return value
+            
             Ok((actual_liquidity >= liquidity_threshold, actual_liquidity))
         },
         Err(e) => {
+            // Try looking up in the queue one more time in case the token was just detected
+            if let Some(name) = get_token_name_for_mint(mint) {
+                info!("🔔 PROCESSED LEVEL - DETECTED NEW TOKEN: {} ({}) 0.00 SOL ❌", 
+                      name, mint);
+                info!("❌ Liquidity check FAILED (0.00 SOL < {:.2} SOL) - Skipping buy", 
+                      liquidity_threshold);
+            }
+            
             Err(anyhow!("Failed to get account info for primary bonding curve: {}", e))
         }
     }
@@ -970,4 +1185,11 @@ pub fn get_primary_bonding_curve_for_subscription(mint: &str) -> Option<String> 
     }
 
     None
+}
+
+/// Public function to connect to a WebSocket and verify connection
+/// This is provided for backward compatibility
+pub async fn connect_websocket_simple(url: &str) -> Result<()> {
+    // This just calls our internal function and returns an Ok if the connection succeeds
+    connect_to_websocket(url).await
 }

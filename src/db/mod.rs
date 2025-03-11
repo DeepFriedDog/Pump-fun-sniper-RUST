@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex, Once};
 
 static INIT: Once = Once::new();
 static mut DB_CONNECTION: Option<Arc<Mutex<Connection>>> = None;
+const DB_PATH: &str = "./database.db";
 
 /// A structure representing a trade
 #[derive(Debug, Clone)]
@@ -32,9 +33,9 @@ pub struct Trade {
 pub fn init_db(reset_pending: bool) -> Result<()> {
     info!("Starting database initialization...");
 
-    let conn = Connection::open("./database.db").context("Failed to open database file")?;
+    let conn = Connection::open(DB_PATH).context("Failed to open database file")?;
 
-    info!("Successfully opened the database file: ./database.db");
+    info!("Successfully opened the database file: {}", DB_PATH);
     info!("Creating (or verifying) the 'trades' table...");
 
     conn.execute(
@@ -276,4 +277,34 @@ pub fn clear_pending_trades() -> Result<usize> {
     }
 
     Ok(affected_rows)
+}
+
+/// Update a trade as sold by mint address
+pub fn update_trade_sold_by_mint(mint: &str, sell_price: f64, sell_liquidity: f64, reason: String, current_price: f64) -> Result<()> {
+    let conn = Connection::open(DB_PATH)?;
+    
+    // First, find the trade ID by mint
+    let mut stmt = conn.prepare("SELECT id FROM trades WHERE mint = ? AND sold = 0 LIMIT 1")?;
+    let mut rows = stmt.query(params![mint])?;
+    
+    if let Some(row) = rows.next()? {
+        let id: i64 = row.get(0)?;
+        
+        // Now update the trade as sold
+        conn.execute(
+            "UPDATE trades SET sold = 1, sell_price = ?, sell_liquidity = ?, sell_time = ?, sell_reason = ? WHERE id = ?",
+            params![
+                sell_price,
+                sell_liquidity,
+                chrono::Utc::now().to_rfc3339(),
+                reason,
+                id
+            ],
+        )?;
+        
+        info!("Updated trade {} as sold with price: {}", id, sell_price);
+        Ok(())
+    } else {
+        Err(rusqlite::Error::QueryReturnedNoRows.into())
+    }
 }

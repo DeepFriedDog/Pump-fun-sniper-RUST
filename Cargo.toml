@@ -23,7 +23,7 @@ futures-util = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 url = "2.5"
-base64 = "0.21"
+base64 = "=0.21.5"
 bs58 = "0.5"
 hex = "0.4"
 solana-program = "=1.16.25"
@@ -51,6 +51,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4.5.31", features = ["derive"] }
 http = "1.2.0"
 dashmap = "6.1.0"
+native-tls = "0.2"
+solana-transaction-status = "1.16.25"
+solana-account-decoder = "1.16.25"
 
 # Fix for ark-bn254 compile error - using older, more stable versions
 [dependencies.ark-ff]
@@ -72,3 +75,11 @@ features = ["std"]
 [dependencies.ark-std]
 version = "=0.3.0"
 features = ["std"]
+
+# Add profile settings to work around rustc compiler issues
+[profile.release]
+opt-level = 2              # Use optimization level 2 to avoid SIMD-related compiler bug
+lto = "thin"               # Enable thin link-time optimization for better performance
+codegen-units = 1          # Improve performance by using a single codegen unit
+panic = "abort"            # Remove panic unwinding code for smaller binaries
+strip = true               # Strip symbols from the binary
