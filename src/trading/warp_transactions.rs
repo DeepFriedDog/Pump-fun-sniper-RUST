@@ -91,7 +91,9 @@ pub async fn send_transaction_via_websocket_with_status(
     
     // Parse URL and connect with timeout
     let url = Url::parse(&ws_url)?;
-    let connect_timeout = Duration::from_secs(5);
+    // Clone URL early for potential reconnection attempts later
+    let url_clone = url.clone();
+    let connect_timeout = Duration::from_secs(10); // Increased from 5 to 10 seconds
     
     // Important: This WebSocket connection is DEDICATED to the Warp transaction
     // and is completely separate from the token detection WebSocket.
@@ -118,7 +120,7 @@ pub async fn send_transaction_via_websocket_with_status(
     
     // Send the transaction
     status.store(TX_STATUS_SENDING, Ordering::Relaxed);
-    let send_timeout = Duration::from_secs(5);
+    let send_timeout = Duration::from_secs(10); // Increased from 5 to 10 seconds
     
     match timeout(send_timeout, write.send(Message::Text(request.to_string()))).await {
         Ok(Ok(_)) => {
@@ -136,20 +138,34 @@ pub async fn send_transaction_via_websocket_with_status(
         }
     }
     
-    // Wait for response
+    // Wait for response with better error handling
     status.store(TX_STATUS_WAITING, Ordering::Relaxed);
     // Increase the response timeout for better reliability
-    let response_timeout = Duration::from_secs(30); // Extended from 10s to 30s
+    let response_timeout = Duration::from_secs(90); // Extended from 60s to 90s for more reliability
     let start = Instant::now();
     
     info!("⏳ Waiting for Warp transaction response (timeout: {}s)...", response_timeout.as_secs());
     
+    // Keep the WebSocket alive with periodic pings
+    let ping_interval = Duration::from_secs(5);
+    let mut last_ping = Instant::now();
+    
     while start.elapsed() < response_timeout {
+        // Send periodic pings to keep the connection alive
+        if last_ping.elapsed() >= ping_interval {
+            debug!("Sending ping to keep WebSocket connection alive");
+            if let Err(e) = write.send(Message::Ping(vec![1, 2, 3])).await {
+                warn!("Failed to send ping: {}", e);
+            }
+            last_ping = Instant::now();
+        }
+        
         match timeout(Duration::from_secs(1), read.next()).await {
             Ok(Some(Ok(Message::Text(text)))) => {
                 debug!("📥 Received WebSocket message: {}", text);
                 
                 if let Ok(json) = serde_json::from_str::<Value>(&text) {
+                    // First check if this is a response to our specific request
                     if json.get("id").and_then(|id| id.as_str()) == Some(&request_id) {
                         // Check for error
                         if let Some(error) = json.get("error") {
@@ -159,13 +175,55 @@ pub async fn send_transaction_via_websocket_with_status(
                             return Err(anyhow!("Warp transaction error: {}", error_msg));
                         }
                         
-                        // Extract signature
+                        // Extract signature from the result
                         if let Some(result) = json.get("result") {
                             if let Some(signature) = result.as_str() {
                                 match Signature::from_str(signature) {
                                     Ok(sig) => {
-                                        info!("🚀 Warp transaction sent successfully: {}", signature);
+                                        // Log the successful transaction
+                                        info!("🚀 Warp transaction SUCCESSFULLY SENT: {}", signature);
+                                        
+                                        // Store the signature in environment for tracking
+                                        std::env::set_var("LAST_BUY_SIGNATURE", signature);
+                                        
+                                        // Also set a timestamp for this transaction
+                                        let timestamp = std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_secs();
+                                        std::env::set_var("LAST_BUY_TIMESTAMP", timestamp.to_string());
+                                        
+                                        // Get mint signature from environment for performance tracking
+                                        if let Ok(mint_sig) = std::env::var("_DETECTION_SIGNATURE") {
+                                            info!("Found mint signature for performance tracking: {}", mint_sig);
+                                            std::env::set_var("LAST_MINT_SIGNATURE", mint_sig.clone());
+                                            
+                                            // Spawn a task to calculate performance metrics
+                                            let buy_sig = signature.to_string();
+                                            let mint_sig_clone = mint_sig;
+                                            tokio::spawn(async move {
+                                                match crate::trading::performance::compute_performance_metrics(&mint_sig_clone, &buy_sig).await {
+                                                    Ok((block_diff, time_diff_ms)) => {
+                                                        info!("🏁 PERFORMANCE: {}ms ({} blocks) from mint to buy confirmation", 
+                                                              time_diff_ms, block_diff);
+                                                        
+                                                        // Store the metrics for future reference
+                                                        std::env::set_var("_BLOCK_TO_BLOCK_MS", time_diff_ms.to_string());
+                                                        std::env::set_var("_BLOCKS_DIFFERENCE", block_diff.to_string());
+                                                    },
+                                                    Err(e) => {
+                                                        warn!("Could not calculate performance metrics: {}", e);
+                                                    }
+                                                }
+                                            });
+                                        } else {
+                                            warn!("No mint signature found for performance tracking");
+                                        }
+                                        
+                                        // Mark as completed
                                         status.store(TX_STATUS_COMPLETED, Ordering::Relaxed);
+                                        
+                                        // This is critical - return the signature to complete the transaction flow
                                         return Ok(sig);
                                     },
                                     Err(e) => {
@@ -177,6 +235,7 @@ pub async fn send_transaction_via_websocket_with_status(
                             }
                         }
                         
+                        // If we got here, the response format was invalid
                         error!("❌ Invalid response format");
                         status.store(TX_STATUS_FAILED, Ordering::Relaxed);
                         return Err(anyhow!("Invalid response format"));
@@ -194,6 +253,7 @@ pub async fn send_transaction_via_websocket_with_status(
             },
             Ok(Some(Ok(Message::Pong(_)))) => {
                 debug!("🏓 Received pong");
+                last_ping = Instant::now(); // Reset ping timer when we get a pong
             },
             Ok(Some(Ok(Message::Close(_)))) => {
                 warn!("🔌 WebSocket connection closed by server");
@@ -204,7 +264,25 @@ pub async fn send_transaction_via_websocket_with_status(
             },
             Ok(Some(Err(e))) => {
                 error!("❌ WebSocket error: {}", e);
-                break;
+                // Try to reconnect on error
+                warn!("Attempting to reconnect WebSocket...");
+                match timeout(connect_timeout, connect_async(url_clone.clone())).await {
+                    Ok(Ok((stream, _))) => {
+                        info!("✅ WebSocket reconnected");
+                        let (w, r) = stream.split();
+                        write = w;
+                        read = r;
+                        // Resend the transaction
+                        if let Err(e) = write.send(Message::Text(request.to_string())).await {
+                            error!("Failed to resend transaction after reconnect: {}", e);
+                            break;
+                        }
+                    },
+                    _ => {
+                        error!("Failed to reconnect WebSocket");
+                        break;
+                    }
+                }
             },
             Ok(None) => {
                 warn!("🔌 WebSocket stream ended");
@@ -216,7 +294,11 @@ pub async fn send_transaction_via_websocket_with_status(
         }
     }
     
-    error!("❌ No response received for Warp transaction");
+    // If we reach this point, we didn't get a successful response in time
+    error!("❌ No response received for Warp transaction within {} seconds", response_timeout.as_secs());
+    info!("Network conditions may be congested or the transaction may still be in flight");
+    info!("You can check if the transaction was eventually confirmed using a block explorer");
+    
     status.store(TX_STATUS_FAILED, Ordering::Relaxed);
-    Err(anyhow!("No response received for Warp transaction"))
+    Err(anyhow!("No response received for Warp transaction within {} seconds", response_timeout.as_secs()))
 } 

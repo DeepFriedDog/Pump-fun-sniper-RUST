@@ -472,6 +472,8 @@ pub fn process_notification(text: &str) -> Option<NewToken> {
                         name: Some(token.token_name.clone()),
                         symbol: Some(token.token_symbol.clone()),
                         timestamp: Some(token.timestamp),
+                        liquidity_status: Some(false), // Default to false since we haven't checked liquidity
+                        liquidity_amount: Some(0.0),   // Default to 0.0 since we haven't checked liquidity
                     };
 
                     queue.push_back(token_data);

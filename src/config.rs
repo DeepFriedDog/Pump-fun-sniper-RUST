@@ -6,9 +6,16 @@ use std::str::FromStr;
 use log::{debug, error, warn};
 use std::sync::Arc;
 
+// Load environment variables from config.env
+fn load_env() {
+    if let Err(_) = dotenv::from_filename("config.env") {
+        warn!("Could not load config.env file");
+    }
+}
+
 // WebSocket endpoint for the token monitor - completely separate from Warp transaction WebSocket
 pub fn get_wss_endpoint() -> String {
-    dotenv().ok(); // Load .env file if exists
+    load_env(); // Load config.env file if exists
     let endpoint = env::var("CHAINSTACK_WSS_ENDPOINT").unwrap_or_else(|_| {
         // Default to Chainstack WebSocket endpoint as fallback
         warn!("CHAINSTACK_WSS_ENDPOINT not found, using default endpoint for token detection");
@@ -99,12 +106,13 @@ impl Default for Config {
 
 // Function to load configuration from environment variables
 pub fn load_config() -> Config {
+    load_env(); // Load config.env file
     Config::default()
 }
 
 // Function to determine if WebSockets should be used
 pub fn use_websocket() -> bool {
-    dotenv().ok(); // Load .env file if exists
+    load_env(); // Load config.env file
     env::var("USE_WEBSOCKET")
         .unwrap_or_else(|_| "true".to_string())
         .to_lowercase()
@@ -113,6 +121,8 @@ pub fn use_websocket() -> bool {
 
 /// Check if Warp transactions should be used
 pub fn should_use_warp_transactions() -> bool {
+    // Set default to false since Chainstack documentation states
+    // that Warp transactions only work over HTTP
     std::env::var("USE_WARP_TRANSACTIONS")
         .map(|v| v.to_lowercase() == "true")
         .unwrap_or(false)
@@ -175,4 +185,9 @@ pub fn get_transaction_timeout_seconds() -> u64 {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(30) // Default to 30 seconds if not specified
+}
+
+// Add a function to get the commitment level with processed as default
+pub fn get_commitment_level() -> String {
+    std::env::var("COMMITMENT_LEVEL").unwrap_or_else(|_| "processed".to_string())
 }

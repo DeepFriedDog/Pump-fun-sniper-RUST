@@ -8,6 +8,7 @@ pub mod db;
 pub mod error;
 pub mod token_detector;
 pub mod trading;
+pub mod create_buy_instruction;
 
 // Create a unified websocket module that uses token_detector for token detection
 // and api/websocket for transaction handling

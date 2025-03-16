@@ -602,6 +602,40 @@ async fn process_message(
                                                         
                                                         // Subscribe to the bonding curve to get real-time liquidity updates
                                                         subscribe_to_bonding_curve(write, &mint_str, &bonding_curve_str, subscribed_bonding_curves).await?;
+                                                        
+                                                        // Convert to NewToken and add to the queue IMMEDIATELY
+                                                        let mut new_token: NewToken = token_data.into();
+                                                        new_token.transaction_signature = signature.to_string();
+
+                                                        // Add message to global queue for processing IMMEDIATELY
+                                                        let mut queue_guard = queue.lock().await;
+                                                        queue_guard.push_back(text.to_string());
+                                                        info!(
+                                                            "Added token to queue. Current queue size: {}",
+                                                            queue_guard.len()
+                                                        );
+
+                                                        // IMPORTANT: Also add to the API queue that is checked by fetch_new_tokens
+                                                        let token_data = crate::api::TokenData {
+                                                            status: "success".to_string(),
+                                                            mint: mint_str.clone(),
+                                                            dev: new_token.creator_address.clone(),
+                                                            metadata: Some(format!(
+                                                                "bonding_curve:{},tx:{}",
+                                                                bonding_curve_str,
+                                                                signature
+                                                            )),
+                                                            name: Some(new_token.token_name.clone()),
+                                                            symbol: Some(new_token.token_symbol.clone()),
+                                                            timestamp: Some(chrono::Utc::now().timestamp()),
+                                                            liquidity_status: Some(has_liquidity),   // Already have the ACTUAL liquidity value
+                                                            liquidity_amount: Some(actual_liquidity), // Already have the ACTUAL liquidity value
+                                                        };
+
+                                                        let mut api_queue =
+                                                            crate::api::NEW_TOKEN_QUEUE.lock().unwrap();
+                                                        api_queue.push_back(token_data);
+                                                        info!("Added token to API queue. Current API queue size: {}", api_queue.len());
                                                     },
                                                     Err(_) => {
                                                         // If RPC call fails, still log but with zero liquidity
@@ -612,37 +646,6 @@ async fn process_message(
                                                     }
                                                 }
                                             }
-
-                                            // Convert to NewToken and add to the queue IMMEDIATELY
-                                            let mut new_token: NewToken = token_data.into();
-                                            new_token.transaction_signature = signature.to_string();
-
-                                            // Add message to global queue for processing IMMEDIATELY
-                                            let mut queue_guard = queue.lock().await;
-                                            queue_guard.push_back(text.to_string());
-                                            info!(
-                                                "Added token to queue. Current queue size: {}",
-                                                queue_guard.len()
-                                            );
-
-                                            // IMPORTANT: Also add to the API queue that is checked by fetch_new_tokens
-                                            let token_data = crate::api::TokenData {
-                                                status: "success".to_string(),
-                                                mint: mint_str.clone(),
-                                                dev: new_token.creator_address.clone(),
-                                                metadata: Some(format!(
-                                                    "bonding_curve:{}",
-                                                    bonding_curve_str
-                                                )),
-                                                name: Some(new_token.token_name.clone()),
-                                                symbol: Some(new_token.token_symbol.clone()),
-                                                timestamp: Some(chrono::Utc::now().timestamp()),
-                                            };
-
-                                            let mut api_queue =
-                                                crate::api::NEW_TOKEN_QUEUE.lock().unwrap();
-                                            api_queue.push_back(token_data);
-                                            info!("Added token to API queue. Current API queue size: {}", api_queue.len());
                                         }
                                     }
                                     Err(e) => {
@@ -735,6 +738,40 @@ async fn process_message(
                                                                 
                                                                 // Subscribe to the bonding curve to get real-time liquidity updates
                                                                 subscribe_to_bonding_curve(write, &mint_str, &bonding_curve_str, subscribed_bonding_curves).await?;
+                                                                
+                                                                // Convert to NewToken and add to the queue IMMEDIATELY
+                                                                let mut new_token: NewToken = token_data.into();
+                                                                new_token.transaction_signature = signature.to_string();
+
+                                                                // Add message to global queue for processing IMMEDIATELY
+                                                                let mut queue_guard = queue.lock().await;
+                                                                queue_guard.push_back(text.to_string());
+                                                                info!(
+                                                                    "Added token to queue. Current queue size: {}",
+                                                                    queue_guard.len()
+                                                                );
+
+                                                                // IMPORTANT: Also add to the API queue that is checked by fetch_new_tokens
+                                                                let token_data = crate::api::TokenData {
+                                                                    status: "success".to_string(),
+                                                                    mint: mint_str.clone(),
+                                                                    dev: new_token.creator_address.clone(),
+                                                                    metadata: Some(format!(
+                                                                        "bonding_curve:{},tx:{}",
+                                                                        bonding_curve_str,
+                                                                        signature
+                                                                    )),
+                                                                    name: Some(new_token.token_name.clone()),
+                                                                    symbol: Some(new_token.token_symbol.clone()),
+                                                                    timestamp: Some(chrono::Utc::now().timestamp()),
+                                                                    liquidity_status: Some(has_liquidity),   // Already have the ACTUAL liquidity value
+                                                                    liquidity_amount: Some(actual_liquidity), // Already have the ACTUAL liquidity value
+                                                                };
+
+                                                                let mut api_queue =
+                                                                    crate::api::NEW_TOKEN_QUEUE.lock().unwrap();
+                                                                api_queue.push_back(token_data);
+                                                                info!("Added token to API queue. Current API queue size: {}", api_queue.len());
                                                             },
                                                             Err(_) => {
                                                                 // If RPC call fails, still log but with zero liquidity
@@ -745,37 +782,6 @@ async fn process_message(
                                                             }
                                                         }
                                                     }
-
-                                                    // Convert to NewToken and add to the queue IMMEDIATELY
-                                                    let mut new_token: NewToken = token_data.into();
-                                                    new_token.transaction_signature = signature.to_string();
-
-                                                    // Add message to global queue for processing IMMEDIATELY
-                                                    let mut queue_guard = queue.lock().await;
-                                                    queue_guard.push_back(text.to_string());
-                                                    info!(
-                                                        "Added token to queue. Current queue size: {}",
-                                                        queue_guard.len()
-                                                    );
-
-                                                    // IMPORTANT: Also add to the API queue that is checked by fetch_new_tokens
-                                                    let token_data = crate::api::TokenData {
-                                                        status: "success".to_string(),
-                                                        mint: mint_str.clone(),
-                                                        dev: new_token.creator_address.clone(),
-                                                        metadata: Some(format!(
-                                                            "bonding_curve:{}",
-                                                            bonding_curve_str
-                                                        )),
-                                                        name: Some(new_token.token_name.clone()),
-                                                        symbol: Some(new_token.token_symbol.clone()),
-                                                        timestamp: Some(chrono::Utc::now().timestamp()),
-                                                    };
-
-                                                    let mut api_queue =
-                                                        crate::api::NEW_TOKEN_QUEUE.lock().unwrap();
-                                                    api_queue.push_back(token_data);
-                                                    info!("Added token to API queue. Current API queue size: {}", api_queue.len());
                                                 }
                                             }
                                             Err(_) => {

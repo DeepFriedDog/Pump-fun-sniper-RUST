@@ -79,4 +79,6 @@ pub struct TokenData {
     pub name: Option<String>,
     pub symbol: Option<String>,
     pub timestamp: Option<i64>,
+    pub liquidity_status: Option<bool>,
+    pub liquidity_amount: Option<f64>,
 }

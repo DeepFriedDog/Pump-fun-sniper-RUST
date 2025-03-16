@@ -163,6 +163,40 @@ The bot provides detailed logging with emoji indicators:
 - 🛑 - Stop loss triggered
 - ⏱️ - Timeout triggered
 
+## Warp Transactions - Important Note
+
+According to Chainstack documentation, Warp transactions only work over HTTP protocol, not WebSocket:
+
+> **Note that Warp transactions only work over the HTTP protocol. The WebSocket protocol is not supported.**
+
+### Updated Implementation
+
+The latest version of the bot has been updated to use HTTP for Warp transactions by default, ensuring:
+
+1. **Better Reliability**: Transactions are sent using the recommended HTTP protocol
+2. **Faster Confirmation**: Better transaction landing rate with Chainstack's Warp infrastructure
+3. **Higher Success Rate**: Reduced likelihood of transaction failures
+
+### Configuration Options
+
+The bot now defaults to using HTTP for transactions, but you can control this behavior:
+
+```
+# Use HTTP for Warp transactions (recommended and default)
+USE_WS_FOR_WARP_TRANSACTIONS=false
+
+# Force WebSocket for transactions (not recommended)
+USE_WS_FOR_WARP_TRANSACTIONS=true
+```
+
+### Performance Benefits
+
+Chainstack's Warp transactions via HTTP provide significant advantages:
+
+- 40% of transactions land in the first two blocks
+- Transactions are sent to the current leader through a staked validator connection
+- Priority fees can be used to increase placement chances within earlier blocks
+
 ## Performance Tuning
 
 For optimal performance:
@@ -197,4 +231,81 @@ For persistent issues:
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details. 
+This project is licensed under the MIT License - see the LICENSE file for details.
+
+# Pump.fun Token Detector - Optimized
+
+This is an optimized token detector for Pump.fun tokens on the Solana blockchain.
+
+## Optimized Detection Features
+
+The latest version includes significant performance optimizations to reduce the delay between token mint time and detection time:
+
+### Fast Path Detection
+
+The Fast Path Detection mode uses several optimizations to minimize the time between token creation and detection:
+
+1. **Early Filtering**: Messages are filtered at the binary level before full JSON parsing
+2. **Non-blocking Design**: Token detection and liquidity checking run in separate asynchronous tasks
+3. **Prioritized Token Queue**: Detected tokens are immediately added to the queue before any RPC calls
+4. **High-Performance Bonding Curve Cache**: Uses an in-memory cache for bonding curves instead of environment variables
+5. **Optional ATA Creation**: Control whether ATAs are created automatically during buys
+
+### New Environment Variables
+
+The bot now supports these additional environment variables:
+
+```
+# Control whether Associated Token Accounts are created during buying
+# Default: true (creates ATAs automatically)
+# Set to false to prevent automatic ATA creation transactions
+CREATE_ATA_ON_BUY=false
+
+# Time-to-live for cached bonding curves in seconds
+# Default: 30 seconds
+BONDING_CURVE_CACHE_TTL=30
+```
+
+### Performance Benefits
+
+The new high-performance bonding curve cache provides significant advantages:
+
+- **Faster Execution**: Direct memory access instead of environment variable lookups
+- **Thread Safety**: Properly synchronized for concurrent access
+- **Configurable TTL**: Stale entries are automatically refreshed
+- **Reduced System Call Overhead**: No interprocess communication required
+
+## Usage
+
+To use the optimized token detection:
+
+```bash
+# Run in fast detection mode
+cargo run --release -- --fast-detection
+
+# Alternative short form
+cargo run --release -- -f
+```
+
+## Environment Variables
+
+Configure the tool with these environment variables:
+
+- `WSS_ENDPOINT`: WebSocket endpoint for Solana (defaults to Chainstack URL)
+- `MIN_LIQUIDITY`: Minimum liquidity threshold in SOL (default: 5.0)
+- `CHAINSTACK_ENDPOINT`: HTTP RPC endpoint for Solana (used for liquidity checks)
+
+## Performance
+
+The Fast Path Detection mode significantly reduces the delay between token mint time and detection time:
+
+- Standard mode: ~1-2 second delay
+- Fast Path mode: ~200-500ms delay (typical)
+
+## Troubleshooting
+
+If you encounter any issues:
+
+1. Check your WebSocket connection by monitoring the logs
+2. Ensure your RPC provider has sufficient rate limits
+3. Monitor system resource usage during token detection 

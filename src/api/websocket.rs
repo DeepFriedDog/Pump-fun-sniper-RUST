@@ -89,9 +89,10 @@ pub fn return_websocket_connection(
 
 /// Check if Warp transactions should be used
 pub fn should_use_warp_transactions() -> bool {
-    // Default to using Warp Transactions if the env var is not set
+    // Changed to default to NOT using WebSocket for Warp Transactions 
+    // since Chainstack documentation states that Warp transactions only work over HTTP
     std::env::var("USE_WS_FOR_WARP_TRANSACTIONS")
-        .unwrap_or_else(|_| "true".to_string())
+        .unwrap_or_else(|_| "false".to_string())
         .to_lowercase() == "true"
 }
 

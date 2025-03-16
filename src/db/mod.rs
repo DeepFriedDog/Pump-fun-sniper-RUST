@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use log::info;
+use log::{info, warn, error};
 use rusqlite::{params, Connection};
 use std::sync::{Arc, Mutex, Once};
 
@@ -30,7 +30,7 @@ pub struct Trade {
 }
 
 /// Initialize the database with option to reset pending trades
-pub fn init_db(reset_pending: bool) -> Result<()> {
+pub async fn init_db(reset_pending: bool) -> Result<()> {
     info!("Starting database initialization...");
 
     let conn = Connection::open(DB_PATH).context("Failed to open database file")?;
@@ -76,6 +76,9 @@ pub fn init_db(reset_pending: bool) -> Result<()> {
 
     info!("Trigger 'update_trades_updated_at' created or confirmed to exist.");
 
+    // Run migration to add any missing columns
+    migrate_db(&conn)?;
+
     // If reset_pending is true, mark all pending trades as sold
     if reset_pending {
         info!("Resetting any pending trades...");
@@ -86,7 +89,22 @@ pub fn init_db(reset_pending: bool) -> Result<()> {
         info!("All pending trades have been reset to 'sold'.");
     }
 
-    info!("Database initialization complete.");
+    // Add this call right before the "Database initialization complete!" log message
+    // Around where check_db_schema is called
+    match get_db_connection() {
+        Ok(conn) => {
+            if let Err(e) = fix_column_types(&conn).await {
+                warn!("Failed to fix column types: {}", e);
+            } else {
+                info!("Column types verified/fixed successfully");
+            }
+        },
+        Err(e) => {
+            warn!("Cannot fix column types: {}", e);
+        }
+    }
+
+    info!("Database initialization complete!");
 
     unsafe {
         INIT.call_once(|| {
@@ -97,10 +115,88 @@ pub fn init_db(reset_pending: bool) -> Result<()> {
     Ok(())
 }
 
-/// Get a connection to the database
-#[inline]
-#[allow(static_mut_refs)]
-pub fn get_db() -> Result<Arc<Mutex<Connection>>> {
+/// Migrate the database to add any missing columns
+fn migrate_db(conn: &Connection) -> Result<()> {
+    info!("Checking database schema for missing columns...");
+    
+    // Check if buy_liquidity column exists
+    let has_buy_liquidity = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('trades') WHERE name = 'buy_liquidity'",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap_or(0);
+    
+    // Add buy_liquidity column if it doesn't exist
+    if has_buy_liquidity == 0 {
+        info!("Adding missing column 'buy_liquidity' to trades table");
+        conn.execute(
+            "ALTER TABLE trades ADD COLUMN buy_liquidity REAL DEFAULT 0",
+            [],
+        )?;
+    }
+    
+    // Check if sell_liquidity column exists
+    let has_sell_liquidity = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('trades') WHERE name = 'sell_liquidity'",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap_or(0);
+    
+    // Add sell_liquidity column if it doesn't exist
+    if has_sell_liquidity == 0 {
+        info!("Adding missing column 'sell_liquidity' to trades table");
+        conn.execute(
+            "ALTER TABLE trades ADD COLUMN sell_liquidity REAL DEFAULT 0",
+            [],
+        )?;
+    }
+    
+    // Check if detection_time column exists
+    let has_detection_time = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('trades') WHERE name = 'detection_time'",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap_or(0);
+    
+    // Add detection_time column if it doesn't exist
+    if has_detection_time == 0 {
+        info!("Adding missing column 'detection_time' to trades table");
+        conn.execute(
+            "ALTER TABLE trades ADD COLUMN detection_time INTEGER DEFAULT 0",
+            [],
+        )?;
+    }
+    
+    // Check if buy_time column exists
+    let has_buy_time = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('trades') WHERE name = 'buy_time'",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap_or(0);
+    
+    // Add buy_time column if it doesn't exist
+    if has_buy_time == 0 {
+        info!("Adding missing column 'buy_time' to trades table");
+        conn.execute(
+            "ALTER TABLE trades ADD COLUMN buy_time INTEGER DEFAULT 0",
+            [],
+        )?;
+    }
+    
+    info!("Database migration complete");
+    Ok(())
+}
+
+/// Get a safe reference to the database connection
+pub fn get_db_connection() -> Result<Arc<Mutex<Connection>>> {
     unsafe {
         if let Some(conn) = &DB_CONNECTION {
             Ok(Arc::clone(conn))
@@ -115,7 +211,7 @@ pub fn get_db() -> Result<Arc<Mutex<Connection>>> {
 /// Get all pending trades
 #[inline]
 pub fn get_pending_trades() -> Result<Vec<Trade>> {
-    let db = get_db()?;
+    let db = get_db_connection()?;
     let conn = db.lock().unwrap();
 
     let mut stmt = conn.prepare("SELECT * FROM trades WHERE status = 'pending'")?;
@@ -151,7 +247,7 @@ pub fn get_pending_trades() -> Result<Vec<Trade>> {
 /// Get all trades from the database
 #[inline]
 pub fn get_all_trades() -> Result<Vec<Trade>> {
-    let db = get_db()?;
+    let db = get_db_connection()?;
     let conn = db.lock().unwrap();
 
     let mut stmt = conn.prepare("SELECT * FROM trades ORDER BY created_at DESC")?;
@@ -194,7 +290,7 @@ pub fn insert_trade(
     detection_time: i64, 
     buy_time: i64
 ) -> Result<()> {
-    let db = get_db()?;
+    let db = get_db_connection()?;
     let conn = db.lock().unwrap();
 
     conn.execute(
@@ -214,7 +310,7 @@ pub fn insert_trade(
 /// Update the current price of a trade
 #[inline]
 pub fn update_trade_price(id: i64, current_price: f64) -> Result<()> {
-    let db = get_db()?;
+    let db = get_db_connection()?;
     let conn = db.lock().unwrap();
 
     conn.execute(
@@ -231,7 +327,7 @@ pub fn update_trade_price(id: i64, current_price: f64) -> Result<()> {
 /// Update a trade to sold status
 #[inline]
 pub fn update_trade_sold(id: i64, sell_price: f64, sell_liquidity: f64) -> Result<()> {
-    let db = get_db()?;
+    let db = get_db_connection()?;
     let conn = db.lock().unwrap();
 
     conn.execute(
@@ -249,7 +345,7 @@ pub fn update_trade_sold(id: i64, sell_price: f64, sell_liquidity: f64) -> Resul
 /// Count pending trades
 #[inline]
 pub fn count_pending_trades() -> Result<i64> {
-    let db = get_db()?;
+    let db = get_db_connection()?;
     let conn = db.lock().unwrap();
 
     let count: i64 = conn.query_row(
@@ -264,7 +360,7 @@ pub fn count_pending_trades() -> Result<i64> {
 /// Clear all pending trades
 #[allow(dead_code)]
 pub fn clear_pending_trades() -> Result<usize> {
-    let db = get_db()?;
+    let db = get_db_connection()?;
     let conn = db.lock().unwrap();
 
     let affected_rows = conn.execute(
@@ -307,4 +403,94 @@ pub fn update_trade_sold_by_mint(mint: &str, sell_price: f64, sell_liquidity: f6
     } else {
         Err(rusqlite::Error::QueryReturnedNoRows.into())
     }
+}
+
+/// Update the status of a trade in the database
+pub async fn update_trade_status(mint: &str, status: &str) -> Result<()> {
+    let conn = get_db_connection()?;
+    let conn_guard = conn.lock().unwrap();
+    
+    let now = chrono::Utc::now().naive_utc().to_string();
+    
+    match conn_guard.execute(
+        "UPDATE trades SET status = ?1, updated_at = ?2 WHERE mint = ?3",
+        params![status, now, mint],
+    ) {
+        Ok(rows_affected) => {
+            if rows_affected > 0 {
+                info!("Updated status to '{}' for trade with mint {}", status, mint);
+            } else {
+                warn!("No trade found with mint {} to update status", mint);
+            }
+            Ok(())
+        },
+        Err(e) => {
+            error!("Failed to update trade status: {}", e);
+            Err(anyhow::anyhow!("Failed to update trade status: {}", e))
+        }
+    }
+}
+
+/// Fix column type issues in the trades table
+pub async fn fix_column_types(conn: &Arc<Mutex<Connection>>) -> Result<(), anyhow::Error> {
+    let conn_guard = conn.lock().unwrap();
+    
+    info!("Fixing column types in trades table...");
+    
+    // Check if buy_liquidity column exists and if it's the wrong type
+    let column_info = conn_guard.query_row(
+        "PRAGMA table_info(trades)",
+        [],
+        |row| {
+            let name: String = row.get(1)?;
+            let type_name: String = row.get(2)?;
+            Ok((name, type_name))
+        }
+    );
+    
+    if let Ok((name, type_name)) = column_info {
+        if name == "buy_liquidity" && type_name != "REAL" {
+            info!("Fixing buy_liquidity column type from {} to REAL...", type_name);
+            
+            // Create a new table with correct column types
+            conn_guard.execute(
+                "
+                CREATE TABLE trades_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    mint TEXT NOT NULL,
+                    name TEXT,
+                    amount REAL,
+                    status TEXT,
+                    signature TEXT,
+                    liquidity REAL,
+                    price REAL,
+                    trade_status TEXT,
+                    detection_to_buy_ms TEXT,
+                    buy_liquidity REAL,
+                    created_at DATETIME,
+                    updated_at DATETIME
+                )
+                ",
+                [],
+            )?;
+            
+            // Copy data from the old table to the new one
+            conn_guard.execute(
+                "
+                INSERT INTO trades_new(id, mint, name, amount, status, signature, liquidity, price, trade_status, detection_to_buy_ms, buy_liquidity, created_at, updated_at)
+                SELECT id, mint, name, amount, status, signature, liquidity, price, trade_status, detection_to_buy_ms, CAST(buy_liquidity AS REAL), created_at, updated_at
+                FROM trades
+                ",
+                [],
+            )?;
+            
+            // Drop the old table and rename the new one
+            conn_guard.execute("DROP TABLE trades", [])?;
+            conn_guard.execute("ALTER TABLE trades_new RENAME TO trades", [])?;
+            
+            info!("Column buy_liquidity type fixed successfully!");
+        }
+    }
+    
+    Ok(())
 }

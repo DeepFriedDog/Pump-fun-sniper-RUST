@@ -31,6 +31,8 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tokio::time::timeout;
 use url::Url;
+use tokio::task::JoinHandle;
+use tokio::sync::oneshot;
 
 // Global cached values
 lazy_static! {
@@ -45,7 +47,37 @@ lazy_static! {
     // Add missing caches that other code depends on
     pub static ref TOKEN_PRICE_CACHE: Mutex<HashMap<String, (f64, Instant)>> = Mutex::new(HashMap::new());
     pub static ref NEW_TOKEN_QUEUE: Mutex<VecDeque<models::TokenData>> = Mutex::new(VecDeque::new());
+    
+    // Task handles collection for graceful shutdown
+    pub static ref TASK_HANDLES: Mutex<Vec<JoinHandle<()>>> = Mutex::new(Vec::new());
+    
+    // Cancellation senders for individual monitoring tasks
+    pub static ref API_CANCEL_SENDERS: Mutex<Vec<(String, oneshot::Sender<()>)>> = Mutex::new(Vec::new());
 }
 
 // Constants
 pub const PUMP_PROGRAM_ID: &str = "FunNVnBYXCzd1MxQV9qOAHQJUmfKVTUfkj8hAyGRSXL5"; 
+
+/// Helper function to get bonding curve for a mint
+pub async fn get_bonding_curve_for_mint(mint: &str) -> Option<String> {
+    // First check if we have it in the token queue
+    if let Ok(queue) = NEW_TOKEN_QUEUE.try_lock() {
+        for token in queue.iter() {
+            if token.mint == mint {
+                if let Some(metadata) = &token.metadata {
+                    if metadata.starts_with("bonding_curve:") {
+                        return Some(metadata.replace("bonding_curve:", ""));
+                    }
+                }
+            }
+        }
+    }
+    
+    // If not found in queue, try getting it from token_detector
+    if let Ok(mint_pubkey) = solana_sdk::pubkey::Pubkey::from_str(mint) {
+        let bonding_curve = crate::token_detector::get_bonding_curve_address(&mint_pubkey).0;
+        return Some(bonding_curve.to_string());
+    }
+    
+    None
+} 

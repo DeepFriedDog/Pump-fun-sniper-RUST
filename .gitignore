@@ -3,6 +3,8 @@ node_modules/
 *.log
 dist/
 database.db
+@config.env
+config.env
 
 
 # Added by cargo
