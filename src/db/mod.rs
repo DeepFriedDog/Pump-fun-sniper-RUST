@@ -405,6 +405,38 @@ pub fn update_trade_sold_by_mint(mint: &str, sell_price: f64, sell_liquidity: f6
     }
 }
 
+/// Get a trade by its mint address
+pub fn get_trade_by_mint(mint: &str) -> Result<Option<Trade>> {
+    let conn = get_db_connection()?;
+    let conn_guard = conn.lock().unwrap();
+
+    let mut stmt = conn_guard.prepare("SELECT id, mint, tokens, buy_price, current_price, sell_price, buy_liquidity, sell_liquidity, status, created_at, detection_time, buy_time, updated_at FROM trades WHERE mint = ? LIMIT 1")?;
+    
+    let mut trade_iter = stmt.query_map(params![mint], |row| {
+        Ok(Trade {
+            id: row.get(0)?,
+            mint: row.get(1)?,
+            tokens: row.get(2)?,
+            buy_price: row.get(3)?,
+            current_price: row.get(4)?,
+            sell_price: row.get(5)?,
+            buy_liquidity: row.get(6)?,
+            sell_liquidity: row.get(7)?,
+            status: row.get(8)?,
+            created_at: row.get(9)?,
+            detection_time: row.get(10)?,
+            buy_time: row.get(11)?,
+            updated_at: row.get(12)?,
+        })
+    })?;
+
+    if let Some(trade) = trade_iter.next() {
+        return Ok(Some(trade?));
+    }
+
+    Ok(None)
+}
+
 /// Update the status of a trade in the database
 pub async fn update_trade_status(mint: &str, status: &str) -> Result<()> {
     let conn = get_db_connection()?;

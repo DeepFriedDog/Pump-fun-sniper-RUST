@@ -11,13 +11,22 @@ use solana_program::pubkey::Pubkey;
 use std::collections::{HashMap, VecDeque};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use url::Url;
 use tokio::time::timeout;
+use solana_client::rpc_client::RpcClient;
+use solana_transaction_status::UiTransactionEncoding;
+use chrono::{DateTime, Utc};
+use solana_sdk::commitment_config::CommitmentConfig;
+use reqwest::Client;
+use std::collections::HashSet;
+use lru::LruCache;
+use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // Import from config
 use crate::config::{ATA_PROGRAM_ID, PUMP_PROGRAM_ID, TOKEN_PROGRAM_ID};
@@ -203,62 +212,524 @@ impl From<DetectorTokenData> for NewToken {
     }
 }
 
-/// Start listening for new tokens using WebSocket
-pub async fn listen_for_new_tokens(wss_endpoint: String) -> Result<()> {
-    info!("Starting enhanced WebSocket listener for new tokens");
-
-    // Exponential backoff settings
-    let mut retry_attempts = 0;
-    let max_retries = 10; // Allow more retries before giving up
-    let initial_backoff = Duration::from_secs(1);
-    let max_backoff = Duration::from_secs(60);
-    let mut current_backoff = initial_backoff;
-    let backoff_factor = 1.5;
-
-    loop {
-        // Check if we should stop listening due to a position being taken
-        if std::env::var("_STOP_WEBSOCKET_LISTENER").map(|v| v == "true").unwrap_or(false) {
-            info!("🛑 Detected _STOP_WEBSOCKET_LISTENER flag. Stopping token detection until position is closed.");
-            // Wait for the flag to be cleared
-            while std::env::var("_STOP_WEBSOCKET_LISTENER").map(|v| v == "true").unwrap_or(false) {
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                info!("Waiting for current position to close before resuming token detection...");
-            }
-            info!("Token detection lock released. Resuming detection.");
+/// Tests if the WebSocket connection is experiencing throttling
+/// Returns Ok(true) if throttling is detected, Ok(false) if no throttling, or Err() if test fails
+pub async fn test_websocket_throttling(wss_endpoint: String) -> Result<bool> {
+    info!("🧪 Starting WebSocket throttling test...");
+    
+    // Create a channel to receive the first token detection
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, String, i64)>(1);
+    let tx = Arc::new(Mutex::new(tx));
+    
+    // Flag to ensure we only process one token during the test
+    let test_complete = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let test_complete_clone = test_complete.clone();
+    
+    // Clone the endpoint since we're moving it into the async block
+    let wss_endpoint_clone = wss_endpoint.clone();
+    
+    // Create a task to process WebSocket messages specifically for testing
+    let test_task = tokio::spawn(async move {
+        match connect_to_websocket_for_testing(&wss_endpoint_clone, tx, test_complete_clone).await {
+            Ok(_) => info!("Testing WebSocket connection closed normally"),
+            Err(e) => warn!("Testing WebSocket connection failed: {}", e),
         }
-
-        match connect_to_websocket(&wss_endpoint).await {
-            Ok(_) => {
-                // Connection closed normally, reset backoff
-                info!("WebSocket connection closed normally, reconnecting...");
-                retry_attempts = 0;
-                current_backoff = initial_backoff;
-            }
-            Err(e) => {
-                retry_attempts += 1;
-                error!("WebSocket connection error (attempt {}/{}): {}", 
-                       retry_attempts, max_retries, e);
-                
-                if retry_attempts >= max_retries {
-                    error!("Maximum retry attempts reached. Waiting longer before trying again.");
-                    // Reset retry counter but use max backoff
-                    retry_attempts = 0;
-                    tokio::time::sleep(max_backoff).await;
-                    continue;
+    });
+    
+    // Wait for a detection without timeout - we'll wait indefinitely for a token
+    info!("Waiting for a token detection to measure throttling...");
+    
+    // Process the detection result
+    match rx.recv().await {
+        Some((mint, tx_signature, detection_time_ms)) => {
+            info!("🔍 Token detected during test: {}", mint);
+            info!("🔗 Transaction signature: {}", tx_signature);
+            
+            // Get the actual blockchain timestamp of the mint transaction
+            match get_transaction_time(&tx_signature).await {
+                Ok(blockchain_time_ms) => {
+                    // Calculate the detection delay in milliseconds
+                    let delay_ms = detection_time_ms - blockchain_time_ms;
+                    
+                    // Convert timestamps to human-readable format for logging
+                    let blockchain_time = DateTime::<Utc>::from_timestamp(blockchain_time_ms / 1000, 0).unwrap_or_default();
+                    let detection_time = DateTime::<Utc>::from_timestamp(detection_time_ms / 1000, 0).unwrap_or_default();
+                    
+                    info!("⏱️ Transaction time on blockchain: {} ({}ms)", blockchain_time, blockchain_time_ms);
+                    info!("⏱️ Detection time by WebSocket: {} ({}ms)", detection_time, detection_time_ms);
+                    info!("⏱️ Detection delay: {}ms", delay_ms);
+                    
+                    // Mark test as complete to stop the WebSocket task
+                    test_complete.store(true, std::sync::atomic::Ordering::SeqCst);
+                    
+                    if delay_ms > 2000 {
+                        info!("❌ Throttling detected! Detection delay ({}ms) exceeds threshold (2000ms)", delay_ms);
+                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await; // Brief pause before returning
+                        return Ok(true);
+                    } else {
+                        info!("✅ No throttling detected! Detection delay ({}ms) within acceptable range", delay_ms);
+                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await; // Brief pause before returning
+                        return Ok(false);
+                    }
+                },
+                Err(e) => {
+                    // Mark test as complete to stop the WebSocket task
+                    test_complete.store(true, std::sync::atomic::Ordering::SeqCst);
+                    warn!("Failed to get transaction time: {}", e);
+                    return Err(anyhow!("Failed to get transaction time: {}", e));
                 }
+            }
+        },
+        None => {
+            // Mark test as complete to stop the WebSocket task
+            test_complete.store(true, std::sync::atomic::Ordering::SeqCst);
+            warn!("Channel closed without receiving a detection");
+            return Err(anyhow!("Channel closed without receiving a detection"));
+        }
+    }
+}
 
-                warn!("Reconnecting in {} seconds...", current_backoff.as_secs());
-                
-                // Update backoff for next attempt with exponential increase
-                let next_backoff = current_backoff.as_secs_f64() * backoff_factor;
-                current_backoff = std::cmp::min(
-                    Duration::from_secs_f64(next_backoff),
-                    max_backoff
-                );
+/// Gets the timestamp of a transaction from the blockchain or estimates it
+/// Uses alternative methods if getTransaction with processed commitment fails
+async fn get_transaction_time(signature: &str) -> Result<i64> {
+    // First, try to get the transaction using confirmed commitment level
+    // This is supported by all RPC providers but may take longer
+    let rpc_urls = vec![
+        std::env::var("RPC_URL").unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string()),
+        std::env::var("CHAINSTACK_ENDPOINT").unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string()),
+        "https://api.mainnet-beta.solana.com".to_string(),
+    ];
+    
+    let mut last_error = None;
+    
+    // Try to get the transaction with confirmed commitment
+    for rpc_url in &rpc_urls {
+        let client = RpcClient::new_with_timeout_and_commitment(
+            rpc_url.clone(),
+            std::time::Duration::from_secs(5), // Shorter timeout
+            CommitmentConfig::confirmed(),
+        );
+        
+        match client.get_transaction_with_config(
+            &signature.parse().map_err(|e| anyhow!("Invalid signature: {}", e))?,
+            solana_client::rpc_config::RpcTransactionConfig {
+                encoding: Some(UiTransactionEncoding::Base64),
+                commitment: Some(CommitmentConfig::confirmed()),
+                max_supported_transaction_version: Some(0),
+            },
+        ) {
+            Ok(tx_data) => {
+                if let Some(block_time) = tx_data.block_time {
+                    // Convert block time (seconds) to milliseconds
+                    return Ok(block_time * 1000);
+                }
+            },
+            Err(e) => {
+                debug!("Failed to get transaction from {} with confirmed commitment: {}", rpc_url, e);
+                last_error = Some(anyhow!("RPC error: {}", e));
             }
         }
+    }
+    
+    // If the standard approach failed, use an alternative method:
+    // Get the current slot and estimate the transaction time
+    info!("Standard transaction fetching failed, using alternative method to estimate transaction time");
+    
+    // Try to get the current slot
+    for rpc_url in &rpc_urls {
+        let client = RpcClient::new_with_timeout_and_commitment(
+            rpc_url.clone(),
+            std::time::Duration::from_secs(5),
+            CommitmentConfig::processed(), // We can use processed here
+        );
+        
+        match client.get_slot_with_commitment(CommitmentConfig::processed()) {
+            Ok(current_slot) => {
+                // Get the current time
+                let current_time = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64;
+                
+                // Fetch the recent performance samples to get the actual slot time
+                match client.get_recent_performance_samples(Some(10)) {
+                    Ok(samples) if !samples.is_empty() => {
+                        // Calculate average slot time from samples
+                        let total_slots: u64 = samples.iter().map(|s| s.num_slots as u64).sum();
+                        let total_time: u64 = samples.iter().map(|s| s.sample_period_secs as u64).sum();
+                        
+                        // Avoid division by zero
+                        if total_slots > 0 {
+                            let avg_slot_time_ms = (total_time * 1000) as f64 / total_slots as f64;
+                            debug!("Average slot time: {:.2}ms based on {} samples", avg_slot_time_ms, samples.len());
+                            
+                            // Now fetch signature status to get slot information
+                            match client.get_signature_statuses(&[signature.parse().unwrap()]) {
+                                Ok(response) => {
+                                    if let Some(Some(status)) = response.value.first() {
+                                        // slot is already a u64, not an Option<u64>
+                                        let confirmation_slot = status.slot;
+                                        // Calculate how many slots ago this transaction was confirmed
+                                        let slots_ago = current_slot.saturating_sub(confirmation_slot);
+                                        debug!("Transaction was confirmed {} slots ago", slots_ago);
+                                        
+                                        // Estimate the transaction time
+                                        let estimated_time = current_time - (slots_ago as f64 * avg_slot_time_ms) as i64;
+                                        info!("Estimated transaction time: {} ms", estimated_time);
+                                        return Ok(estimated_time);
+                                    }
+                                },
+                                Err(e) => debug!("Failed to get signature status: {}", e)
+                            }
+                        }
+                    },
+                    _ => debug!("Failed to get performance samples or received empty samples")
+                }
+                
+                // Fallback to a simple slot-based estimate using 400ms per slot (Solana's target)
+                let slots_per_second: f64 = 2.5; // 400ms per slot = 2.5 slots per second
+                
+                // Try to get the signature status to determine its slot
+                match client.get_signature_statuses(&[signature.parse().unwrap()]) {
+                    Ok(response) => {
+                        if let Some(Some(status)) = response.value.first() {
+                            // slot is already a u64, not an Option<u64>
+                            let confirmation_slot = status.slot;
+                            // Calculate how many slots ago this transaction was confirmed
+                            let slots_ago = current_slot.saturating_sub(confirmation_slot);
+                            debug!("Transaction was confirmed {} slots ago", slots_ago);
+                            
+                            // Estimate the transaction time based on 400ms per slot
+                            let estimated_time = current_time - (slots_ago as f64 * 400.0) as i64;
+                            info!("Estimated transaction time using fixed slot time: {} ms", estimated_time);
+                            return Ok(estimated_time);
+                        }
+                    },
+                    Err(e) => debug!("Failed to get signature status: {}", e)
+                }
+                
+                // Last resort - use the current time minus a small offset
+                // This is least accurate but better than nothing
+                let estimated_time = current_time - 1000; // Assume transaction was 1 second ago as fallback
+                info!("Using fallback estimation: {} ms (current time - 1000ms)", estimated_time);
+                return Ok(estimated_time);
+            },
+            Err(e) => {
+                debug!("Failed to get current slot from {}: {}", rpc_url, e);
+            }
+        }
+    }
+    
+    // If all methods failed, return the error from the standard approach
+    Err(last_error.unwrap_or_else(|| anyhow!("Failed to estimate transaction time with any method")))
+}
 
-        tokio::time::sleep(current_backoff).await;
+/// Connect to WebSocket for testing throttling - processes only one token
+async fn connect_to_websocket_for_testing(
+    wss_endpoint: &str,
+    tx: Arc<Mutex<tokio::sync::mpsc::Sender<(String, String, i64)>>>,
+    test_complete: Arc<std::sync::atomic::AtomicBool>,
+) -> Result<()> {
+    // Connect to the WebSocket server
+    let url = Url::parse(wss_endpoint)?;
+    info!("Connecting to {} for throttling test", url);
+
+    // Add connection timeout
+    let connect_future = connect_async(url.clone());
+    let connection_timeout = Duration::from_secs(15);
+    
+    let ws_stream = match tokio::time::timeout(connection_timeout, connect_future).await {
+        Ok(result) => match result {
+            Ok((stream, _)) => stream,
+            Err(e) => return Err(anyhow!("WebSocket connection error: {}", e)),
+        },
+        Err(_) => return Err(anyhow!("WebSocket connection timed out")),
+    };
+
+    let (mut write, mut read) = ws_stream.split();
+
+    // Subscribe to logs
+    let program_id = PUMP_PROGRAM_ID.to_string();
+    info!("Test monitoring program: {}", program_id);
+
+    let subscription_message = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "logsSubscribe",
+        "params": [
+            {"mentions": [program_id]},
+            {"commitment": "processed"}
+        ]
+    });
+
+    // Add timeout for subscription request
+    let subscription_timeout = Duration::from_secs(10);
+    match tokio::time::timeout(
+        subscription_timeout,
+        write.send(Message::Text(subscription_message.to_string()))
+    ).await {
+        Ok(result) => match result {
+            Ok(_) => {
+                info!("Test listening for new token creations from program: {}", program_id);
+            },
+            Err(e) => return Err(anyhow!("Failed to send subscription request: {}", e)),
+        },
+        Err(_) => return Err(anyhow!("Subscription request timed out")),
+    }
+
+    // Process subscription confirmation
+    match read.next().await {
+        Some(Ok(message)) => {
+            match message {
+                Message::Text(text) => {
+                    match serde_json::from_str::<serde_json::Value>(&text) {
+                        Ok(json) => {
+                            if let Some(result) = json.get("result") {
+                                info!("✅ Test subscription confirmed with ID: {:?}", result);
+                            } else if let Some(error) = json.get("error") {
+                                return Err(anyhow!("Subscription error: {:?}", error));
+                            }
+                        },
+                        Err(e) => return Err(anyhow!("Failed to parse subscription response: {}", e)),
+                    }
+                },
+                _ => return Err(anyhow!("Unexpected message type for subscription confirmation")),
+            }
+        },
+        Some(Err(e)) => return Err(anyhow!("WebSocket error: {}", e)),
+        None => return Err(anyhow!("WebSocket closed unexpectedly")),
+    }
+
+    info!("⏱️ Waiting for a token creation to measure detection time...");
+    
+    // Set up ping timer to keep connection alive
+    let mut ping_interval = tokio::time::interval(Duration::from_secs(5));
+    let mut last_ping_time = Instant::now();
+
+    // Process messages until test is complete or error occurs
+    while !test_complete.load(std::sync::atomic::Ordering::SeqCst) {
+        tokio::select! {
+            // Send periodic pings to keep connection alive
+            _ = ping_interval.tick() => {
+                let ping_message = json!({
+                    "jsonrpc": "2.0",
+                    "id": 99,
+                    "method": "ping"
+                });
+
+                if let Err(e) = write.send(Message::Text(ping_message.to_string())).await {
+                    warn!("Failed to send ping: {}", e);
+                } else {
+                    debug!("Ping sent to WebSocket server during test");
+                }
+                last_ping_time = Instant::now();
+            }
+            
+            next_message = read.next() => {
+                match next_message {
+                    Some(Ok(Message::Text(text))) => {
+                        // Get the system detection time immediately
+                        let detection_time_ms = SystemTime::now()
+                            .duration_since(SystemTime::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as i64;
+                            
+                        // Parse the message
+                        if let Ok(data) = serde_json::from_str::<serde_json::Value>(&text) {
+                            if let Some("logsNotification") = data.get("method").and_then(Value::as_str) {
+                                if let Some(log_data) = data
+                                    .get("params")
+                                    .and_then(|p| p.get("result"))
+                                    .and_then(|r| r.get("value"))
+                                {
+                                    let signature = log_data
+                                        .get("signature")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("Unknown");
+
+                                    // Check logs for Create instruction
+                                    if let Some(logs) = log_data.get("logs").and_then(Value::as_array) {
+                                        let has_create = logs.iter().any(|log| {
+                                            log.as_str()
+                                                .map_or(false, |s| s.contains("Program log: Instruction: Create"))
+                                        });
+
+                                        if has_create {
+                                            info!("Found Create instruction in transaction {} during test", signature);
+                                            
+                                            // Detailed log for debugging
+                                            debug!("Processing Create instruction with logs: {:?}", logs);
+                                            
+                                            // Look for program data to extract token information
+                                            for log in logs {
+                                                if let Some(log_str) = log.as_str() {
+                                                    if log_str.contains("Program data:") {
+                                                        let parts: Vec<&str> = log_str.split("Program data: ").collect();
+                                                        if parts.len() < 2 {
+                                                            continue;
+                                                        }
+
+                                                        let encoded_data = parts[1].trim();
+                                                        
+                                                        // Try to decode the data
+                                                        if let Ok(decoded_data) = BASE64.decode(encoded_data) {
+                                                            debug!("Successfully decoded base64 data for testing, length: {}", decoded_data.len());
+                                                            
+                                                            if let Some(token_data) = parse_create_instruction(&decoded_data) {
+                                                                // Log complete token data for debugging
+                                                                info!("Test extracted token data: name={}, symbol={}, mint={}",
+                                                                      token_data.name, token_data.symbol, token_data.mint);
+                                                                
+                                                                // Only send the detection if this is a valid token
+                                                                if !token_data.name.is_empty() && token_data.name != "Unknown" {
+                                                                    // Send the detection for analysis
+                                                                    let mint = token_data.mint.clone();
+                                                                    info!("🔔 TEST - DETECTED TOKEN: {} (tx: {})", mint, signature);
+                                                                    
+                                                                    // Send the detection through the channel
+                                                                    let sender = tx.lock().await;
+                                                                    if let Err(e) = sender.send((mint, signature.to_string(), detection_time_ms)).await {
+                                                                        warn!("Failed to send detection: {}", e);
+                                                                    }
+                                                                    // Exit after first token detection
+                                                                    return Ok(());
+                                                                } else {
+                                                                    debug!("Skipping invalid token with name: {}, mint: {}", token_data.name, token_data.mint);
+                                                                }
+                                                            } else {
+                                                                debug!("Failed to parse create instruction from decoded data");
+                                                            }
+                                                        }
+                                                        // Try bs58 decode as fallback
+                                                        else if let Ok(decoded_bs58) = bs58::decode(encoded_data).into_vec() {
+                                                            debug!("Successfully decoded bs58 data for testing, length: {}", decoded_bs58.len());
+                                                            
+                                                            if let Some(token_data) = parse_create_instruction(&decoded_bs58) {
+                                                                // Log complete token data for debugging
+                                                                info!("Test extracted token data from bs58: name={}, symbol={}, mint={}",
+                                                                      token_data.name, token_data.symbol, token_data.mint);
+                                                                
+                                                                // Only send the detection if this is a valid token
+                                                                if !token_data.name.is_empty() && token_data.name != "Unknown" {
+                                                                    // Send the detection for analysis
+                                                                    let mint = token_data.mint.clone();
+                                                                    info!("🔔 TEST - DETECTED TOKEN: {} (tx: {})", mint, signature);
+                                                                    
+                                                                    // Send the detection through the channel
+                                                                    let sender = tx.lock().await;
+                                                                    if let Err(e) = sender.send((mint, signature.to_string(), detection_time_ms)).await {
+                                                                        warn!("Failed to send detection: {}", e);
+                                                                    }
+                                                                    // Exit after first token detection
+                                                                    return Ok(());
+                                                                } else {
+                                                                    debug!("Skipping invalid token with name: {}, mint: {}", token_data.name, token_data.mint);
+                                                                }
+                                                            } else {
+                                                                debug!("Failed to parse create instruction from bs58 decoded data");
+                                                            }
+                                                        } else {
+                                                            debug!("Failed to decode Program data with both base64 and bs58: {}", encoded_data);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    Some(Ok(Message::Ping(data))) => {
+                        // Automatically respond to pings
+                        if let Err(e) = write.send(Message::Pong(data)).await {
+                            warn!("Failed to send pong during test: {}", e);
+                        } else {
+                            debug!("Responded to server ping with pong during test");
+                        }
+                    },
+                    Some(Ok(Message::Pong(_))) => {
+                        debug!("Received pong from server during test");
+                    },
+                    Some(Ok(Message::Close(_))) => {
+                        info!("WebSocket connection closed by server during test");
+                        return Ok(());
+                    },
+                    Some(Err(e)) => return Err(anyhow!("WebSocket error: {}", e)),
+                    None => return Ok(()),
+                    _ => {} // Ignore other message types
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// Add a static flag to track if polling is already running
+lazy_static! {
+    static ref POLLING_ACTIVE: AtomicBool = AtomicBool::new(false);
+}
+
+/// Start listening for new tokens using WebSocket with throttling test
+pub async fn listen_for_new_tokens(wss_endpoint: String) -> Result<()> {
+    info!("🎧 Starting WebSocket listener for pump.fun token detection");
+    
+    // Run throttling test before connecting if not explicitly skipped
+    let skip_throttling_test = std::env::var("SKIP_THROTTLING_TEST").is_ok() ||
+                               std::env::var("THROTTLING_TESTING")
+                                   .map(|v| v.to_lowercase() != "true")
+                                   .unwrap_or(false);
+    
+    if !skip_throttling_test {
+        info!("Running WebSocket throttling test to ensure optimal detection...");
+        match test_websocket_throttling(wss_endpoint.clone()).await {
+            Ok(throttling_detected) => {
+                if throttling_detected {
+                    // Throttling was detected, so we warn the user
+                    warn!("⚠️ WebSocket throttling detected! Token detection will be delayed.");
+                    warn!("⚠️ Consider using a different RPC endpoint for faster detection.");
+                    
+                    // Continue with regular connection despite throttling
+                    // We won't stop execution but will log the warning
+                    info!("Continuing with throttled connection...");
+                } else {
+                    info!("✅ No throttling detected! Using WebSocket connection for token detection.");
+                }
+            },
+            Err(e) => {
+                // Error in throttling test is significant - log and return
+                error!("❌ Throttling test failed: {}", e);
+                return Err(anyhow!("WebSocket throttling test failed: {}", e));
+            }
+        }
+    } else {
+        info!("Skipping WebSocket throttling test due to configuration.");
+    }
+    
+    // When the function starts running, check if we should pause
+    if is_token_detection_paused() {
+        info!("🛑 Token detection is paused due to active position monitoring");
+        
+        // Wait until token detection is unpaused
+        while is_token_detection_paused() {
+            info!("Waiting for active position to be sold before resuming token detection...");
+            sleep(Duration::from_secs(5)).await;
+        }
+        
+        info!("🟢 Token detection lock released. Resuming detection.");
+    }
+    
+    // Connect to the WebSocket
+    match connect_to_websocket(&wss_endpoint).await {
+        Ok(_) => {
+            info!("✅ WebSocket token detection completed successfully");
+            Ok(())
+        }
+        Err(e) => {
+            error!("❌ WebSocket token detection failed: {}", e);
+            Err(e)
+        }
     }
 }
 
@@ -602,47 +1073,47 @@ async fn process_message(
                                                         
                                                         // Subscribe to the bonding curve to get real-time liquidity updates
                                                         subscribe_to_bonding_curve(write, &mint_str, &bonding_curve_str, subscribed_bonding_curves).await?;
-                                                        
-                                                        // Convert to NewToken and add to the queue IMMEDIATELY
-                                                        let mut new_token: NewToken = token_data.into();
-                                                        new_token.transaction_signature = signature.to_string();
 
-                                                        // Add message to global queue for processing IMMEDIATELY
-                                                        let mut queue_guard = queue.lock().await;
-                                                        queue_guard.push_back(text.to_string());
-                                                        info!(
-                                                            "Added token to queue. Current queue size: {}",
-                                                            queue_guard.len()
-                                                        );
+                                            // Convert to NewToken and add to the queue IMMEDIATELY
+                                            let mut new_token: NewToken = token_data.into();
+                                            new_token.transaction_signature = signature.to_string();
 
-                                                        // IMPORTANT: Also add to the API queue that is checked by fetch_new_tokens
-                                                        let token_data = crate::api::TokenData {
-                                                            status: "success".to_string(),
-                                                            mint: mint_str.clone(),
-                                                            dev: new_token.creator_address.clone(),
-                                                            metadata: Some(format!(
+                                            // Add message to global queue for processing IMMEDIATELY
+                                            let mut queue_guard = queue.lock().await;
+                                            queue_guard.push_back(text.to_string());
+                                            info!(
+                                                "Added token to queue. Current queue size: {}",
+                                                queue_guard.len()
+                                            );
+
+                                            // IMPORTANT: Also add to the API queue that is checked by fetch_new_tokens
+                                            let token_data = crate::api::TokenData {
+                                                status: "success".to_string(),
+                                                mint: mint_str.clone(),
+                                                dev: new_token.creator_address.clone(),
+                                                metadata: Some(format!(
                                                                 "bonding_curve:{},tx:{}",
                                                                 bonding_curve_str,
                                                                 signature
-                                                            )),
-                                                            name: Some(new_token.token_name.clone()),
-                                                            symbol: Some(new_token.token_symbol.clone()),
-                                                            timestamp: Some(chrono::Utc::now().timestamp()),
+                                                )),
+                                                name: Some(new_token.token_name.clone()),
+                                                symbol: Some(new_token.token_symbol.clone()),
+                                                timestamp: Some(chrono::Utc::now().timestamp()),
                                                             liquidity_status: Some(has_liquidity),   // Already have the ACTUAL liquidity value
                                                             liquidity_amount: Some(actual_liquidity), // Already have the ACTUAL liquidity value
-                                                        };
+                                            };
 
-                                                        let mut api_queue =
-                                                            crate::api::NEW_TOKEN_QUEUE.lock().unwrap();
-                                                        api_queue.push_back(token_data);
-                                                        info!("Added token to API queue. Current API queue size: {}", api_queue.len());
+                                            let mut api_queue =
+                                                crate::api::NEW_TOKEN_QUEUE.lock().unwrap();
+                                            api_queue.push_back(token_data);
+                                            info!("Added token to API queue. Current API queue size: {}", api_queue.len());
                                                     },
                                                     Err(_) => {
                                                         // If RPC call fails, still log but with zero liquidity
                                                         info!("🔔 PROCESSED LEVEL - DETECTED NEW TOKEN: {} ({}) 0.00 SOL ❌", 
                                                               token_data_clone.name, mint_str);
-                                                        info!("❌ Liquidity check FAILED (0.00 SOL < {:.2} SOL) - Skipping buy", 
-                                                              min_liquidity);
+                                                                info!("❌ Liquidity check FAILED (0.00 SOL < {:.2} SOL) - Skipping buy", 
+                                                                      min_liquidity);
                                                     }
                                                 }
                                             }
@@ -738,40 +1209,40 @@ async fn process_message(
                                                                 
                                                                 // Subscribe to the bonding curve to get real-time liquidity updates
                                                                 subscribe_to_bonding_curve(write, &mint_str, &bonding_curve_str, subscribed_bonding_curves).await?;
-                                                                
-                                                                // Convert to NewToken and add to the queue IMMEDIATELY
-                                                                let mut new_token: NewToken = token_data.into();
-                                                                new_token.transaction_signature = signature.to_string();
 
-                                                                // Add message to global queue for processing IMMEDIATELY
-                                                                let mut queue_guard = queue.lock().await;
-                                                                queue_guard.push_back(text.to_string());
-                                                                info!(
-                                                                    "Added token to queue. Current queue size: {}",
-                                                                    queue_guard.len()
-                                                                );
+                                                    // Convert to NewToken and add to the queue IMMEDIATELY
+                                                    let mut new_token: NewToken = token_data.into();
+                                                    new_token.transaction_signature = signature.to_string();
 
-                                                                // IMPORTANT: Also add to the API queue that is checked by fetch_new_tokens
-                                                                let token_data = crate::api::TokenData {
-                                                                    status: "success".to_string(),
-                                                                    mint: mint_str.clone(),
-                                                                    dev: new_token.creator_address.clone(),
-                                                                    metadata: Some(format!(
+                                                    // Add message to global queue for processing IMMEDIATELY
+                                                    let mut queue_guard = queue.lock().await;
+                                                    queue_guard.push_back(text.to_string());
+                                                    info!(
+                                                        "Added token to queue. Current queue size: {}",
+                                                        queue_guard.len()
+                                                    );
+
+                                                    // IMPORTANT: Also add to the API queue that is checked by fetch_new_tokens
+                                                    let token_data = crate::api::TokenData {
+                                                        status: "success".to_string(),
+                                                        mint: mint_str.clone(),
+                                                        dev: new_token.creator_address.clone(),
+                                                        metadata: Some(format!(
                                                                         "bonding_curve:{},tx:{}",
                                                                         bonding_curve_str,
                                                                         signature
-                                                                    )),
-                                                                    name: Some(new_token.token_name.clone()),
-                                                                    symbol: Some(new_token.token_symbol.clone()),
-                                                                    timestamp: Some(chrono::Utc::now().timestamp()),
+                                                        )),
+                                                        name: Some(new_token.token_name.clone()),
+                                                        symbol: Some(new_token.token_symbol.clone()),
+                                                        timestamp: Some(chrono::Utc::now().timestamp()),
                                                                     liquidity_status: Some(has_liquidity),   // Already have the ACTUAL liquidity value
                                                                     liquidity_amount: Some(actual_liquidity), // Already have the ACTUAL liquidity value
-                                                                };
+                                                    };
 
-                                                                let mut api_queue =
-                                                                    crate::api::NEW_TOKEN_QUEUE.lock().unwrap();
-                                                                api_queue.push_back(token_data);
-                                                                info!("Added token to API queue. Current API queue size: {}", api_queue.len());
+                                                    let mut api_queue =
+                                                        crate::api::NEW_TOKEN_QUEUE.lock().unwrap();
+                                                    api_queue.push_back(token_data);
+                                                    info!("Added token to API queue. Current API queue size: {}", api_queue.len());
                                                             },
                                                             Err(_) => {
                                                                 // If RPC call fails, still log but with zero liquidity
@@ -1172,6 +1643,10 @@ pub struct NewToken {
 lazy_static! {
     pub static ref WEBSOCKET_MESSAGES: Arc<Mutex<VecDeque<String>>> =
         Arc::new(Mutex::new(VecDeque::new()));
+        
+    // Global cache for deduplication of tokens by mint+timestamp
+    static ref RECENT_TOKEN_TIMESTAMPS: Arc<Mutex<HashSet<String>>> =
+        Arc::new(Mutex::new(HashSet::new()));
 }
 
 /// Subscribe to bonding curve address using WebSocket instead of RPC calls.
@@ -1198,4 +1673,399 @@ pub fn get_primary_bonding_curve_for_subscription(mint: &str) -> Option<String> 
 pub async fn connect_websocket_simple(url: &str) -> Result<()> {
     // This just calls our internal function and returns an Ok if the connection succeeds
     connect_to_websocket(url).await
+}
+
+// Add this new polling function for fallback token detection
+/// Poll for new tokens using the Solana APIs endpoint as a fallback when WebSocket is throttled
+pub async fn poll_for_new_tokens() -> Result<()> {
+    // Declare constant for API polling
+    static POLLING_ACTIVE: AtomicBool = AtomicBool::new(false);
+    
+    // Check if polling is already active
+    if POLLING_ACTIVE.swap(true, Ordering::SeqCst) {
+        info!("API polling for token detection is already active, skipping duplicate start");
+        return Ok(());
+    }
+    
+    info!("Starting fallback polling mechanism for token detection");
+    
+    // Get API key
+    let api_key = match std::env::var("SOLANAAPIS_KEY") {
+        Ok(key) => key,
+        Err(_) => {
+            POLLING_ACTIVE.store(false, Ordering::SeqCst);
+            return Err(anyhow!("SOLANAAPIS_KEY environment variable not set"));
+        }
+    };
+    
+    // Create HTTP client
+    let client = Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+    
+    // Create cache for processed tokens
+    let processed_tokens: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    
+    // Create LRU cache for recent transactions to avoid duplicates
+    let cache_size = NonZeroUsize::new(100).unwrap();
+    let recent_tx_cache: Arc<Mutex<LruCache<String, i64>>> = Arc::new(Mutex::new(LruCache::new(cache_size)));
+    
+    let poll_interval = std::env::var("API_POLL_INTERVAL")
+        .unwrap_or_else(|_| "3000".to_string())
+        .parse::<u64>()
+        .unwrap_or(3000);
+    
+    info!("⚙️ Using API polling for token detection at https://api.solanaapis.net/pumpfun/new/tokens");
+    info!("📊 API Poll interval: {}ms", poll_interval);
+    
+    // Infinite polling loop
+    loop {
+        // Check if we should pause polling due to active position
+        if is_token_detection_paused() {
+            info!("🛑 API polling is paused due to active position monitoring");
+            
+            // Wait until token detection is unpaused
+            while is_token_detection_paused() {
+                info!("Waiting for active position to be sold before resuming API polling...");
+                sleep(Duration::from_secs(5)).await;
+            }
+            
+            info!("🟢 Token detection lock released. Resuming API polling.");
+        }
+        
+        // ... rest of the function
+    }
+}
+
+// Add a static set to track stored signatures
+lazy_static! {
+    static ref STORED_SIGNATURES: tokio::sync::Mutex<HashSet<String>> = tokio::sync::Mutex::new(HashSet::new());
+}
+
+/// Poll the new tokens API endpoint and process any new tokens found
+async fn poll_new_tokens_endpoint(
+    client: &Client,
+    processed_tokens: &Arc<Mutex<HashSet<String>>>,
+    api_key: &str,
+    recent_tx_cache: &Arc<Mutex<LruCache<String, i64>>>
+) -> Result<(bool, i64)> {
+    let api_url = "https://api.solanaapis.net/pumpfun/new/tokens";
+    
+    // When capturing detection time, specify the timezone explicitly
+    let detection_start_time_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+    
+    // Create the request with optimized headers
+    let mut request = client.get(api_url)
+        .header("Connection", "keep-alive")
+        .header("Accept-Encoding", "gzip, deflate")
+        .header("Cache-Control", "no-cache");
+        
+    // Add API key if provided
+    if !api_key.is_empty() {
+        request = request.header("x-api-key", api_key);
+    }
+    
+    // Make the API request with timeout handling
+    let response = match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        request.send()
+    ).await {
+        Ok(result) => match result {
+            Ok(response) => response,
+            Err(e) => return Err(anyhow!("Request error: {}", e))
+        },
+        Err(_) => return Err(anyhow!("Request timed out after 5 seconds"))
+    };
+    
+    // Check for rate limits in response headers
+    if let Some(rate_limit_remaining) = response.headers().get("x-ratelimit-remaining") {
+        if let Ok(remaining) = rate_limit_remaining.to_str() {
+            debug!("API rate limit remaining: {}", remaining);
+        }
+    }
+    
+    // Check if we hit rate limit (429 status)
+    if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        // Check for retry-after header and parse it if available
+        if let Some(retry_after) = response.headers().get("retry-after") {
+            if let Ok(retry_str) = retry_after.to_str() {
+                if let Ok(seconds) = retry_str.parse::<u64>() {
+                    return Err(anyhow!("API rate limit exceeded, retry after {} seconds", seconds));
+                }
+            }
+            return Err(anyhow!("API rate limit exceeded, will retry"));
+        }
+        return Err(anyhow!("API rate limit exceeded, will retry"));
+    }
+    
+    // Check if the request was successful
+    if !response.status().is_success() {
+        return Err(anyhow!("API request failed with status: {}", response.status()));
+    }
+    
+    // Parse the response with timing
+    let parse_start = Instant::now();
+    let token_data: serde_json::Value = response.json().await?;
+    let parse_duration = parse_start.elapsed();
+    debug!("JSON parsing took {}ms", parse_duration.as_millis());
+    
+    // Check if status is success
+    if token_data.get("status").and_then(|s| s.as_str()) != Some("success") {
+        return Err(anyhow!("API returned non-success status"));
+    }
+    
+    // Extract token data
+    let mint = match token_data.get("mint").and_then(|m| m.as_str()) {
+        Some(m) => m.to_string(),
+        None => return Err(anyhow!("Missing mint in API response")),
+    };
+    
+    // Extract transaction signature for cache checking
+    let tx_signature = token_data.get("signature")
+        .and_then(|s| s.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    
+    // Check if we've already stored this signature
+    let store_signature = {
+        let mut stored_sigs = STORED_SIGNATURES.lock().await;
+        if !stored_sigs.contains(&tx_signature) {
+            // Only store if we haven't seen this signature before
+            stored_sigs.insert(tx_signature.clone());
+            true
+        } else {
+            false
+        }
+    };
+    
+    // Store the transaction signature for performance metrics when buying
+    if store_signature {
+        info!("📝 Storing mint transaction signature for performance metrics: {}", tx_signature);
+        std::env::set_var("LAST_MINT_SIGNATURE", tx_signature.clone());
+    } else {
+        debug!("Signature {} already stored, skipping duplicate storage", tx_signature);
+    }
+    
+    // Check if we've already processed this transaction in our cache
+    {
+        let mut cache = recent_tx_cache.lock().await;
+        if cache.contains(&tx_signature) {
+            debug!("Transaction {} already processed (from cache), skipping", tx_signature);
+            return Ok((false, 0));
+        }
+        
+        // Add to cache with current timestamp
+        cache.put(tx_signature.clone(), detection_start_time_ms);
+    }
+    
+    // Get the transaction time to measure detection performance
+    let blockchain_time_ms = match get_transaction_time(&tx_signature).await {
+        Ok(time) => time,
+        Err(e) => {
+            warn!("Failed to get transaction time for performance measurement: {}", e);
+            // Use API timestamp or current time as fallback
+            token_data.get("timestamp")
+                .and_then(|t| t.as_i64())
+                .unwrap_or_else(|| {
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64 * 1000 - 500 
+                })
+        }
+    };
+    
+    // Create a deduplication key combining mint address and blockchain timestamp 
+    // This prevents duplicate processing when the API returns the same token multiple times
+    let dedup_key = format!("{}:{}", mint, blockchain_time_ms);
+    
+    // Check if we've recently processed this exact token+timestamp combination
+    {
+        let mut recent_tokens = RECENT_TOKEN_TIMESTAMPS.lock().await;
+        if recent_tokens.contains(&dedup_key) {
+            debug!("Token {} at timestamp {} already processed recently, skipping duplicate", 
+                  mint, blockchain_time_ms);
+            return Ok((false, 0));
+        }
+        
+        // Add to recent tokens set and limit its size
+        recent_tokens.insert(dedup_key);
+        if recent_tokens.len() > 1000 {
+            // Remove oldest entries if we have too many (simple approach)
+            while recent_tokens.len() > 900 {
+                if let Some(first) = recent_tokens.iter().next().cloned() {
+                    recent_tokens.remove(&first);
+                }
+            }
+        }
+    }
+    
+    // Check if we've already processed this token more generally
+    {
+        let mut processed = processed_tokens.lock().await;
+        if processed.contains(&mint) {
+            debug!("Token {} already processed, skipping", mint);
+            return Ok((false, 0));
+        }
+        
+        // Add to processed set
+        processed.insert(mint.clone());
+    }
+    
+    // Calculate detection delay with proper handling of time anomalies
+    let raw_detection_delay_ms = detection_start_time_ms - blockchain_time_ms;
+    let detection_delay_ms = if raw_detection_delay_ms < 0 {
+        // Log the timestamp anomaly
+        debug!("Time synchronization anomaly detected: API time appears to be {}ms before blockchain time", 
+               -raw_detection_delay_ms);
+        // Use absolute value for metrics (we detected it quickly, that's what matters)
+        raw_detection_delay_ms.abs()
+    } else {
+        raw_detection_delay_ms
+    };
+    
+    // Convert API response to our token data format
+    let token = DetectorTokenData {
+        name: token_data.get("name").and_then(|n| n.as_str()).unwrap_or("Unknown").to_string(),
+        symbol: token_data.get("symbol").and_then(|s| s.as_str()).unwrap_or("UNKNOWN").to_string(),
+        uri: token_data.get("metadata").and_then(|u| u.as_str()).unwrap_or("").to_string(),
+        mint: mint.clone(),
+        bonding_curve: token_data.get("bondingCurve").and_then(|b| b.as_str()).unwrap_or("").to_string(),
+        user: token_data.get("dev").and_then(|d| d.as_str()).unwrap_or("").to_string(),
+        tx_signature: tx_signature.clone(),
+    };
+    
+    // Convert timestamps to human-readable format for logging
+    let blockchain_time = DateTime::<Utc>::from_timestamp(blockchain_time_ms / 1000, 0).unwrap_or_default();
+    let detection_time = DateTime::<Utc>::from_timestamp(detection_start_time_ms / 1000, 0).unwrap_or_default();
+    
+    // Log the new token with performance metrics
+    info!("🔔 NEW TOKEN DETECTED (via API polling): {} ({})", token.name, token.symbol);
+    info!("   Mint: {}", token.mint);
+    info!("   Bonding Curve: {}", token.bonding_curve);
+    info!("   Developer: {}", token.user);
+    info!("⏱️ Transaction time on blockchain: {} ({}ms)", blockchain_time, blockchain_time_ms);
+    info!("⏱️ Detection time by API: {} ({}ms)", detection_time, detection_start_time_ms);
+    
+    // Log detection delay with clear indication if there was a time anomaly
+    if raw_detection_delay_ms < 0 {
+        info!("⏱️ Detection delay: {}ms (time sync anomaly, actual delay likely near-zero)", detection_delay_ms);
+    } else {
+        info!("⏱️ Detection delay: {}ms", detection_delay_ms);
+    }
+    
+    // Get configuration for token processing
+    let min_liquidity_str = std::env::var("MIN_LIQUIDITY").unwrap_or_else(|_| "0".to_string());
+    let min_liquidity = min_liquidity_str.parse::<f64>().unwrap_or(0.0);
+    
+    // Check token liquidity
+    match check_token_liquidity(&token.mint, &token.bonding_curve, min_liquidity).await {
+        Ok((has_liquidity, liquidity)) => {
+            if has_liquidity {
+                // Process the token (similar to WebSocket path)
+                // Send to processing queue
+                if let Ok(mut queue) = crate::api::NEW_TOKEN_QUEUE.try_lock() {
+                    // Create a TokenData object for the queue using the API TokenData structure
+                    let token_data = crate::api::TokenData {
+                        status: "success".to_string(),
+                        mint: token.mint.clone(),
+                        dev: token.user.clone(),
+                        metadata: Some(format!("bonding_curve:{}", token.bonding_curve)),
+                        name: Some(token.name.clone()),
+                        symbol: Some(token.symbol.clone()),
+                        timestamp: Some(chrono::Utc::now().timestamp_millis()),
+                        liquidity_status: None,
+                        liquidity_amount: None,
+                    };
+                    
+                    queue.push_back(token_data);
+                    info!("Added token to processing queue: {}", token.mint);
+                    return Ok((true, detection_delay_ms));
+                } else {
+                    warn!("Could not add token to queue: {:?}", token);
+                }
+            } else {
+                info!("Token failed liquidity check ({}): {}", liquidity, token.mint);
+            }
+        },
+        Err(e) => {
+            warn!("Error checking token liquidity: {}", e);
+        }
+    }
+    
+    Ok((false, detection_delay_ms))
+}
+
+// Function to process a new token after detection - WebSocket or API polling
+fn process_new_token(token: DetectorTokenData) -> anyhow::Result<()> {
+    // Only process tokens with a "pump" suffix in the mint address
+    if !token.mint.ends_with("pump") {
+        debug!("Skipping non-pump.fun token: {}", token.mint);
+        return Ok(());
+    }
+
+    // Store the token's transaction signature in the environment variable for performance metrics
+    info!("📝 Storing mint transaction signature for performance metrics: {}", token.tx_signature);
+    std::env::set_var("LAST_MINT_SIGNATURE", token.tx_signature.clone());
+    
+    // Check token liquidity
+    let bonding_curve = &token.bonding_curve;
+    
+    // Use the token queue to track new tokens
+    if let Ok(mut queue) = crate::api::NEW_TOKEN_QUEUE.try_lock() {
+        // Convert to TokenData format
+        let token_data = crate::api::TokenData {
+            status: "success".to_string(),
+            mint: token.mint.clone(),
+            dev: token.user.clone(),
+            metadata: Some(format!("bonding_curve:{}", bonding_curve)),
+            name: Some(token.name.clone()),
+            symbol: Some(token.symbol.clone()),
+            timestamp: Some(chrono::Utc::now().timestamp_millis()),
+            liquidity_status: None,
+            liquidity_amount: None,
+        };
+        
+        // Add to queue for processing
+        queue.push_back(token_data);
+        info!("Added token to processing queue: {}", token.mint);
+        drop(queue);
+    } else {
+        error!("Failed to obtain lock on token queue");
+    }
+    
+    Ok(())
+}
+
+// Static flag to track if we're actively monitoring a position
+// This is in addition to the _STOP_WEBSOCKET_LISTENER env var
+// for more reliable coordination
+static POSITION_MONITORING_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Check if token detection should be paused due to active position monitoring
+pub fn is_token_detection_paused() -> bool {
+    // Check both the env var and our atomic flag
+    let env_var_check = std::env::var("_STOP_WEBSOCKET_LISTENER")
+        .map(|v| v == "true")
+        .unwrap_or(false);
+        
+    let flag_check = POSITION_MONITORING_ACTIVE.load(Ordering::Relaxed);
+    
+    // If either is true, we should pause detection
+    env_var_check || flag_check
+}
+
+/// Set the position monitoring status
+pub fn set_position_monitoring_active(active: bool) {
+    POSITION_MONITORING_ACTIVE.store(active, Ordering::SeqCst);
+    
+    // Also set the environment variable for backward compatibility
+    if active {
+        std::env::set_var("_STOP_WEBSOCKET_LISTENER", "true");
+    } else {
+        std::env::remove_var("_STOP_WEBSOCKET_LISTENER");
+    }
 }

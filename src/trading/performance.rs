@@ -6,19 +6,30 @@ use solana_sdk::{commitment_config::CommitmentConfig, signature::Signature};
 use std::str::FromStr;
 use solana_client::rpc_config::RpcTransactionConfig;
 use solana_transaction_status::UiTransactionEncoding;
-use log::{warn, debug};
+use log::{warn, debug, info};
 
 /// Asynchronously fetches the block information for a given transaction signature.
 /// Returns a tuple: (slot, block_time) where block_time is in seconds.
 /// Returns an error if the transaction failed or doesn't exist.
 pub async fn get_transaction_block_info(signature: &str) -> Result<(u64, i64)> {
-    // Get the RPC URL from config. Assumes a function in config exists.
-    let rpc_url = "https://api.mainnet-beta.solana.com".to_string();
-    // For performance metrics, we use confirmed commitment for faster but still reliable results
-    let client = RpcClient::new_with_commitment(
-        rpc_url, 
-        CommitmentConfig::confirmed()
-    );
+    // Get the RPC URL from config, defaulting to mainnet
+    let rpc_url = std::env::var("RPC_URL")
+        .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
+    
+    // Get the commitment level from environment, defaulting to processed for faster results
+    let commitment_str = std::env::var("COMMITMENT_LEVEL")
+        .unwrap_or_else(|_| "processed".to_string());
+    
+    let commitment = match commitment_str.to_lowercase().as_str() {
+        "processed" => CommitmentConfig::processed(),
+        "confirmed" => CommitmentConfig::confirmed(),
+        "finalized" => CommitmentConfig::finalized(),
+        _ => CommitmentConfig::processed(), // Default to processed if unrecognized
+    };
+    
+    info!("Using {} commitment for performance metrics", commitment_str);
+    
+    let client = RpcClient::new_with_commitment(rpc_url, commitment);
 
     let sig = Signature::from_str(signature)
         .map_err(|e| anyhow!("Invalid signature '{}': {}", signature, e))?;
@@ -26,13 +37,13 @@ pub async fn get_transaction_block_info(signature: &str) -> Result<(u64, i64)> {
     // Configure transaction retrieval to get both slot and block time
     let config = RpcTransactionConfig {
         encoding: Some(UiTransactionEncoding::Base64),
-        commitment: Some(CommitmentConfig::confirmed()),
+        commitment: Some(commitment),
         max_supported_transaction_version: Some(0),
     };
 
     // Implement retry logic with exponential backoff
     let mut retry_count = 0;
-    let max_retries = 10;
+    let max_retries = 15; // Increased from 10 to 15
     let mut backoff_ms = 500; // Start with 500ms
 
     loop {
@@ -71,8 +82,8 @@ pub async fn get_transaction_block_info(signature: &str) -> Result<(u64, i64)> {
                 // Wait with exponential backoff
                 tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                 
-                // Increase backoff for next retry (exponential with a max of 10 seconds)
-                backoff_ms = std::cmp::min(backoff_ms * 2, 10000);
+                // Increase backoff for next retry (exponential with a max of 15 seconds)
+                backoff_ms = std::cmp::min(backoff_ms * 2, 15000); // Increased from 10s to 15s
             }
         }
     }

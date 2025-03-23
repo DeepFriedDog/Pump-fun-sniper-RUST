@@ -11,7 +11,7 @@ use reqwest::Client;
 use serde_json::{json, Value};
 use solana_sdk::{
     compute_budget::ComputeBudgetInstruction,
-    instruction::Instruction,
+    instruction::{Instruction, AccountMeta},
     message::Message,
     pubkey::Pubkey,
     signature::{Keypair, Signature},
@@ -30,6 +30,9 @@ use serde_json;
 use uuid::Uuid;
 use std::env;
 use bs58 as base58;
+use crate::create_buy_instruction::derive_associated_pump_curve;
+use spl_associated_token_account::{get_associated_token_address, instruction::create_associated_token_account_idempotent};
+use crate::create_buy_instruction::create_buy_instruction;
 
 // Re-export from mod.rs
 use super::{CACHED_BLOCKHASH, HTTP_CLIENT, PUMP_PROGRAM_ID};
@@ -101,10 +104,10 @@ pub async fn buy_token(
     amount: f64,
     slippage: f64,
 ) -> Result<ApiResponse, anyhow::Error> {
-    info!("🔄 Buying {} SOL of token {} with slippage {}%", amount, mint, slippage * 100.0);
+    info!("🔄 Buying tokens worth {} SOL for {} with slippage {}%", amount, mint, slippage);
     
-    // Increase priority fee to 5,000,000 microlamports (0.005 SOL) for better transaction placement
-    let priority_fee = 5_000_000; // Increased from 2,000,000 to 5,000,000
+    // Increase priority fee to 10,000,000 microlamports (0.01 SOL) for better transaction placement
+    let priority_fee = 10_000_000; // Increased from 5,000,000 to 10,000,000
     info!("🔶 Using priority fee: {} microlamports ({:.3} SOL)", priority_fee, priority_fee as f64 / LAMPORTS_PER_SOL as f64);
     
     // Get trader node URL
@@ -118,7 +121,7 @@ pub async fn buy_token(
     verify_trader_node_connection(&client_arc).await?;
     
     // Use HTTP-based transaction for Warp transactions (required by Chainstack)
-    info!("📡 Using HTTP-based transaction for best Warp transaction compatibility");
+    info!("📡 Using HTTP-based transaction with Warp optimizations for ultra-fast execution");
     
     // Parse the mint to a pubkey
     let mint_pubkey = Pubkey::from_str(mint)
@@ -128,78 +131,124 @@ pub async fn buy_token(
         })?;
     info!("✅ Successfully parsed mint pubkey: {}", mint_pubkey);
     
-    // Create instructions for the buy transaction
+    // Create the buy instructions
     info!("🧮 Creating buy instructions for mint: {}", mint);
     
-    // Parse mint and user pubkeys
-    let mint_pubkey = Pubkey::from_str(mint)?;
-    let private_key_bytes = base58::decode(private_key)
-        .into_vec()
-        .map_err(|e| anyhow!("Invalid private key: {}", e))?;
-    let keypair = Keypair::from_bytes(&private_key_bytes)
-        .map_err(|e| anyhow!("Invalid keypair: {}", e))?;
+    let bonding_curve = get_bonding_curve_from_api(mint).await?;
+    info!("✅ Found bonding curve from API: {}", bonding_curve);
+    
+    // Create the buy instruction with setup instructions
+    let keypair = decode_keypair(private_key).map_err(|e| anyhow::anyhow!("Failed to decode keypair: {}", e))?;
     let user_pubkey = keypair.pubkey();
     
-    // Get bonding curve from API
-    // Fallback to API if needed
-    let bonding_curve = match crate::api::get_bonding_curve_for_mint(mint).await {
-        Some(bonding_curve) => {
-            info!("✅ Found bonding curve from API: {}", bonding_curve);
-            bonding_curve
-        },
-        None => {
-            error!("❌ Failed to get bonding curve");
-            return Err(anyhow!("Failed to find bonding curve for mint {}", mint));
+    // Check if the associated bonding curve account exists
+    let associated_bonding_curve = derive_associated_pump_curve(
+        &Pubkey::from_str(mint)?,
+        &Pubkey::from_str(&bonding_curve)?
+    );
+    info!("🔍 Checking if associated bonding curve account exists: {}", associated_bonding_curve);
+    
+    let account_exists = match check_account_exists(&trader_node_url, &associated_bonding_curve.to_string()).await {
+        Ok(exists) => exists,
+        Err(e) => {
+            warn!("⚠️ Failed to check if associated bonding curve account exists: {}", e);
+            false
         }
     };
-
-    // Check if the associated bonding curve account exists
-    let account_exists = check_associated_bonding_curve(&client_arc, mint, &bonding_curve).await?;
     
-    if !account_exists {
-        warn!("⚠️ Associated bonding curve account does not exist. Transaction will likely fail.");
-        // We could attempt to create the account here, but that would require a separate transaction
-        // For now, we'll just warn and proceed
-    }
+    // Create the user's token account if it doesn't exist
+    let user_token_account = get_associated_token_address(&user_pubkey, &Pubkey::from_str(mint)?);
+    info!("📝 User's token account: {}", user_token_account);
     
-    // Create instruction to create the user's associated token account
-    let create_ata_ix = spl_associated_token_account::instruction::create_associated_token_account_idempotent(
-        &user_pubkey,       // Payer
-        &user_pubkey,       // Wallet address 
-        &mint_pubkey,       // Mint address
-        &spl_token::id(),   // Token program ID
-    );
-    
-    info!("📝 Created instruction to initialize the user's associated token account");
-
-    // Create buy instruction after creating the ATA
-    let buy_ix = crate::create_buy_instruction::create_buy_instruction(
-        &user_pubkey,  // user
-        mint,          // mint as &str
-        &bonding_curve, // bonding_curve as &str
-        amount,        // amount as f64
-        slippage,      // slippage as f64
+    // Get the buy instruction
+    let (buy_instruction, _) = create_buy_instruction(
+        &user_pubkey,
+        mint,
+        &bonding_curve,
+        amount,
+        slippage
     )?;
     
-    info!("✅ Created buy instruction successfully");
+    // Create a vector for all our instructions
+    let mut instructions = Vec::new();
     
-    // Create the compute budget instructions
-    use solana_sdk::compute_budget::ComputeBudgetInstruction;
+    // If the associated bonding curve doesn't exist, we need to create it first
+    if !account_exists {
+        warn!("⚠️ Associated bonding curve account does not exist. Creating it now.");
+        
+        // Use the correct method to create the associated bonding curve account
+        // Based on verified sources, we need to:
+        // 1. Use the ASSOCIATED_TOKEN_PROGRAM_ID
+        // 2. Use the proper seeds for the PDA
+        
+        // The pump.fun program ID
+        let pump_program_id = Pubkey::from_str("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")?;
+        
+        // Get the mint and bonding curve pubkeys
+        let mint_pubkey = Pubkey::from_str(mint)?;
+        let bonding_curve_pubkey = Pubkey::from_str(&bonding_curve)?;
+        
+        // The token program ID
+        let token_program_id = spl_token::id();
+        
+        // The associated token program ID
+        let associated_token_program_id = spl_associated_token_account::id();
+        
+        // Create the initialization instruction for the associated bonding curve account
+        // Using the standard create_associated_token_account instruction
+        // This matches the Python implementation:
+        // derived_address, _ = Pubkey.find_program_address(
+        //    [bytes(bonding_curve), bytes(TOKEN_PROGRAM_ID), bytes(mint)],
+        //    ATA_PROGRAM_ID)
+        let init_associated_curve_ix = spl_associated_token_account::instruction::create_associated_token_account(
+            &user_pubkey,              // Funding account (payer)
+            &bonding_curve_pubkey,     // Wallet address (the bonding curve is the wallet)
+            &mint_pubkey,              // Mint address
+            &token_program_id          // Owner program (important: token program, NOT pump program)
+        );
+        
+        // Add this instruction first
+        instructions.push(init_associated_curve_ix);
+        
+        // Also create the user's token account if it doesn't exist
+        let create_user_ata_ix = spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+            &user_pubkey,              // Funding account (payer)
+            &user_pubkey,              // Wallet address (user)
+            &mint_pubkey,              // Mint address
+            &token_program_id          // Owner program (token program for regular ATAs)
+        );
+        
+        // Add user's token account creation instruction
+        instructions.push(create_user_ata_ix);
+        
+        info!("✅ Added instruction to initialize the associated bonding curve account");
+    }
     
-    // Set compute unit price instruction (priority fee)
-    let compute_price_ix = ComputeBudgetInstruction::set_compute_unit_price(priority_fee);
+    // Always create the token account idempotently (does nothing if it already exists)
+    let create_ata_ix = create_associated_token_account_idempotent(
+        &user_pubkey,             // Funding address (also the payer)
+        &user_pubkey,             // Wallet address
+        &Pubkey::from_str(mint)?, // Mint address
+        &spl_token::id(),         // Token program ID
+    );
     
-    // Set compute unit limit instruction (default is 200,000)
-    let compute_limit_ix = ComputeBudgetInstruction::set_compute_unit_limit(250_000); // Increased from 200,000
+    instructions.push(create_ata_ix);
+    
+    // Add the compute budget instructions
+    let compute_budget_ix = ComputeBudgetInstruction::set_compute_unit_limit(300_000);
+    let priority_fee_ix = ComputeBudgetInstruction::set_compute_unit_price(priority_fee);
+    
+    instructions.push(compute_budget_ix);
+    instructions.push(priority_fee_ix);
+    
+    // Add the buy instruction
+    instructions.push(buy_instruction.clone());
+    
+    info!("✅ Created buy instruction with {} accounts", buy_instruction.accounts.len());
     
     // Create a new transaction with all instructions in the correct order
     let mut transaction = Transaction::new_with_payer(
-        &[
-            compute_price_ix,
-            compute_limit_ix,
-            create_ata_ix,  // Create ATA before buying
-            buy_ix
-        ], 
+        &instructions,
         Some(&user_pubkey)
     );
     
@@ -218,21 +267,21 @@ pub async fn buy_token(
     let bloxroute_auth = env::var("BLOXROUTE_AUTH_HEADER").unwrap_or_default();
     let chainstack_api_key = env::var("API_KEY").unwrap_or_default();
     
-    // Create the bloXroute-specific transaction payload
+    // Create the bloXroute-specific transaction payload with front-running protection
     let bloxroute_payload = json!({
         "jsonrpc": "2.0", 
         "id": format!("tx-{}", Uuid::new_v4()),
         "method": "eth_sendRawTransaction",  // bloXroute format
         "params": [{
             "transaction": base64_tx,
-            "frontRunningProtection": false,  // Disable front-running protection for speed
-            "useStakedRPCs": true,            // Use staked validators for faster propagation
-            "fastBestEffort": true,           // Submit to Jito and low-risk leaders
+            "frontRunningProtection": true,  // Enable front-running protection for pump.fun tokens
+            "useStakedRPCs": true,           // Use staked validators for faster propagation
+            "fastBestEffort": true,          // Submit to Jito and low-risk leaders
             "tip": (priority_fee as f64 / LAMPORTS_PER_SOL as f64 * 1000.0) as u64 // Convert to 0.001 SOL increments
         }]
     });
     
-    // Create the standard Solana RPC payload
+    // Create the standard Solana RPC payload with optimized parameters
     let standard_payload = json!({
         "jsonrpc": "2.0",
         "id": format!("tx-{}", Uuid::new_v4()),
@@ -243,18 +292,19 @@ pub async fn buy_token(
                 "encoding": "base64",
                 "skipPreflight": true,
                 "preflightCommitment": "processed",
-                "maxRetries": 5,
-                "minContextSlot": 0
+                "maxRetries": 10,             // Increased from 5 to 10
+                "minContextSlot": 0,
+                "prioritizationFee": priority_fee // Add explicit prioritization fee
             }
         ]
     });
     
     // Determine which payload to use - if we have bloXroute auth, use their format
     let (tx_payload, is_bloxroute) = if !bloxroute_auth.is_empty() {
-        info!("🚀 Using bloXroute-specific transaction format");
+        info!("🚀 Using bloXroute-specific transaction format with front-running protection");
         (bloxroute_payload, true)
     } else {
-        info!("🚀 Using standard Solana RPC transaction format");
+        info!("🚀 Using optimized Solana RPC transaction format with higher retries");
         (standard_payload, false)
     };
     
@@ -276,15 +326,17 @@ pub async fn buy_token(
         info!("🔐 Using basic authentication for transaction");
         request_builder = request_builder
             .header("Authorization", format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", trader_username, trader_password))))
-            .header("X-Chainstack-Tx", "true")       // Required header for Chainstack Trader Nodes
-            .header("X-BloXroute-Transaction", "true"); // Required header for bloXroute forwarding
+            .header("X-Chainstack-Tx", "true")           // Required header for Chainstack Trader Nodes
+            .header("X-Chainstack-Warp", "true")         // Explicitly request Warp transaction for faster confirmation
+            .header("X-BloXroute-Transaction", "true");  // Required header for bloXroute forwarding
     } else if !chainstack_api_key.is_empty() {
         info!("🔑 Using API key authentication for transaction");
         request_builder = request_builder
             .header("x-api-key", &chainstack_api_key)
             .header("X-Chainstack-Auth", &chainstack_api_key)
-            .header("X-Chainstack-Tx", "true")       // Required header for Chainstack
-            .header("X-BloXroute-Transaction", "true"); // Required header for bloXroute forwarding
+            .header("X-Chainstack-Tx", "true")           // Required header for Chainstack
+            .header("X-Chainstack-Warp", "true")         // Explicitly request Warp transaction
+            .header("X-BloXroute-Transaction", "true");  // Required header for bloXroute forwarding
     } else if !bloxroute_auth.is_empty() {
         info!("🔑 Using direct bloXroute authentication");
         request_builder = request_builder
@@ -315,38 +367,68 @@ pub async fn buy_token(
                         match verify_transaction(&trader_node_url, signature)
                             .await
                             .map_err(|e| anyhow::anyhow!("{}", e)) {
-                            Ok(confirmed) => {
-                                if confirmed {
+                            Ok((confirmed, error)) => {
+                                if confirmed && error.is_none() {
                                     info!("✅ Transaction confirmed on-chain or accepted by Trader Node");
+                                    return Ok(ApiResponse {
+                                        status: "success".to_string(),
+                                        data: json!({
+                                            "signature": signature,
+                                            "status": "sent",
+                                            "message": "Transaction sent successfully",
+                                            "verified": confirmed
+                                        }),
+                                        mint: mint.to_string(),
+                                    });
+                                } else if let Some(error_msg) = error {
+                                    // Check for specific error types
+                                    if error_msg.contains("0x1772") || error_msg.contains("TooMuchSolRequired") || error_msg.contains("6002") {
+                                        warn!("❌ Transaction failed with slippage error: {}", error_msg);
+                                        return Ok(ApiResponse {
+                                            status: "error".to_string(),
+                                            data: json!({
+                                                "signature": signature,
+                                                "error": "slippage: Too much SOL required to buy tokens (price moved too quickly)",
+                                                "error_code": "0x1772",
+                                                "message": "Transaction sent but failed due to slippage"
+                                            }),
+                                            mint: mint.to_string(),
+                                        });
+                                    } else {
+                                        warn!("❌ Transaction verification failed with error: {}", error_msg);
+                                        return Ok(ApiResponse {
+                                            status: "error".to_string(),
+                                            data: json!({
+                                                "signature": signature,
+                                                "error": error_msg,
+                                                "message": "Transaction sent but verification failed"
+                                            }),
+                                            mint: mint.to_string(),
+                                        });
+                                    }
                                 } else {
                                     warn!("⚠️ Transaction verification unclear, but signature was received");
+                                    return Ok(ApiResponse {
+                                        status: "success".to_string(),
+                                        data: json!({
+                                            "signature": signature,
+                                            "status": "sent",
+                                            "message": "Transaction sent and accepted by the network",
+                                            "verified": confirmed
+                                        }),
+                                        mint: mint.to_string(),
+                                    });
                                 }
-                                
-                                // For Trader Node / Warp transactions, we proceed even if verification is unclear
-                                // as many successful transactions don't immediately show up in RPC calls
-                                
-                                // Return success response with the signature
-                                return Ok(ApiResponse {
-                                    status: "success".to_string(),
-                                    data: json!({
-                                        "signature": signature,
-                                        "status": "sent",
-                                        "message": "Transaction sent successfully",
-                                        "verified": confirmed
-                                    }),
-                                    mint: mint.to_string(),
-                                });
                             },
                             Err(e) => {
                                 warn!("⚠️ Transaction verification error: {}", e);
-                                // Still return success since we got a signature from the Trader Node
+                                // Still return an error response since verification failed
                                 return Ok(ApiResponse {
-                                    status: "success".to_string(),
+                                    status: "error".to_string(),
                                     data: json!({
                                         "signature": signature,
-                                        "status": "sent",
-                                        "message": "Transaction sent but verification failed",
-                                        "error": e.to_string()
+                                        "error": e.to_string(),
+                                        "message": "Transaction sent but verification failed"
                                     }),
                                     mint: mint.to_string(),
                                 });
@@ -390,11 +472,10 @@ pub async fn buy_token(
     }
 }
 
-// Helper function to verify transaction status
-async fn verify_transaction(rpc_url: &str, signature: &str) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+/// Verify that a transaction completed successfully by checking its status on-chain
+/// Returns a Result with a tuple (bool, Option<String>) where the bool indicates success and the String contains any error message
+async fn verify_transaction(rpc_url: &str, signature: &str) -> Result<(bool, Option<String>), Box<dyn std::error::Error + Send + Sync>> {
     let client = reqwest::Client::new();
-    
-    // Maximum number of attempts to verify transaction
     let max_attempts = 5;
     let mut current_attempt = 0;
     
@@ -418,7 +499,83 @@ async fn verify_transaction(rpc_url: &str, signature: &str) -> Result<bool, Box<
         
         // Try each RPC endpoint for this attempt
         for endpoint in &rpc_endpoints {
-            // Method 1: Check using getSignatureStatuses
+            // Method 2: Try getTransaction for detailed error codes
+            let payload2 = json!({
+                "jsonrpc": "2.0",
+                "id": format!("verify-{}", Uuid::new_v4()),
+                "method": "getTransaction",
+                "params": [
+                    signature,
+                    {"encoding": "json", "commitment": "confirmed", "maxSupportedTransactionVersion": 0}
+                ]
+            });
+            
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                client.post(endpoint)
+                    .header("Content-Type", "application/json")
+                    .json(&payload2)
+                    .send()
+            ).await {
+                Ok(response_result) => {
+                    match response_result {
+                        Ok(response) => {
+                            if response.status().is_success() {
+                                match response.json::<Value>().await {
+                                    Ok(response_json) => {
+                                        if let Some(result) = response_json.get("result") {
+                                            if !result.is_null() {
+                                                // Check for transaction success or failure
+                                                if let Some(meta) = result.get("meta") {
+                                                    if let Some(err) = meta.get("err") {
+                                                        if !err.is_null() {
+                                                            // Transaction failed, extract error details
+                                                            let error_str = format!("{:?}", err);
+                                                            
+                                                            // Look for common pump.fun error codes
+                                                            if error_str.contains("0x1772") || error_str.contains("6002") {
+                                                                warn!("❌ Transaction failed with slippage error (TooMuchSolRequired): {}", error_str);
+                                                                return Ok((false, Some(String::from("slippage: Too much SOL required to buy the given amount of tokens"))));
+                                                            } else {
+                                                                warn!("❌ Transaction failed with error: {}", error_str);
+                                                                return Ok((false, Some(error_str)));
+                                                            }
+                                                        }
+                                                    }
+                                                    
+                                                    if let Some(status) = meta.get("status") {
+                                                        if let Some(ok) = status.get("Ok") {
+                                                            if !ok.is_null() {
+                                                                info!("✅ Transaction confirmed successfully at endpoint: {}", endpoint);
+                                                                return Ok((true, None));
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                
+                                                // No explicit error found but transaction exists
+                                                info!("✅ Transaction confirmed (getTransaction) at endpoint: {}", endpoint);
+                                                return Ok((true, None));
+                                            }
+                                        }
+                                    },
+                                    Err(e) => {
+                                        warn!("⚠️ Failed to parse getTransaction response from {}: {}", endpoint, e);
+                                    }
+                                }
+                            }
+                        },
+                        Err(e) => {
+                            warn!("⚠️ Failed to get getTransaction response from {}: {}", endpoint, e);
+                        }
+                    }
+                },
+                Err(_) => {
+                    warn!("⚠️ Timeout waiting for getTransaction verification from {}", endpoint);
+                }
+            };
+            
+            // Method 1: Check using getSignatureStatuses as backup
             let payload1 = json!({
                 "jsonrpc": "2.0",
                 "id": format!("verify-{}", Uuid::new_v4()),
@@ -447,17 +604,33 @@ async fn verify_transaction(rpc_url: &str, signature: &str) -> Result<bool, Box<
                                             if let Some(status_array) = result.get("value") {
                                                 if let Some(status) = status_array.get(0) {
                                                     if !status.is_null() {
+                                                        // Check for error details
+                                                        if let Some(err) = status.get("err") {
+                                                            if !err.is_null() {
+                                                                // Transaction failed, extract error details
+                                                                let error_str = format!("{:?}", err);
+                                                                
+                                                                if error_str.contains("0x1772") || error_str.contains("6002") {
+                                                                    warn!("❌ Transaction failed with slippage error (TooMuchSolRequired): {}", error_str);
+                                                                    return Ok((false, Some(String::from("slippage: Too much SOL required to buy the given amount of tokens"))));
+                                                                } else {
+                                                                    warn!("❌ Transaction failed with error: {}", error_str);
+                                                                    return Ok((false, Some(error_str)));
+                                                                }
+                                                            }
+                                                        }
+                                                        
                                                         if let Some(confirmation_status) = status.get("confirmationStatus") {
                                                             let status_str = confirmation_status.as_str().unwrap_or("unknown");
                                                             info!("Transaction status from {}: {}", endpoint, status_str);
                                                             if status_str == "confirmed" || status_str == "finalized" {
                                                                 info!("✅ Transaction confirmed on-chain at endpoint: {}", endpoint);
-                                                                return Ok(true);
+                                                                return Ok((true, None));
                                                             }
                                                         } else {
                                                             // Status exists but no confirmationStatus field
                                                             info!("✅ Transaction exists but no confirmation status field at endpoint: {}", endpoint);
-                                                            return Ok(true);
+                                                            return Ok((true, None));
                                                         }
                                                     }
                                                 }
@@ -479,53 +652,6 @@ async fn verify_transaction(rpc_url: &str, signature: &str) -> Result<bool, Box<
                     warn!("⚠️ Timeout waiting for verification response from {}", endpoint);
                 }
             };
-            
-            // Method 2: Try getTransaction as backup
-            let payload2 = json!({
-                "jsonrpc": "2.0",
-                "id": format!("verify-{}", Uuid::new_v4()),
-                "method": "getTransaction",
-                "params": [
-                    signature,
-                    {"encoding": "json", "commitment": "confirmed", "maxSupportedTransactionVersion": 0}
-                ]
-            });
-            
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                client.post(endpoint)
-                    .header("Content-Type", "application/json")
-                    .json(&payload2)
-                    .send()
-            ).await {
-                Ok(response_result) => {
-                    match response_result {
-                        Ok(response) => {
-                            if response.status().is_success() {
-                                match response.json::<Value>().await {
-                                    Ok(response_json) => {
-                                        if let Some(result) = response_json.get("result") {
-                                            if !result.is_null() {
-                                                info!("✅ Transaction confirmed (getTransaction) at endpoint: {}", endpoint);
-                                                return Ok(true);
-                                            }
-                                        }
-                                    },
-                                    Err(e) => {
-                                        warn!("⚠️ Failed to parse getTransaction response from {}: {}", endpoint, e);
-                                    }
-                                }
-                            }
-                        },
-                        Err(e) => {
-                            warn!("⚠️ Failed to get getTransaction response from {}: {}", endpoint, e);
-                        }
-                    }
-                },
-                Err(_) => {
-                    warn!("⚠️ Timeout waiting for getTransaction verification from {}", endpoint);
-                }
-            };
         }
         
         current_attempt += 1;
@@ -539,10 +665,10 @@ async fn verify_transaction(rpc_url: &str, signature: &str) -> Result<bool, Box<
     // as they often land on-chain even without immediate verification
     if rpc_url.contains("p2pify") || rpc_url.contains("chainstack") {
         info!("⚠️ Transaction may still confirm later (Trader Node/Warp transaction): {}", signature);
-        return Ok(true); // Return true for Trader Node/Warp txs to avoid unnecessary retries
+        return Ok((true, None)); // Return true for Trader Node/Warp txs to avoid unnecessary retries
     }
     
-    Ok(false)
+    Ok((false, Some(String::from("Unable to verify transaction status"))))
 }
 
 /// Transaction status enum
@@ -648,13 +774,12 @@ async fn wait_for_transaction_confirmation(signature: &str) -> Result<(), anyhow
 /// Sell a token using pump.fun API
 pub async fn sell_token(
     client: &Client,
-    private_key: &str,
     mint: &str,
     amount: &str,
-    slippage: f64,
-) -> Result<ApiResponse> {
-    // Log the action with correct slippage percentage formatting
-    info!("🔄 Selling {} of token {} with slippage {:.1}%", amount, mint, slippage * 100.0);
+    private_key: &str,
+) -> Result<ApiResponse, anyhow::Error> {
+    // Log the action with correct info but without slippage since it's not needed
+    info!("🔄 Selling {} of token {}", amount, mint);
     
     // Determine the compute units and priority fee to use
     let compute_units = std::env::var("COMPUTE_UNITS")
@@ -668,12 +793,18 @@ pub async fn sell_token(
         Err(_) => calculate_optimal_priority_fee(mint).await.unwrap_or(25000),
     };
     
+    // Get slippage from environment variable or use default
+    let slippage = std::env::var("SLIPPAGE")
+        .unwrap_or_else(|_| "40".to_string())
+        .parse::<f64>()
+        .unwrap_or(40.0) / 100.0; // Convert percentage to decimal
+    
     // Determine RPC URL to use
     let rpc_url = std::env::var("RPC_URL")
         .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
     
     // HTTP-based transaction via pump.fun API
-    info!("Using HTTP API for sell transaction...");
+    info!("Using HTTP API for sell transaction with {}% slippage", slippage * 100.0);
     
     // Create request
     let request = crate::api::models::SellRequest {
@@ -704,18 +835,58 @@ pub async fn sell_token(
     let mut api_response: ApiResponse = response_result.json().await?;
     api_response.mint = mint.to_string();
     
-    // If the sell was successful, reset the websocket lock to resume token detection
+    // If the sell was successful, completely reset token detection to resume normal operation
     if api_response.status == "success" {
-        info!("✅ Sell transaction successful - unlocking token detection");
-        std::env::remove_var("_STOP_WEBSOCKET_LISTENER");
+        info!("✅ Sell transaction successful!");
         
-        // Check for auto-buy in .env
+        // Get the signature from the response
+        if let Some(signature) = api_response.data.get("signature").and_then(|s| s.as_str()) {
+            info!("🔗 Sell transaction signature: {}", signature);
+            info!("🔗 View on explorer: https://explorer.solana.com/tx/{}", signature);
+        }
+        
+        // Regardless of success or failure, we want to reset the token detection state
+        info!("🔓 UNLOCKING TOKEN DETECTION after successful sell");
+        std::env::remove_var("_STOP_WEBSOCKET_LISTENER");
+        crate::token_detector::set_position_monitoring_active(false);
+        
+        // Check for auto-buy in .env to provide clear log message
         let auto_buy = std::env::var("AUTO_BUY")
             .unwrap_or_else(|_| "false".to_string())
             .to_lowercase() == "true";
             
         if auto_buy {
-            info!("🔍 AUTO_BUY is enabled - Resuming token detection");
+            info!("🔍 AUTO_BUY is enabled - Resuming token detection with auto-buy");
+        } else {
+            info!("🔍 Resuming token detection in manual mode");
+        }
+        
+        // Extra safety - directly check and update any trades in DB
+        match crate::db::get_trade_by_mint(mint) {
+            Ok(Some(trade)) => {
+                if let Some(id) = trade.id {
+                    match crate::db::update_trade_sold(id, trade.buy_price, trade.buy_liquidity) {
+                        Ok(_) => info!("✅ DB updated: Trade {} for {} marked as sold", id, mint),
+                        Err(e) => warn!("⚠️ Failed to update trade {} in DB: {}", id, e),
+                    }
+                }
+            },
+            Ok(None) => warn!("⚠️ No trade found in DB for mint {}", mint),
+            Err(e) => warn!("⚠️ Error looking up trade in DB: {}", e),
+        }
+    } else {
+        warn!("⚠️ Sell response indicates failure: {:?}", api_response.data);
+        
+        // Even in case of failure, try to maintain token detection state
+        // Don't unlock if we think the position is still active
+        if let Some(error_msg) = api_response.data.get("message")
+            .and_then(|m| m.as_str())
+            .filter(|msg| msg.contains("already sold") || msg.contains("not found")) {
+            
+            // If token is already sold or not found, we can safely unlock
+            info!("🔓 UNLOCKING TOKEN DETECTION since token appears to be already sold or not found");
+            std::env::remove_var("_STOP_WEBSOCKET_LISTENER");
+            crate::token_detector::set_position_monitoring_active(false);
         }
     }
     
@@ -765,14 +936,14 @@ async fn create_buy_instructions(
     
     // Get slippage from config
     let slippage = std::env::var("SLIPPAGE")
-        .unwrap_or_else(|_| "30".to_string())
+        .unwrap_or_else(|_| "40".to_string())  // Default to 40% slippage
         .parse::<f64>()
-        .unwrap_or(30.0);
+        .unwrap_or(40.0);  // Default to 40% if parsing fails
     
     // Properly calculate token amount based on price
     // This should match the Python implementation exactly, including discriminator and byte layout
     info!("🔄 Using crate::create_buy_instruction::create_buy_instruction");
-    let instruction = crate::create_buy_instruction::create_buy_instruction(
+    let (instruction, setup_instructions) = crate::create_buy_instruction::create_buy_instruction(
         &wallet.pubkey(),
         &mint.to_string(),
         &bonding_curve_str,
@@ -1445,4 +1616,71 @@ async fn check_associated_bonding_curve(
     
     info!("❌ Failed to check associated bonding curve account");
     return Ok(false);
+}
+
+/// Add this function that was referenced but not defined
+async fn check_account_exists(rpc_url: &str, account_pubkey: &str) -> Result<bool, anyhow::Error> {
+    // Create a one-time client with a short timeout
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(500))
+        .build()?;
+
+    // Create JSON-RPC request
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getAccountInfo",
+        "params": [
+            account_pubkey,
+            {"encoding": "base64"}
+        ]
+    });
+
+    // Send the request
+    let response = client.post(rpc_url)
+        .json(&request)
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        return Err(anyhow!("Failed to check account: HTTP error {}", response.status()));
+    }
+
+    // Parse the response
+    let response_json: Value = response.json().await?;
+    
+    // Check if we got a result
+    if let Some(result) = response_json.get("result") {
+        if let Some(value) = result.get("value") {
+            // If value is null, the account doesn't exist
+            return Ok(!value.is_null());
+        }
+    }
+
+    // Default to false if we can't determine
+    warn!("⚠️ Could not determine if account exists");
+    Ok(false)
+}
+
+/// Add this helper function that was referenced
+async fn get_bonding_curve_from_api(mint: &str) -> Result<String, anyhow::Error> {
+    match crate::api::get_bonding_curve_for_mint(mint).await {
+        Some(bonding_curve) => {
+            info!("✅ Found bonding curve from API: {}", bonding_curve);
+            Ok(bonding_curve)
+        },
+        None => {
+            error!("❌ Failed to get bonding curve");
+            Err(anyhow!("Failed to find bonding curve for mint {}", mint))
+        }
+    }
+}
+
+/// Helper function to decode a keypair from a private key string
+fn decode_keypair(private_key: &str) -> Result<Keypair, anyhow::Error> {
+    let private_key_bytes = base58::decode(private_key)
+        .into_vec()
+        .map_err(|e| anyhow!("Invalid private key: {}", e))?;
+    Keypair::from_bytes(&private_key_bytes)
+        .map_err(|e| anyhow!("Invalid keypair: {}", e))
 }

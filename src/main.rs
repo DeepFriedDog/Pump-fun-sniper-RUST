@@ -22,11 +22,11 @@ use std::time::{Duration, Instant};
 use std::env;
 
 // External crate imports
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use dotenv::dotenv;
 use lazy_static::lazy_static;
-use log::{error, info, warn, LevelFilter};
+use log::{debug, error, info, warn, LevelFilter};
 use reqwest::Client;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
@@ -65,6 +65,80 @@ lazy_static! {
 
 // Constants
 pub const PUMP_PROGRAM_ID: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
+
+/// Command enum for CLI parsing
+#[derive(Debug, Clone)]
+enum Command {
+    MonitorWebSocket,
+    ExtractTokens,
+}
+
+/// Parse command line arguments
+fn parse_args() -> Command {
+    let args: Vec<String> = std::env::args().collect();
+    
+    if args.iter().any(|arg| arg == "--extract-tokens") {
+        return Command::ExtractTokens;
+    }
+    
+    // Default to monitor mode
+    Command::MonitorWebSocket
+}
+
+/// Set up the logger with the specified level
+fn setup_logger(level: log::LevelFilter) -> Result<()> {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level.to_string()))
+        .format(|buf, record| {
+            writeln!(
+                buf,
+                "{} [{}] {}",
+                chrono::Local::now().format("%Y-%m-%d %H:%M:%S.%3f"),
+                record.level(),
+                record.args()
+            )
+        })
+        .init();
+    
+    Ok(())
+}
+
+/// Print the application banner
+fn print_banner() {
+    println!("---------------------------------------------");
+    println!("PumpFun Sniper Bot v0.1.0");
+    println!("High-Performance Token Sniper for pump.fun");
+    println!("---------------------------------------------");
+}
+
+/// Create an optimized HTTP client for making requests
+fn create_optimized_client() -> Result<reqwest::Client> {
+    // Create a client with reasonable timeouts and connection pooling
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .pool_idle_timeout(Duration::from_secs(30))
+        .pool_max_idle_per_host(10)
+        .build()?;
+    
+    Ok(client)
+}
+
+/// Monitor websocket for new tokens
+async fn websocket_monitor_tokens() -> Result<()> {
+    // Use the token detector to monitor for new tokens
+    token_detector::listen_for_new_tokens(config::get_wss_endpoint()).await?;
+    Ok(())
+}
+
+/// Extract tokens without buying
+async fn extract_tokens() -> Result<()> {
+    info!("Extracting tokens from WebSocket without buying");
+    
+    // Set the AUTO_BUY environment variable to false
+    std::env::set_var("AUTO_BUY", "false");
+    
+    // Call the websocket monitor with auto-buy disabled
+    websocket_monitor_tokens().await
+}
 
 /// Process newly detected tokens from the WebSocket
 async fn process_new_tokens_from_websocket(
@@ -174,6 +248,14 @@ async fn process_new_tokens_from_websocket(
     let min_liquidity_str = std::env::var("MIN_LIQUIDITY").unwrap_or_else(|_| "0".to_string());
     let min_liquidity = min_liquidity_str.parse::<f64>().unwrap_or(0.0);
 
+    // PAUSE TOKEN DETECTION IMMEDIATELY before any buy operations to prevent race conditions
+    if auto_buy {
+        info!("🔒 PAUSING TOKEN DETECTION during transaction processing");
+        std::env::set_var("_STOP_WEBSOCKET_LISTENER", "true");
+        should_stop_listener = true;
+        token_detector::set_position_monitoring_active(true);
+    }
+
     // Check if the developer is in the approved list
     let is_approved_dev = if approved_devs_only {
         match checks::check_approved_devs(user).await {
@@ -185,6 +267,15 @@ async fn process_new_tokens_from_websocket(
             }
             Err(e) => {
                 warn!("Failed to check if developer is approved: {}", e);
+                
+                // Resume token detection if check fails and we paused it
+                if should_stop_listener {
+                    info!("🔓 RESUMING TOKEN DETECTION after dev check failure");
+                    std::env::remove_var("_STOP_WEBSOCKET_LISTENER");
+                    token_detector::set_position_monitoring_active(false);
+                    should_stop_listener = false;
+                }
+                
                 false
             }
         }
@@ -195,6 +286,14 @@ async fn process_new_tokens_from_websocket(
     // If approved_devs_only is enabled, skip tokens not created by approved developers
     if approved_devs_only && !is_approved_dev {
         info!("Skipping token from non-approved developer: {} (creator: {})", name, user);
+        
+        // Resume token detection if we paused it since we're skipping this token
+        if should_stop_listener {
+            info!("🔓 RESUMING TOKEN DETECTION after skipping non-approved dev");
+            std::env::remove_var("_STOP_WEBSOCKET_LISTENER");
+            token_detector::set_position_monitoring_active(false);
+        }
+        
         return Ok(());
     }
 
@@ -202,22 +301,17 @@ async fn process_new_tokens_from_websocket(
     if approved_devs_only && is_approved_dev {
         info!("Skipping liquidity check and buying immediately for approved developer");
 
-        // Set the flag to stop websocket listener BEFORE initiating the buy
-        if auto_buy {
-            info!("AUTO_BUY is enabled - Focusing all resources on buying this token");
-            std::env::set_var("_STOP_WEBSOCKET_LISTENER", "true");
-            should_stop_listener = true;
-        }
-
         // Buy the token immediately using Chainstack warp transaction
         let buy_start = std::time::Instant::now();
         let buy_result = match api::buy_token(client, private_key, mint, amount, slippage).await
         {
             Ok(result) => result,
             Err(e) => {
-                // If buy fails, unlock the token detection
+                // If buy fails, unlock the token detection immediately
                 if should_stop_listener {
+                    info!("🔓 RESUMING TOKEN DETECTION after buy error");
                     std::env::remove_var("_STOP_WEBSOCKET_LISTENER");
+                    token_detector::set_position_monitoring_active(false);
                 }
                 return Err(format!("Failed to buy token: {}", e));
             }
@@ -235,6 +329,9 @@ async fn process_new_tokens_from_websocket(
                 total_elapsed.as_secs_f64()
             );
 
+            // Keep token detection paused - already done via _STOP_WEBSOCKET_LISTENER
+            info!("🔒 TOKEN DETECTION REMAINS PAUSED until position is closed");
+
             // Process the buy result for DB storage and price monitoring
             if let Err(e) = process_buy_result(buy_result, client, wallet, mint, buy_start).await {
                 warn!("Error processing buy result: {}", e);
@@ -250,6 +347,13 @@ async fn process_new_tokens_from_websocket(
                     .and_then(|m| m.as_str())
                     .unwrap_or("Unknown")
             );
+            
+            // Resume token detection after buy failure
+            if should_stop_listener {
+                info!("🔓 RESUMING TOKEN DETECTION after buy failure");
+                std::env::remove_var("_STOP_WEBSOCKET_LISTENER");
+                token_detector::set_position_monitoring_active(false);
+            }
         }
 
         return Ok(());
@@ -266,14 +370,6 @@ async fn process_new_tokens_from_websocket(
                 if has_liquidity {
                     // Note: check_token_liquidity already logged "Liquidity check PASSED"
                     
-                    // If auto_buy is enabled, stop listening for new tokens and focus on this one
-                    if auto_buy {
-                        info!("AUTO_BUY is enabled - Focusing all resources on buying this token");
-                        // Set the flag BEFORE starting the transaction
-                        std::env::set_var("_STOP_WEBSOCKET_LISTENER", "true");
-                        should_stop_listener = true;
-                    }
-
                     // Execute buy transaction
                     let buy_start = std::time::Instant::now();
                     let buy_result = match api::buy_token(client, private_key, mint, amount, slippage).await
@@ -282,7 +378,9 @@ async fn process_new_tokens_from_websocket(
                         Err(e) => {
                             // Re-enable websocket listener if we stopped it and the buy failed
                             if should_stop_listener {
+                                info!("🔓 RESUMING TOKEN DETECTION after buy error");
                                 std::env::remove_var("_STOP_WEBSOCKET_LISTENER");
+                                token_detector::set_position_monitoring_active(false);
                             }
                             return Err(format!("Failed to buy token: {}", e));
                         }
@@ -299,6 +397,9 @@ async fn process_new_tokens_from_websocket(
                             buy_elapsed.as_secs_f64(),
                             total_elapsed.as_secs_f64()
                         );
+
+                        // Keep token detection paused - already done via _STOP_WEBSOCKET_LISTENER
+                        info!("🔒 TOKEN DETECTION REMAINS PAUSED until position is closed");
 
                         // Process the buy result
                         if let Err(e) =
@@ -317,28 +418,54 @@ async fn process_new_tokens_from_websocket(
                                 .and_then(|m| m.as_str())
                                 .unwrap_or("Unknown")
                         );
+                        
+                        // Resume token detection after buy failure
+                        if should_stop_listener {
+                            info!("🔓 RESUMING TOKEN DETECTION after buy failure");
+                            std::env::remove_var("_STOP_WEBSOCKET_LISTENER");
+                            token_detector::set_position_monitoring_active(false);
+                        }
+                    }
+                } else {
+                    // Note: check_token_liquidity already logged "Liquidity check FAILED"
+                    
+                    // Resume token detection after liquidity check failure
+                    if should_stop_listener {
+                        info!("🔓 RESUMING TOKEN DETECTION after liquidity check failure");
+                        std::env::remove_var("_STOP_WEBSOCKET_LISTENER");
+                        token_detector::set_position_monitoring_active(false);
                     }
                 }
-                // Note: No need for else clause as check_token_liquidity already logged "Liquidity check FAILED"
             }
             Err(e) => {
                 warn!("Failed to check liquidity: {}", e);
+                
+                // Resume token detection after liquidity check error
+                if should_stop_listener {
+                    info!("🔓 RESUMING TOKEN DETECTION after liquidity check error");
+                    std::env::remove_var("_STOP_WEBSOCKET_LISTENER");
+                    token_detector::set_position_monitoring_active(false);
+                }
             }
         }
     } else if auto_buy {
         // If liquidity check is disabled and auto_buy is enabled
-        info!("Liquidity check disabled and AUTO_BUY enabled - Focusing all resources on buying this token");
-        should_stop_listener = true;
-        
-        // Set a global flag to stop websocket listener
-        std::env::set_var("_STOP_WEBSOCKET_LISTENER", "true");
+        info!("Liquidity check disabled and AUTO_BUY enabled - Buying token");
         
         // Buy the token immediately
         let buy_start = std::time::Instant::now();
         let buy_result = match api::buy_token(client, private_key, mint, amount, slippage).await
         {
             Ok(result) => result,
-            Err(e) => return Err(format!("Failed to buy token: {}", e)),
+            Err(e) => {
+                // Resume token detection after buy error
+                if should_stop_listener {
+                    info!("🔓 RESUMING TOKEN DETECTION after buy error");
+                    std::env::remove_var("_STOP_WEBSOCKET_LISTENER");
+                    token_detector::set_position_monitoring_active(false);
+                }
+                return Err(format!("Failed to buy token: {}", e));
+            }
         };
 
         // Process buy result
@@ -353,6 +480,9 @@ async fn process_new_tokens_from_websocket(
                 total_elapsed.as_secs_f64()
             );
 
+            // Keep token detection paused - already done via _STOP_WEBSOCKET_LISTENER
+            info!("🔒 TOKEN DETECTION REMAINS PAUSED until position is closed");
+
             // Process the buy result
             if let Err(e) = process_buy_result(buy_result, client, wallet, mint, buy_start).await {
                 warn!("Error processing buy result: {}", e);
@@ -365,9 +495,16 @@ async fn process_new_tokens_from_websocket(
                 buy_result
                     .data
                     .get("message")
-                    .and_then(|m| m.as_str())
+                    .and_then(|v| v.as_str())
                     .unwrap_or("Unknown")
             );
+            
+            // Resume token detection after buy failure
+            if should_stop_listener {
+                info!("🔓 RESUMING TOKEN DETECTION after buy failure");
+                std::env::remove_var("_STOP_WEBSOCKET_LISTENER");
+                token_detector::set_position_monitoring_active(false);
+            }
         }
     } else {
         // If we're not checking liquidity and auto_buy is not enabled
@@ -378,7 +515,15 @@ async fn process_new_tokens_from_websocket(
         let buy_result = match api::buy_token(client, private_key, mint, amount, slippage).await
         {
             Ok(result) => result,
-            Err(e) => return Err(format!("Failed to buy token: {}", e)),
+            Err(e) => {
+                // Resume token detection after buy error
+                if should_stop_listener {
+                    info!("🔓 RESUMING TOKEN DETECTION after buy error");
+                    std::env::remove_var("_STOP_WEBSOCKET_LISTENER");
+                    token_detector::set_position_monitoring_active(false);
+                }
+                return Err(format!("Failed to buy token: {}", e));
+            }
         };
 
         // Process buy result
@@ -392,6 +537,18 @@ async fn process_new_tokens_from_websocket(
                 buy_elapsed.as_secs_f64(),
                 total_elapsed.as_secs_f64()
             );
+
+            // Keep token detection paused if auto_buy is enabled
+            if auto_buy {
+                info!("🔒 TOKEN DETECTION REMAINS PAUSED until position is closed");
+            } else {
+                // Resume token detection if auto_buy is disabled
+                if should_stop_listener {
+                    info!("🔓 RESUMING TOKEN DETECTION after manual buy");
+                    std::env::remove_var("_STOP_WEBSOCKET_LISTENER");
+                    token_detector::set_position_monitoring_active(false);
+                }
+            }
 
             // Process the buy result
             if let Err(e) = process_buy_result(buy_result, client, wallet, mint, buy_start).await {
@@ -408,6 +565,13 @@ async fn process_new_tokens_from_websocket(
                     .and_then(|m| m.as_str())
                     .unwrap_or("Unknown")
             );
+            
+            // Resume token detection after buy failure
+            if should_stop_listener {
+                info!("🔓 RESUMING TOKEN DETECTION after buy failure");
+                std::env::remove_var("_STOP_WEBSOCKET_LISTENER");
+                token_detector::set_position_monitoring_active(false);
+            }
         }
     }
 
@@ -511,7 +675,7 @@ async fn monitor_bonding_curve(mint: String, buy_price: f64) -> std::result::Res
         // Release the websocket lock if this function is exiting
         if std::env::var("_STOP_WEBSOCKET_LISTENER").map(|v| v == "true").unwrap_or(false) {
             info!("🔓 Monitoring for token {} completed - Releasing token detection lock", mint);
-            std::env::remove_var("_STOP_WEBSOCKET_LISTENER");
+            token_detector::set_position_monitoring_active(false);
         }
         
         // Log any errors but don't propagate
@@ -588,7 +752,7 @@ async fn monitor_price_loop(
                           price_change, take_profit);
                           
                     // Execute sell transaction
-                    match api::sell_token(client, private_key, mint, "all", 1.0).await {
+                    match api::sell_token(client, mint, "all", private_key).await {
                         Ok(result) => {
                             if result.status == "success" {
                                 info!("✅ SOLD TOKEN at take profit: {} - Transaction: {}", 
@@ -633,7 +797,7 @@ async fn monitor_price_loop(
                           drop_from_peak, stop_loss);
                           
                     // Execute sell transaction
-                    match api::sell_token(client, private_key, mint, "all", 1.0).await {
+                    match api::sell_token(client, mint, "all", private_key).await {
                         Ok(result) => {
                             if result.status == "success" {
                                 info!("✅ SOLD TOKEN at stop loss: {} - Transaction: {}", 
@@ -735,27 +899,56 @@ async fn process_buy_result(
     } else {
         // Check if we have the transaction signatures to compute metrics
         let mint_sig = std::env::var("LAST_MINT_SIGNATURE").unwrap_or_default();
+        
+        // Log detailed debug info about the mint signature
+        debug!("LAST_MINT_SIGNATURE environment variable: {}", 
+              if mint_sig.is_empty() { "not set" } else { &mint_sig });
+        
         if !mint_sig.is_empty() && tx_signature != "unknown" {
+            info!("🔍 Computing performance metrics between mint tx {} and buy tx {}", 
+                  mint_sig, tx_signature);
+                  
             // Calculate performance metrics in a non-blocking way
             let mint_sig_clone = mint_sig.clone();
             let tx_signature_clone = tx_signature.to_string();
-            tokio::spawn(async move {
-                match crate::trading::performance::compute_performance_metrics(&mint_sig_clone, &tx_signature_clone).await {
-                    Ok((block_diff, time_diff_ms)) => {
-                        info!("🏁 PERFORMANCE: {}ms ({} blocks) from mint to buy confirmation", 
-                              time_diff_ms, block_diff);
-                        
-                        // Store the metrics for future reference
-                        std::env::set_var("_BLOCK_TO_BLOCK_MS", time_diff_ms.to_string());
-                        std::env::set_var("_BLOCKS_DIFFERENCE", block_diff.to_string());
-                    },
-                    Err(e) => {
-                        warn!("Could not calculate performance metrics: {}", e);
-                    }
+            
+            // Calculate immediately in the current task for reliability
+            match trading::performance::compute_performance_metrics(&mint_sig_clone, &tx_signature_clone).await {
+                Ok((block_diff, time_diff_ms)) => {
+                    info!("🚀 PERFORMANCE METRICS - Mint to Buy: {} ms ({} blocks)", time_diff_ms, block_diff);
+                    
+                    // Store the metrics in environment variables for other parts of the code
+                    std::env::set_var("_BLOCK_TO_BLOCK_MS", time_diff_ms.to_string());
+                    std::env::set_var("_BLOCKS_DIFFERENCE", block_diff.to_string());
+                    
+                    // Additional categorized feedback on performance
+                    let performance_category = if time_diff_ms < 1000 {
+                        "⚡ LIGHTNING FAST"
+                    } else if time_diff_ms < 2000 {
+                        "🔥 VERY FAST"
+                    } else if time_diff_ms < 5000 {
+                        "✅ GOOD"
+                    } else if time_diff_ms < 10000 {
+                        "⚠️ MODERATE"
+                    } else {
+                        "🐢 SLOW"
+                    };
+                    info!("🏁 TRANSACTION SPEED: {} - {} ms ({} blocks)", performance_category, time_diff_ms, block_diff);
+                },
+                Err(e) => {
+                    error!("❌ Failed to compute performance metrics: {}", e);
+                    error!("Mint tx: {}, Buy tx: {}", mint_sig, tx_signature_clone);
                 }
-            });
+            }
         } else {
-            info!("No performance metrics available for this transaction");
+            warn!("⚠️ Cannot calculate performance metrics - missing mint transaction signature: {} or buy signature: {}", 
+                 mint_sig.is_empty(), tx_signature == "unknown");
+            
+            // Look for the mint signature in other places
+            if let Some(last_sig) = buy_result.data.get("last_mint_signature").and_then(|v| v.as_str()) {
+                info!("Found mint signature in API response: {}", last_sig);
+                std::env::set_var("LAST_MINT_SIGNATURE", last_sig);
+            }
         }
     }
 
@@ -825,17 +1018,16 @@ async fn process_buy_result(
                         info!("MAX_POSITIONS ({}) reached after buying token {}", max_positions, mint);
                         info!("🔒 Focusing all resources on monitoring this position");
                         
-                        // Ensure the WebSocket detector is locked
-                        if auto_buy {
-                            std::env::set_var("_STOP_WEBSOCKET_LISTENER", "true");
-                            
-                            // Clear any pending tokens from the queue that won't be processed
-                            // since we're at max positions
-                            if let Ok(mut queue) = crate::api::NEW_TOKEN_QUEUE.try_lock() {
-                                let previous_size = queue.len();
-                                queue.clear();
-                                info!("🗑️ Cleared token queue ({} items) since max positions reached", previous_size);
-                            }
+                        // Make sure token detection is stopped immediately using the new atomic flag method
+                        info!("🛑 Stopping token detection to focus on current position");
+                        token_detector::set_position_monitoring_active(true);
+                        
+                        // Clear any pending tokens from the queue that won't be processed
+                        // since we're at max positions
+                        if let Ok(mut api_queue) = crate::api::NEW_TOKEN_QUEUE.try_lock() {
+                            let previous_size = api_queue.len();
+                            api_queue.clear();
+                            info!("🗑️ Cleared token queue ({} items) since max positions reached", previous_size);
                         }
                         
                         // Clone the mint string for the spawned task
@@ -867,7 +1059,7 @@ async fn process_buy_result(
                     .unwrap_or(50.0);
 
                 info!(
-                    "Starting price monitor with take profit: {}%, stop loss: {}%",
+                    "🔄 Starting price monitor with take profit: {}%, stop loss: {}%",
                     take_profit, stop_loss
                 );
 
@@ -875,38 +1067,79 @@ async fn process_buy_result(
                 let client_clone = client.clone();
                 let mint_clone = mint.to_string();
                 let wallet_clone = wallet.to_string();
-                let mint_clone2 = mint_clone.clone(); // Clone again for the second task
+                let price_clone = price; // Clone the price for both monitoring functions
+                
+                // Enable auto-sell based on price targets
+                std::env::set_var("_ENABLE_AUTO_SELL", "true");
+                
+                // Make sure token detection is fully stopped
+                // This focuses resources on price monitoring
+                info!("🔒 Stopping token detection to focus on this position");
+                token_detector::set_position_monitoring_active(true);
 
-                // Start price monitoring in a separate task
-                let price_monitor_handle = tokio::spawn(async move {
-                    if let Err(e) = api::start_price_monitor(
-                        &client_clone,
-                        &mint_clone,
-                        &wallet_clone,
-                        price,
-                        take_profit,
-                        stop_loss,
-                    )
-                    .await
-                    {
-                        warn!("Price monitoring error: {}", e);
-                        // Unlock the token detector when monitoring ends with error
-                        std::env::remove_var("_STOP_WEBSOCKET_LISTENER");
+                // Start price monitoring in the CURRENT task for better reliability
+                info!("🔎 Starting immediate price monitoring for token {}", mint_clone);
+                
+                // Spawn a separate task to run both monitoring methods concurrently
+                tokio::spawn(async move {
+                    let (price_monitor_result, price_polling_result) = tokio::join!(
+                        async {
+                            match api::start_price_monitor(
+                                &client_clone,
+                                &mint_clone,
+                                &wallet_clone,
+                                price_clone,
+                                take_profit,
+                                stop_loss,
+                            ).await {
+                                Ok(_) => {
+                                    info!("✅ Price monitoring completed normally for {}", mint_clone);
+                                    Ok(())
+                                },
+                                Err(e) => {
+                                    error!("❌ Price monitoring error for {}: {}", mint_clone, e);
+                                    error!("Price monitoring parameters: price={}, take_profit={}%, stop_loss={}%", 
+                                           price_clone, take_profit, stop_loss);
+                                    Err(e)
+                                }
+                            }
+                        },
+                        async {
+                            match start_price_polling(&mint_clone, price_clone).await {
+                                Ok(_) => {
+                                    info!("✅ Price polling completed normally for {}", mint_clone);
+                                    Ok(())
+                                },
+                                Err(e) => {
+                                    error!("❌ Price polling error for {}: {}", mint_clone, e);
+                                    Err(e)
+                                }
+                            }
+                        }
+                    );
+                    
+                    // Log the results of both monitoring methods
+                    match (price_monitor_result, price_polling_result) {
+                        (Ok(_), Ok(_)) => {
+                            info!("✅ All price monitoring completed successfully for {}", mint_clone);
+                        },
+                        (Err(_), Ok(_)) => {
+                            info!("⚠️ Price monitoring failed but polling completed for {}", mint_clone);
+                        },
+                        (Ok(_), Err(_)) => {
+                            info!("⚠️ Price polling failed but monitoring completed for {}", mint_clone);
+                        },
+                        (Err(_), Err(_)) => {
+                            error!("❌ Both price monitoring methods failed for {}", mint_clone);
+                            // Only unlock the token detector when both monitoring methods fail
+                            token_detector::set_position_monitoring_active(false);
+                        }
                     }
                 });
                 
-                // Start fallback price polling with external API
-                let price_polling_handle = tokio::spawn(async move {
-                    if let Err(e) = start_price_polling(&mint_clone2, price).await {
-                        warn!("Price polling error: {}", e);
-                    }
-                });
-
-                // Store the task handles for potential cancellation
-                if let Ok(mut handles) = crate::api::TASK_HANDLES.try_lock() {
-                    handles.push(price_monitor_handle);
-                    handles.push(price_polling_handle);
-                }
+                info!("📝 Price monitoring task started for {}", mint);
+            } else {
+                warn!("⚠️ Price monitoring is disabled in configuration");
             }
         }
         Err(e) => {
@@ -1062,204 +1295,6 @@ async fn start_price_polling(mint: &str, buy_price: f64) -> std::result::Result<
     Ok(())
 }
 
-/// Create an optimized HTTP client for fast API calls
-fn create_optimized_client() -> Result<reqwest::Client> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .tcp_nodelay(true)
-        .tcp_keepalive(Some(Duration::from_secs(30)))
-        .pool_max_idle_per_host(10)
-        .build()?;
-
-    Ok(client)
-}
-
-/// Run in monitor websocket mode
-async fn monitor_websocket() -> Result<()> {
-    // Check if we're in quiet mode
-    let is_quiet_mode = std::env::args().any(|arg| arg == "--quiet" || arg == "-q");
-    
-    // Always show the initial info message
-    info!("Starting WebSocket monitor for new tokens with automatic buying");
-
-    // Initialize the database before starting
-    info!("Initializing database...");
-    if let Err(e) = db::init_db(false).await {
-        warn!("Failed to initialize database: {}. Trades will not be stored.", e);
-    } else {
-        info!("Database initialized successfully");
-    }
-
-    // Test Trader Node connection before proceeding
-    info!("🌐 Testing Chainstack Trader Node connection to: {}", crate::config::get_trader_node_rpc_url());
-    let test_client = reqwest::Client::new();
-    let (username, password) = crate::config::get_trader_node_credentials();
-    
-    // Check if credentials are available
-    if username.is_empty() || password.is_empty() {
-        error!("⚠️ Trader Node credentials are missing. Please check your config.env file.");
-        warn!("Falling back to standard RPC for transactions (performance will be degraded)");
-        std::env::set_var("USE_TRADER_NODE_FOR_TRANSACTIONS", "false");
-    } else {
-        // First, try a simple health check with authentication
-        match test_client.post(&crate::config::get_trader_node_rpc_url())
-            .basic_auth(&username, Some(&password))
-            .json(&serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "getHealth",
-            }))
-            .send()
-            .await {
-                Ok(response) => {
-                    if response.status().is_success() {
-                        info!("✅ Trader Node connection successful!");
-                        
-                        // Try getting a blockhash to confirm RPC functionality
-                        match test_client.post(&crate::config::get_trader_node_rpc_url())
-                            .basic_auth(&username, Some(&password))
-                            .json(&serde_json::json!({
-                                "jsonrpc": "2.0",
-                                "id": 1,
-                                "method": "getLatestBlockhash",
-                                "params": [{"commitment": "processed"}]
-                            }))
-                            .send()
-                            .await {
-                                Ok(blockhash_response) => {
-                                    if blockhash_response.status().is_success() {
-                                        match blockhash_response.json::<serde_json::Value>().await {
-                                            Ok(json) => {
-                                                if let Some(result) = json.get("result").and_then(|r| r.get("value")).and_then(|v| v.get("blockhash")) {
-                                                    info!("✅ Trader Node RPC fully functional! Latest blockhash: {}", result);
-                                                    std::env::set_var("USE_TRADER_NODE_FOR_TRANSACTIONS", "true");
-                                                } else {
-                                                    warn!("⚠️ Trader Node returned unexpected response format");
-                                                    std::env::set_var("USE_TRADER_NODE_FOR_TRANSACTIONS", "true"); // Still use it since connection works
-                                                }
-                                            },
-                                            Err(e) => {
-                                                warn!("⚠️ Failed to parse blockhash response: {}", e);
-                                                std::env::set_var("USE_TRADER_NODE_FOR_TRANSACTIONS", "true"); // Still use it since connection works
-                                            }
-                                        }
-                                    } else {
-                                        warn!("⚠️ Trader Node blockhash check failed with status: {}", blockhash_response.status());
-                                        std::env::set_var("USE_TRADER_NODE_FOR_TRANSACTIONS", "true"); // Still use it since basic connection works
-                                    }
-                                },
-                                Err(e) => {
-                                    warn!("⚠️ Trader Node blockhash check failed: {}", e);
-                                    std::env::set_var("USE_TRADER_NODE_FOR_TRANSACTIONS", "true"); // Still use it since basic connection works
-                                }
-                            }
-                    } else {
-                        error!("❌ Trader Node connection failed with status: {}", response.status());
-                        warn!("Response body: {:?}", response.text().await.unwrap_or_default());
-                        warn!("Falling back to standard RPC for transactions");
-                        std::env::set_var("USE_TRADER_NODE_FOR_TRANSACTIONS", "false");
-                    }
-                },
-                Err(e) => {
-                    error!("❌ Trader Node connection test failed: {}", e);
-                    warn!("Falling back to standard RPC for transactions");
-                    std::env::set_var("USE_TRADER_NODE_FOR_TRANSACTIONS", "false");
-                }
-        }
-    }
-
-    // Use optimized client
-    let client = create_optimized_client()?;
-    let client = Arc::new(client);
-
-    // Get command line arguments
-    let args: Vec<String> = std::env::args().collect();
-    let mut fast_detection = false;
-    let mut no_auto_buy = false;
-    
-    // Parse command line flags
-    for arg in &args {
-        match arg.as_str() {
-            "--fast-detection" => {
-                fast_detection = true;
-                info!("Fast detection mode enabled");
-            }
-            "--no-auto-buy" => {
-                no_auto_buy = true;
-                info!("Auto-buy disabled - manual trade confirmation required");
-            }
-            _ => {}
-        }
-    }
-    
-    // If auto-buy is disabled via command line, override the environment variable
-    if no_auto_buy {
-        std::env::set_var("AUTO_BUY", "false");
-    }
-    
-    // Register a shutdown handler
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    let shutdown_handle = tokio::spawn(async move {
-        // Wait for CTRL+C signal
-        tokio::signal::ctrl_c().await.expect("Failed to listen for ctrl+c event");
-        info!("Received shutdown signal. Shutting down gracefully...");
-        
-        // Set a flag to terminate all tasks gracefully
-        std::env::set_var("_STOP_ALL_TASKS", "true");
-        
-        // Allow some time for tasks to shut down
-        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-        
-        // Cancel all remaining tasks and clean up
-        if let Ok(handles) = crate::api::TASK_HANDLES.try_lock() {
-            for handle in handles.iter() {
-                handle.abort();
-            }
-        }
-        
-        // Send the shutdown signal to the main loop
-        let _ = shutdown_tx.send(());
-    });
-    
-    // Start the WebSocket monitor directly instead of calling monitor_websocket()
-    // This avoids the recursion issue
-    info!("Starting WebSocket monitor for new tokens with automatic buying");
-    
-    // Start the token detector
-    let token_detector_result = token_detector::listen_for_new_tokens(config::get_wss_endpoint()).await;
-    
-    if let Err(e) = token_detector_result {
-        error!("Token detector error: {}", e);
-    }
-    
-    // Final cleanup
-    info!("Cleaning up and exiting...");
-    
-    Ok(())
-}
-
-/// Gracefully shut down all tasks
-pub async fn shutdown_gracefully() {
-    info!("Initiating graceful shutdown...");
-    
-    // First, signal all tasks to terminate on their own
-    std::env::set_var("_STOP_ALL_TASKS", "true");
-    
-    // Wait a bit for tasks to shut down cleanly
-    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-    
-    // Abort any remaining tasks
-    if let Ok(handles) = crate::api::TASK_HANDLES.try_lock() {
-        let handle_count = handles.len();
-        for handle in handles.iter() {
-            handle.abort();
-        }
-        info!("Aborted {} remaining tasks", handle_count);
-    }
-    
-    info!("Graceful shutdown complete");
-}
-
 /// Adds delays between WebSocket subscription batches to prevent overwhelming the node
 /// This is especially useful when subscribing to many events at once
 async fn batch_subscriptions_with_backpressure<T: Clone>(
@@ -1376,6 +1411,45 @@ async fn process_token_queue(
             break;
         }
         
+        // First check if we're at MAX_POSITIONS limit before processing any tokens
+        let max_positions = std::env::var("MAX_POSITIONS")
+            .unwrap_or_else(|_| "1".to_string())
+            .parse::<i64>()
+            .unwrap_or(1);
+                
+        match db::count_pending_trades() {
+            Ok(pending_count) => {
+                if pending_count >= max_positions {
+                    info!("MAX_POSITIONS ({}) reached - not processing any more tokens", max_positions);
+                    // Make sure token detection is stopped
+                    token_detector::set_position_monitoring_active(true);
+                    
+                    // Clear any pending tokens from the queue
+                    if let Ok(mut api_queue) = crate::api::NEW_TOKEN_QUEUE.try_lock() {
+                        let previous_size = api_queue.len();
+                        if previous_size > 0 {
+                            api_queue.clear();
+                            info!("🗑️ Cleared token queue ({} items) since max positions reached", previous_size);
+                        }
+                    }
+                    
+                    // Sleep for a while before checking again
+                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                    continue;
+                }
+            }
+            Err(e) => {
+                warn!("Could not check pending trades count: {}", e);
+            }
+        }
+        
+        // Also check if token detection is paused
+        if token_detector::is_token_detection_paused() {
+            // If we're monitoring a position, don't process more tokens
+            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            continue;
+        }
+        
         // Try to get a token from the API queue
         let token = {
             let mut queue = crate::api::NEW_TOKEN_QUEUE.lock().unwrap();
@@ -1403,6 +1477,10 @@ async fn process_token_queue(
             };
             
             if auto_buy && should_buy {
+                // PAUSE TOKEN DETECTION IMMEDIATELY before buying to prevent race conditions
+                info!("🔒 Pausing token detection immediately while attempting to buy");
+                token_detector::set_position_monitoring_active(true);
+                
                 info!("🚀 Executing buy transaction for token: {}", token_data.mint);
                 
                 // Get the mint transaction signature from token metadata if available
@@ -1416,34 +1494,68 @@ async fn process_token_queue(
                         }
                     });
                 
-                // Log mint transaction signature if found
+                // Store the mint signature for later performance calculations
                 if let Some(mint_sig) = &mint_signature {
                     info!("📝 Token was minted in transaction: {}", mint_sig);
                     info!("🔗 Mint transaction: https://explorer.solana.com/tx/{}", mint_sig);
+                    std::env::set_var("LAST_MINT_SIGNATURE", mint_sig);
+                } else {
+                    warn!("⚠️ No mint transaction signature found for performance metrics");
                 }
                 
                 // Execute the buy transaction
                 match crate::api::buy_token(&client, &private_key, &token_data.mint, amount, slippage).await {
                     Ok(response) => {
-                        if response.status == "success" {
-                            // Clone or extract the signature string early to avoid borrowing issues
-                            let signature = response.data.get("signature")
-                                .and_then(|s| s.as_str())
-                                .map(|s| s.to_string())
-                                .unwrap_or_else(|| "unknown".to_string());
+                        // Get the signature early to avoid borrowing issues
+                        let signature = response.data.get("signature")
+                            .and_then(|s| s.as_str())
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| "unknown".to_string());
+                        
+                        // Check status in the response and error field specifically
+                        let has_error = response.status == "error" || response.data.get("error").is_some();
+                        
+                        if has_error {
+                            // Transaction failed - get the specific error message
+                            let error_msg = response.data.get("error")
+                                .and_then(|e| e.as_str())
+                                .or_else(|| response.data.get("message").and_then(|m| m.as_str()))
+                                .unwrap_or("Unknown error");
                             
+                            error!("❌ Buy transaction failed: {}", error_msg);
+                            
+                            // Check for common error types
+                            if error_msg.contains("slippage") || error_msg.contains("TooMuchSolRequired") || error_msg.contains("0x1772") {
+                                error!("❌ Transaction failed due to slippage error - price moved too quickly");
+                                info!("🔓 UNLOCKING TOKEN DETECTION since transaction failed due to slippage");
+                            } else {
+                                error!("❌ Transaction failed with error: {}", error_msg);
+                                info!("🔓 UNLOCKING TOKEN DETECTION since transaction failed");
+                            }
+                            
+                            // Always unlock token detection when a transaction fails
+                            token_detector::set_position_monitoring_active(false);
+                            std::env::remove_var("_STOP_WEBSOCKET_LISTENER");
+                        } else {
+                            // Transaction appears successful
                             info!("✅ Buy transaction successful! Signature: {}", signature);
                             info!("🔗 View on explorer: https://explorer.solana.com/tx/{}", signature);
                             
                             // Calculate performance metrics if we have both signatures
                             if let Some(mint_sig) = mint_signature {
+                                // Setup for performance metrics calculation
                                 info!("🕒 Computing performance metrics between mint and buy transactions...");
+                                info!("🔗 Mint tx: {}, Buy tx: {}", mint_sig, signature);
+                                
                                 // Spawn a separate task to avoid blocking the queue processing
                                 let signature_clone = signature.clone();
                                 tokio::spawn(async move {
                                     // Add extra delay before computing metrics to ensure transaction is indexed
-                                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                                    // Increase from 5 to 10 seconds to allow for finalization
+                                    info!("⏱️ Waiting 10 seconds before calculating performance metrics...");
+                                    tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
                                     
+                                    info!("🔍 Now calculating performance for mint tx: {} and buy tx: {}", mint_sig, signature_clone);
                                     match trading::performance::compute_performance_metrics(&mint_sig, &signature_clone).await {
                                         Ok((block_diff, time_diff_ms)) => {
                                             info!("🚀 PERFORMANCE METRICS - Mint to Buy: {} ms ({} blocks)", time_diff_ms, block_diff);
@@ -1458,10 +1570,9 @@ async fn process_token_queue(
                                             } else if time_diff_ms < 10000 {
                                                 "⚠️ MODERATE"
                                             } else {
-                                                "⛔ SLOW"
+                                                "🐢 SLOW"
                                             };
-                                            
-                                            info!("🏆 Performance rating: {} ({} ms)", performance_category, time_diff_ms);
+                                            info!("🏁 TRANSACTION SPEED: {} - {} ms ({} blocks)", performance_category, time_diff_ms, block_diff);
                                         },
                                         Err(e) => {
                                             warn!("Failed to compute performance metrics: {}", e);
@@ -1472,12 +1583,17 @@ async fn process_token_queue(
                             } else {
                                 warn!("⚠️ Could not calculate performance metrics - missing mint transaction signature");
                             }
-                        } else {
-                            error!("❌ Buy transaction failed: {:?}", response.data);
+                            
+                            // Keep the token detection paused until we sell this position
+                            info!("📊 Starting price monitoring for token: {}", token_data.mint);
+                            // Token detection remains paused
                         }
                     },
                     Err(e) => {
                         error!("❌ Failed to execute buy transaction: {}", e);
+                        info!("🔓 UNLOCKING TOKEN DETECTION since transaction failed");
+                        token_detector::set_position_monitoring_active(false);
+                        std::env::remove_var("_STOP_WEBSOCKET_LISTENER");
                     }
                 }
             } else if !auto_buy {
@@ -1497,203 +1613,89 @@ async fn main() -> Result<()> {
     // Load environment variables from the config.env file
     dotenv::from_filename("config.env").ok();
 
-    // Example of accessing an environment variable
-    let private_key = env::var("PRIVATE_KEY").expect("PRIVATE_KEY must be set.");
-    let wallet = env::var("WALLET").expect("WALLET must be set.");
-
-    println!("Private Key: {}", private_key);
-    println!("Wallet: {}", wallet);
-
-    // Set up logging
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .format(|buf, record| {
-            writeln!(
-                buf,
-                "{} [{}] {}",
-                chrono::Local::now().format("%Y-%m-%d %H:%M:%S.%3f"),
-                record.level(),
-                record.args()
-            )
-        })
-        .init();
-
-    // Ensure the db is initialized
-    if let Err(e) = db::init_db(false).await {
-        error!("Failed to initialize database: {}", e);
-        return Err(anyhow::anyhow!("Database initialization failed: {}", e));
-    }
-
-    // Test Trader Node connection before proceeding
-    info!("🌐 Testing Chainstack Trader Node connection to: {}", crate::config::get_trader_node_rpc_url());
-    let test_client = reqwest::Client::new();
-    let (username, password) = crate::config::get_trader_node_credentials();
-    
-    // Check if credentials are available
-    if username.is_empty() || password.is_empty() {
-        error!("⚠️ Trader Node credentials are missing. Please check your config.env file.");
-        warn!("Falling back to standard RPC for transactions (performance will be degraded)");
-        std::env::set_var("USE_TRADER_NODE_FOR_TRANSACTIONS", "false");
-    } else {
-        // First, try a simple health check with authentication
-        match test_client.post(&crate::config::get_trader_node_rpc_url())
-            .basic_auth(&username, Some(&password))
-            .json(&serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "getHealth",
-            }))
-            .send()
-            .await {
-                Ok(response) => {
-                    if response.status().is_success() {
-                        info!("✅ Trader Node connection successful!");
-                        
-                        // Try getting a blockhash to confirm RPC functionality
-                        match test_client.post(&crate::config::get_trader_node_rpc_url())
-                            .basic_auth(&username, Some(&password))
-                            .json(&serde_json::json!({
-                                "jsonrpc": "2.0",
-                                "id": 1,
-                                "method": "getLatestBlockhash",
-                                "params": [{"commitment": "processed"}]
-                            }))
-                            .send()
-                            .await {
-                                Ok(blockhash_response) => {
-                                    if blockhash_response.status().is_success() {
-                                        match blockhash_response.json::<serde_json::Value>().await {
-                                            Ok(json) => {
-                                                if let Some(result) = json.get("result").and_then(|r| r.get("value")).and_then(|v| v.get("blockhash")) {
-                                                    info!("✅ Trader Node RPC fully functional! Latest blockhash: {}", result);
-                                                    std::env::set_var("USE_TRADER_NODE_FOR_TRANSACTIONS", "true");
-                                                } else {
-                                                    warn!("⚠️ Trader Node returned unexpected response format");
-                                                    std::env::set_var("USE_TRADER_NODE_FOR_TRANSACTIONS", "true"); // Still use it since connection works
-                                                }
-                                            },
-                                            Err(e) => {
-                                                warn!("⚠️ Failed to parse blockhash response: {}", e);
-                                                std::env::set_var("USE_TRADER_NODE_FOR_TRANSACTIONS", "true"); // Still use it since connection works
-                                            }
-                                        }
-                                    } else {
-                                        warn!("⚠️ Trader Node blockhash check failed with status: {}", blockhash_response.status());
-                                        std::env::set_var("USE_TRADER_NODE_FOR_TRANSACTIONS", "true"); // Still use it since basic connection works
-                                    }
-                                },
-                                Err(e) => {
-                                    warn!("⚠️ Trader Node blockhash check failed: {}", e);
-                                    std::env::set_var("USE_TRADER_NODE_FOR_TRANSACTIONS", "true"); // Still use it since basic connection works
-                                }
-                            }
-                    } else {
-                        error!("❌ Trader Node connection failed with status: {}", response.status());
-                        warn!("Response body: {:?}", response.text().await.unwrap_or_default());
-                        warn!("Falling back to standard RPC for transactions");
-                        std::env::set_var("USE_TRADER_NODE_FOR_TRANSACTIONS", "false");
-                    }
-                },
-                Err(e) => {
-                    error!("❌ Trader Node connection test failed: {}", e);
-                    warn!("Falling back to standard RPC for transactions");
-                    std::env::set_var("USE_TRADER_NODE_FOR_TRANSACTIONS", "false");
-                }
-        }
-    }
-
-    // Use optimized client
-    let client = create_optimized_client()?;
-    let client = Arc::new(client);
-
-    // Get command line arguments
+    // Initialize logger with appropriate level based on --quiet flag
     let args: Vec<String> = std::env::args().collect();
-    let mut fast_detection = false;
-    let mut no_auto_buy = false;
+    let quiet_mode = args.contains(&"--quiet".to_string()) || args.contains(&"-q".to_string());
     
-    // Parse command line flags
-    for arg in &args {
-        match arg.as_str() {
-            "--fast-detection" => {
-                fast_detection = true;
-                info!("Fast detection mode enabled");
-            }
-            "--no-auto-buy" => {
-                no_auto_buy = true;
-                info!("Auto-buy disabled - manual trade confirmation required");
-            }
-            _ => {}
-        }
-    }
-    
-    // If auto-buy is disabled via command line, override the environment variable
-    if no_auto_buy {
-        std::env::set_var("AUTO_BUY", "false");
-    }
-    
-    // Get private key and buy configuration
-    let private_key = std::env::var("PRIVATE_KEY")
-        .unwrap_or_else(|_| "".to_string());
-    
-    let amount = std::env::var("AMOUNT")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(0.1); // Default to 0.1 SOL
-    
-    let slippage = std::env::var("SLIPPAGE")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(30.0); // Default to 30% slippage
-    
-    if private_key.is_empty() {
-        warn!("⚠️ PRIVATE_KEY is not set. Buy transactions will not work!");
+    // Set up the appropriate log level
+    if quiet_mode {
+        setup_logger(log::LevelFilter::Warn)?;
     } else {
-        // Spawn the token queue processor task
-        let client_clone = client.clone();
-        let private_key_clone = private_key.clone();
-        
-        info!("Starting the token queue processor for automatic buying");
-        tokio::spawn(async move {
-            process_token_queue(client_clone, private_key_clone, amount, slippage).await;
-        });
+        setup_logger(log::LevelFilter::Info)?;
     }
     
-    // Register a shutdown handler
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    let shutdown_handle = tokio::spawn(async move {
-        // Wait for CTRL+C signal
-        tokio::signal::ctrl_c().await.expect("Failed to listen for ctrl+c event");
-        info!("Received shutdown signal. Shutting down gracefully...");
-        
-        // Set a flag to terminate all tasks gracefully
-        std::env::set_var("_STOP_ALL_TASKS", "true");
-        
-        // Allow some time for tasks to shut down
-        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-        
-        // Cancel all remaining tasks and clean up
-        if let Ok(handles) = crate::api::TASK_HANDLES.try_lock() {
-            for handle in handles.iter() {
-                handle.abort();
-            }
+    // Print banner and version info
+    print_banner();
+    
+    // Check if we need to run the ATA fix test
+    if args.contains(&"--test-ata-fix".to_string()) {
+        info!("Running test for associated token account fix");
+        return test_associated_token_account_fix().await.map_err(|e| e.into());
+    }
+    
+    // Parse command line arguments and run the appropriate function
+    let command = parse_args();
+    
+    match command {
+        Command::MonitorWebSocket => {
+            info!("Starting WebSocket monitoring for new tokens...");
+            websocket_monitor_tokens().await?;
         }
-        
-        // Send the shutdown signal to the main loop
-        let _ = shutdown_tx.send(());
-    });
-    
-    // Start the WebSocket monitor directly instead of calling monitor_websocket()
-    // This avoids the recursion issue
-    info!("Starting WebSocket monitor for new tokens with automatic buying");
-    
-    // Start the token detector
-    let token_detector_result = token_detector::listen_for_new_tokens(config::get_wss_endpoint()).await;
-    
-    if let Err(e) = token_detector_result {
-        error!("Token detector error: {}", e);
+        Command::ExtractTokens => {
+            info!("Extracting tokens from WebSocket data...");
+            extract_tokens().await?;
+        }
     }
-    
-    // Final cleanup
-    info!("Cleaning up and exiting...");
     
     Ok(())
+}
+
+// Test function to check our associated bonding curve account fix
+async fn test_associated_token_account_fix() -> Result<(), anyhow::Error> {
+    use solana_sdk::signature::Keypair;
+    use std::str::FromStr;
+    use crate::create_buy_instruction::derive_associated_pump_curve;
+    use solana_sdk::pubkey::Pubkey;
+    
+    // Get private key from environment
+    let private_key = std::env::var("PRIVATE_KEY").expect("PRIVATE_KEY must be set");
+    
+    // Use a sample mint and bonding curve from the error log
+    let mint = "QLpykFS5eSrwEuitgbavYppq7eXwKdcLre6fgNZpump";
+    let bonding_curve = "3xXqZXbQt9SEgTfh1wpHxsKdPuGCUUFn4A8Ruj32dh5V";
+    
+    // Derive the associated bonding curve
+    let associated_bonding_curve = derive_associated_pump_curve(
+        &Pubkey::from_str(mint)?,
+        &Pubkey::from_str(bonding_curve)?
+    );
+    
+    info!("👉 Testing associated bonding curve account creation");
+    info!("🔍 Mint: {}", mint);
+    info!("🔍 Bonding curve: {}", bonding_curve);
+    info!("🔍 Associated bonding curve: {}", associated_bonding_curve);
+    
+    // Create HTTP client
+    let client = reqwest::Client::new();
+    
+    // Default slippage
+    let slippage = 40.0;
+    
+    // Try to buy the token to test our fix
+    match crate::api::transactions::buy_token(
+        &client,
+        &private_key,
+        mint,
+        0.01,
+        slippage
+    ).await {
+        Ok(response) => {
+            info!("✅ Buy token response: {:?}", response);
+            Ok(())
+        },
+        Err(e) => {
+            error!("❌ Buy token failed: {}", e);
+            Err(anyhow::anyhow!("Buy token failed: {}", e))
+        }
+    }
 }
