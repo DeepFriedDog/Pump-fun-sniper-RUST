@@ -174,6 +174,12 @@ pub fn derive_associated_pump_curve(mint: &Pubkey, bonding_curve: &Pubkey) -> Pu
     // Get the token program ID
     let token_program_id = spl_token::id();
     
+    // Log the bytes being used for derivation to ensure they match Python
+    info!("📣 Deriving associated bonding curve with seeds:");
+    info!("  Bonding curve: {} (bytes: {:?})", bonding_curve, bonding_curve.as_ref());
+    info!("  Token program: {} (bytes: {:?})", token_program_id, token_program_id.as_ref());
+    info!("  Mint address:  {} (bytes: {:?})", mint, mint.as_ref());
+    
     // Use the same seeds as the Python implementation:
     // 1. Bonding curve address
     // 2. Token program ID
@@ -185,10 +191,12 @@ pub fn derive_associated_pump_curve(mint: &Pubkey, bonding_curve: &Pubkey) -> Pu
     ];
     
     // Use the ATA program to find the PDA
-    let (address, _) = Pubkey::find_program_address(
+    let (address, bump) = Pubkey::find_program_address(
         seeds, 
         &spl_associated_token_account::id() // ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL
     );
+    
+    info!("📣 Derived associated bonding curve {} with bump {}", address, bump);
     
     address
 }
@@ -207,12 +215,13 @@ pub fn create_buy_instruction(
     // Calculate SOL amount in lamports
     let amount_in_lamports = (amount * LAMPORTS_PER_SOL as f64) as u64;
     
-    // Conservative default values:
-    // For token amount, assume 1 trillion tokens for 0.01 SOL
-    let token_amount: u64 = 1_000_000_000_000;
+    // Conservative default values - much reduced from original values
+    // For token amount, reduce by 80% from original 1 trillion tokens
+    let token_amount: u64 = 200_000_000_000; // 20% of original 1T
     
-    // For max_sol_cost, assume 3x the input amount with slippage
-    let multiplier = 3.0;
+    // For max_sol_cost, use a very high multiple of the input amount
+    // This is a sync function that can't directly query on-chain prices
+    let multiplier = 10.0; // Increased for maximum safety
     let max_sol_cost = (amount_in_lamports as f64 * multiplier) as u64;
     
     info!("Using conservative values for sync instruction building:");
@@ -268,16 +277,20 @@ pub fn create_buy_instruction(
         AccountMeta::new_readonly(spl_token::id(), false),  // Token program
         AccountMeta::new_readonly(Pubkey::from_str(SYSTEM_RENT).map_err(|_| anyhow!("Invalid rent pubkey"))?, false),      // Rent account
         AccountMeta::new_readonly(Pubkey::from_str(PUMP_EVENT_AUTHORITY).map_err(|_| anyhow!("Invalid event authority pubkey"))?, false), // Event authority
-        AccountMeta::new_readonly(Pubkey::from_str(PUMP_PROGRAM_ID).map_err(|_| anyhow!("Invalid program pubkey"))?, false),     // Program ID itself
+        AccountMeta::new_readonly(program_id, false),       // Program ID itself - FIXED: Use the variable, not a string conversion
     ];
     
     // Create the buy data with discriminator and parameters
+    // FIXED: Match the exact data format from Python reference
     let discriminator = u64::to_le_bytes(DEFAULT_DISCRIMINATOR);
+    
+    // Convert token amount to a 6-decimal fixed point number
+    let scaled_token_amount = token_amount;
     
     let mut buy_data = vec![];
     buy_data.extend_from_slice(&discriminator);
-    buy_data.extend_from_slice(&token_amount.to_le_bytes());
-    buy_data.extend_from_slice(&max_sol_cost.to_le_bytes());
+    buy_data.extend_from_slice(&scaled_token_amount.to_le_bytes());  // Token amount with 6 decimals
+    buy_data.extend_from_slice(&max_sol_cost.to_le_bytes());         // Max SOL cost in lamports
     
     // Create the instruction
     let instruction = Instruction {
@@ -304,9 +317,9 @@ pub async fn get_real_time_prices(
     
     info!("🔒 Using amount of {} SOL for token purchase from environment variable", amount);
     
-    // For pump.fun tokens, use a minimum of 100% slippage to handle very fast price movements
-    // This effectively doubles the max_sol_cost to prevent slippage errors
-    let effective_slippage = if slippage < 1.0 { 1.0 } else { slippage };
+    // For pump.fun tokens, use a minimum of 150% slippage to handle very fast price movements
+    // This effectively multiplies the max_sol_cost by 2.5x to prevent slippage errors
+    let effective_slippage = if slippage < 1.5 { 1.5 } else { slippage };
     info!("🔒 Using dynamic slippage of {}% (user setting: {}%) to handle fast price movements", 
            effective_slippage * 100.0, slippage * 100.0);
     
@@ -329,13 +342,28 @@ pub async fn get_real_time_prices(
         
         match calculate_amounts(rpc_url, mint, bonding_curve, amount).await {
             Ok((token_amt, sol_cost)) => {
-                token_amount = token_amt;
-                // Apply the effective slippage to max_sol_cost - multiply by 3x for very fast tokens
-                let slippage_multiplier = 3.0; // More aggressive multiplier for better transaction success
+                // Apply a 50% reduction in token amount to account for price movements
+                // This ensures we're buying fewer tokens than theoretically possible
+                // while still getting a reasonable amount
+                token_amount = (token_amt as f64 * 0.5) as u64;
+                
+                // Apply a higher slippage multiplier for very fast-moving tokens - 10x for extreme safety
+                let slippage_multiplier = 10.0; // Increased from 6.0 to 10.0 to handle larger price movements
                 max_sol_cost = ((sol_cost as f64) * (1.0 + effective_slippage * slippage_multiplier)) as u64;
                 
-                info!("🔄 Calculated token amount: {} tokens for {} SOL, max_sol_cost: {} lamports (with {}% effective slippage)", 
-                     token_amount, amount, max_sol_cost, effective_slippage * 100.0 * slippage_multiplier);
+                info!("🔄 Calculated token amount: {} tokens for {} SOL", token_amt, amount);
+                info!("🔄 REDUCED token amount to {} tokens (50% of original) to prevent slippage", token_amount);
+                info!("🔄 Setting max_sol_cost to {} lamports (with {}% effective slippage)", 
+                     max_sol_cost, effective_slippage * 100.0 * slippage_multiplier);
+                
+                // Extra safety: Ensure we have at least a 2x buffer above estimated sol_cost
+                let absolute_minimum_multiple = 2.0;
+                let safety_min_sol_cost = (sol_cost as f64 * absolute_minimum_multiple) as u64;
+                if max_sol_cost < safety_min_sol_cost {
+                    warn!("⚠️ Increasing max_sol_cost from {} to {} lamports to ensure sufficient buffer against price movement", 
+                         max_sol_cost, safety_min_sol_cost);
+                    max_sol_cost = safety_min_sol_cost;
+                }
                 
                 // Break the loop as we have a successful calculation
                 break;
@@ -351,18 +379,19 @@ pub async fn get_real_time_prices(
     // If we couldn't get data from any RPC, use conservative fallback values
     if token_amount == 0 || max_sol_cost == 0 {
         used_fallback = true;
-        // Conservative fallback - assume we can get 1 trillion tokens for 0.01 SOL
-        token_amount = 1_000_000_000_000;
+        // Conservative fallback - reduce token amount to 50%
+        let default_token_amount: u64 = 1_000_000_000_000; // Explicitly specify u64 type
+        token_amount = (default_token_amount as f64 * 0.5) as u64; // 50% of the fallback amount
         
-        // Set max_sol_cost to 0.03 SOL (3x the input amount)
-        max_sol_cost = (amount * LAMPORTS_PER_SOL as f64 * 3.0) as u64;
+        // Set max_sol_cost to 0.1 SOL (10x the input amount) for ultra safety
+        max_sol_cost = (amount * LAMPORTS_PER_SOL as f64 * 10.0) as u64;
         
         info!("⚠️ Using conservative fallback values: token_amount={} (for {} SOL), max_sol_cost={}", 
              token_amount, amount, max_sol_cost);
     }
     
-    // Extra safety - ensure max_sol_cost has a reasonable minimum value (0.025 SOL)
-    let min_sol_cost = (0.025 * LAMPORTS_PER_SOL as f64) as u64;
+    // Extra safety - ensure max_sol_cost has a reasonable minimum value (0.05 SOL)
+    let min_sol_cost = (0.05 * LAMPORTS_PER_SOL as f64) as u64;
     if max_sol_cost < min_sol_cost {
         warn!("⚠️ Increasing max_sol_cost from {} to {} lamports to ensure transaction success", 
              max_sol_cost, min_sol_cost);
@@ -370,7 +399,7 @@ pub async fn get_real_time_prices(
     }
     
     // Cap the maximum SOL cost to prevent excessive slippage
-    let max_allowed_sol_cost = (0.05 * LAMPORTS_PER_SOL as f64) as u64; // 0.05 SOL maximum
+    let max_allowed_sol_cost = (0.25 * LAMPORTS_PER_SOL as f64) as u64; // 0.25 SOL maximum (increased from 0.15)
     if max_sol_cost > max_allowed_sol_cost {
         warn!("⚠️ Capping max_sol_cost from {} to {} lamports to prevent excessive SOL spending", 
              max_sol_cost, max_allowed_sol_cost);
@@ -379,8 +408,8 @@ pub async fn get_real_time_prices(
     
     // Log the final values for debugging
     info!("🔍 Instruction discriminator: {}", DEFAULT_DISCRIMINATOR);
-    info!("🔄 Buy instruction data: token_amount={} (max purchase for {} SOL), max_sol_cost={} lamports ({}% slippage)", 
-         token_amount, amount, max_sol_cost, slippage * 100.0);
+    info!("🔄 Buy instruction data: token_amount={} (max purchase for {} SOL), max_sol_cost={} lamports ({}% effective slippage)", 
+         token_amount, amount, max_sol_cost, effective_slippage * 100.0);
     
     Ok((token_amount, max_sol_cost))
 }

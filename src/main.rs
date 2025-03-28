@@ -81,6 +81,11 @@ fn parse_args() -> Command {
         return Command::ExtractTokens;
     }
     
+    // Check for --monitor-websocket explicitly
+    if args.iter().any(|arg| arg == "--monitor-websocket") {
+        return Command::MonitorWebSocket;
+    }
+    
     // Default to monitor mode
     Command::MonitorWebSocket
 }
@@ -124,6 +129,47 @@ fn create_optimized_client() -> Result<reqwest::Client> {
 
 /// Monitor websocket for new tokens
 async fn websocket_monitor_tokens() -> Result<()> {
+    // Ensure AUTO_BUY is set according to config.env
+    let auto_buy_from_config = dotenv::var("AUTO_BUY").unwrap_or_else(|_| "true".to_string());
+    std::env::set_var("AUTO_BUY", auto_buy_from_config.clone());
+    info!("AUTO_BUY set to: {}", auto_buy_from_config);
+    
+    // Initialize the database to prevent "Database not initialized" errors
+    if let Err(e) = db::init_db(false).await {
+        warn!("Failed to initialize database: {}", e);
+        info!("Continuing without database support - position tracking will be limited");
+    } else {
+        info!("✅ Database initialized successfully");
+    }
+    
+    // Get trading parameters from config.env
+    let private_key = dotenv::var("PRIVATE_KEY").expect("PRIVATE_KEY must be set in config.env");
+    let amount = dotenv::var("AMOUNT")
+        .unwrap_or_else(|_| "0.01".to_string())
+        .parse::<f64>()
+        .unwrap_or(0.01);
+    let slippage = dotenv::var("SLIPPAGE")
+        .unwrap_or_else(|_| "40.0".to_string())
+        .parse::<f64>()
+        .unwrap_or(40.0);
+    
+    // Create a client for making HTTP requests
+    let client = reqwest::Client::new();
+    let client_arc = Arc::new(client);
+    
+    // Start the token queue processing in a background task
+    let queue_client = client_arc.clone();
+    let queue_private_key = private_key.clone();
+    tokio::spawn(async move {
+        info!("🚀 Starting token queue processing task for auto-buying");
+        process_token_queue(
+            queue_client, 
+            queue_private_key,
+            amount, 
+            slippage
+        ).await;
+    });
+    
     // Use the token detector to monitor for new tokens
     token_detector::listen_for_new_tokens(config::get_wss_endpoint()).await?;
     Ok(())
@@ -1012,37 +1058,34 @@ async fn process_buy_result(
                 .parse::<i64>()
                 .unwrap_or(1);
                 
+            info!("Enforcing MAX_POSITIONS setting: {}", max_positions);
+                
             match db::count_pending_trades() {
                 Ok(pending_count) => {
                     if pending_count >= max_positions {
-                        info!("MAX_POSITIONS ({}) reached after buying token {}", max_positions, mint);
-                        info!("🔒 Focusing all resources on monitoring this position");
-                        
-                        // Make sure token detection is stopped immediately using the new atomic flag method
-                        info!("🛑 Stopping token detection to focus on current position");
+                        info!("🔒 MAX_POSITIONS ({}) reached - not processing any more tokens until current positions are sold", max_positions);
+                        // Make sure token detection is paused
                         token_detector::set_position_monitoring_active(true);
                         
-                        // Clear any pending tokens from the queue that won't be processed
-                        // since we're at max positions
+                        // Clear any pending tokens from the queue
                         if let Ok(mut api_queue) = crate::api::NEW_TOKEN_QUEUE.try_lock() {
                             let previous_size = api_queue.len();
-                            api_queue.clear();
-                            info!("🗑️ Cleared token queue ({} items) since max positions reached", previous_size);
+                            if previous_size > 0 {
+                                api_queue.clear();
+                                info!("🗑️ Cleared token queue ({} items) since max positions reached", previous_size);
+                            }
                         }
                         
-                        // Clone the mint string for the spawned task
-                        let mint_clone = mint.to_string();
-                        
-                        // Start dedicated monitoring of the bonding curve in a new task
-                        tokio::spawn(async move {
-                            if let Err(e) = monitor_bonding_curve(mint_clone, price).await {
-                                warn!("Bonding curve monitoring error: {}", e);
-                            }
-                        });
+                        // Sleep for a while before checking again
+                        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                    } else {
+                        info!("✅ Current positions: {}/{} - can process more tokens", pending_count, max_positions);
                     }
                 }
                 Err(e) => {
                     warn!("Could not check pending trades count: {}", e);
+                    // To be safe, assume we might be at max positions
+                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                 }
             }
 
@@ -1396,13 +1439,17 @@ async fn process_token_queue(
         warn!("AUTO_BUY is disabled - will detect tokens but not execute trades");
     }
     
-    // Get the minimum liquidity threshold from environment
-    let min_liquidity = std::env::var("MIN_LIQUIDITY")
-        .unwrap_or_else(|_| "5.0".to_string())
+    // Get the minimum liquidity threshold from environment using dotenv to ensure we read from config.env
+    let min_liquidity = dotenv::var("MIN_LIQUIDITY")
+        .unwrap_or_else(|_| "30.0".to_string())
         .parse::<f64>()
-        .unwrap_or(5.0);
+        .unwrap_or(30.0);
     
     info!("Using minimum liquidity threshold of {:.2} SOL", min_liquidity);
+    
+    // Keep track of the previous count to avoid spamming logs
+    let mut previous_pending_count = -1;
+    let mut startup_logged = false;
     
     loop {
         // Check for shutdown signal
@@ -1416,12 +1463,27 @@ async fn process_token_queue(
             .unwrap_or_else(|_| "1".to_string())
             .parse::<i64>()
             .unwrap_or(1);
+        
+        // Only log this info once at startup
+        if !startup_logged {
+            info!("Enforcing MAX_POSITIONS setting: {}", max_positions);
+            startup_logged = true;
+        }
                 
         match db::count_pending_trades() {
             Ok(pending_count) => {
+                // Only log position count changes or startup message
+                if pending_count != previous_pending_count {
+                    if pending_count >= max_positions {
+                        info!("🔒 MAX_POSITIONS ({}) reached - not processing any more tokens until current positions are sold", max_positions);
+                    } else {
+                        info!("✅ Current positions: {}/{} - can process more tokens", pending_count, max_positions);
+                    }
+                    previous_pending_count = pending_count;
+                }
+                
                 if pending_count >= max_positions {
-                    info!("MAX_POSITIONS ({}) reached - not processing any more tokens", max_positions);
-                    // Make sure token detection is stopped
+                    // Make sure token detection is paused
                     token_detector::set_position_monitoring_active(true);
                     
                     // Clear any pending tokens from the queue
@@ -1435,11 +1497,12 @@ async fn process_token_queue(
                     
                     // Sleep for a while before checking again
                     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                    continue;
                 }
             }
             Err(e) => {
                 warn!("Could not check pending trades count: {}", e);
+                // To be safe, assume we might be at max positions
+                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
             }
         }
         
@@ -1447,7 +1510,6 @@ async fn process_token_queue(
         if token_detector::is_token_detection_paused() {
             // If we're monitoring a position, don't process more tokens
             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-            continue;
         }
         
         // Try to get a token from the API queue
@@ -1626,6 +1688,15 @@ async fn main() -> Result<()> {
     
     // Print banner and version info
     print_banner();
+    
+    // Initialize database with option to reset pending trades
+    match db::init_db(true).await {
+        Ok(_) => info!("✅ Database initialized successfully"),
+        Err(e) => {
+            error!("❌ Failed to initialize database: {}", e);
+            return Err(e.into());
+        }
+    }
     
     // Check if we need to run the ATA fix test
     if args.contains(&"--test-ata-fix".to_string()) {

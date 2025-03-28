@@ -342,18 +342,31 @@ pub fn update_trade_sold(id: i64, sell_price: f64, sell_liquidity: f64) -> Resul
     Ok(())
 }
 
-/// Count pending trades
-#[inline]
+/// Count the number of pending trades
 pub fn count_pending_trades() -> Result<i64> {
-    let db = get_db_connection()?;
-    let conn = db.lock().unwrap();
+    // Get the database connection, or initialize if not ready
+    let conn = match get_db_connection() {
+        Ok(conn) => conn,
+        Err(e) => {
+            // If the connection is not initialized, try to initialize it
+            if format!("{}", e).contains("Database not initialized") {
+                info!("Initializing database because it wasn't initialized yet");
+                let rt = tokio::runtime::Runtime::new()?;
+                rt.block_on(init_db(false))?;
+                get_db_connection()?
+            } else {
+                return Err(e);
+            }
+        }
+    };
 
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(*) as pendingCount FROM trades WHERE status='pending'",
+    let db_conn = conn.lock().unwrap();
+    let count: i64 = db_conn.query_row(
+        "SELECT COUNT(*) FROM trades WHERE status = 'pending'",
         [],
         |row| row.get(0),
     )?;
-
+    
     Ok(count)
 }
 
