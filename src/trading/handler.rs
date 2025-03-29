@@ -118,22 +118,24 @@ pub async fn handle_buy_token(token: &crate::api::models::TokenData, force: bool
             if signature != "unknown" {
                 // Record in database
                 info!("💾 Recording transaction in database");
-                match database::insert_trade(
+                let buy_time = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64;
+
+                match crate::db::insert_trade(
                     &token.mint,
                     &token.name.clone().unwrap_or_else(|| "Unknown".to_string()),
-                    amount,
-                    status.clone(),
-                    &signature,
-                    0.0, // We don't have liquidity information here
-                    0.0, // We don't have price information here
-                    Some("pending"), // Mark as pending until confirmed
-                    Some(format!("{:.0}", detection_to_buy_ms)),
-                ).await {
+                    amount, // Use amount as the buy_price
+                    0.0, // buy_liquidity is not known at this point
+                    total_duration.as_millis() as i64, // detection_time
+                    buy_time
+                ) {
                     Ok(_) => {
-                        info!("✅ Successfully recorded transaction in database");
+                        info!("✅ Successfully recorded transaction in database using db::insert_trade");
                     },
                     Err(e) => {
-                        warn!("⚠️ Failed to record transaction in database: {}", e);
+                        warn!("⚠️ Failed to record trade in database: {}", e);
                     }
                 }
                 
@@ -200,7 +202,7 @@ async fn verify_transaction_and_update_status(
             Err(e) => {
                 error!("❌ Invalid signature format '{}': {}", signature, e);
                 // Update database to reflect failed transaction
-                let _ = database::update_trade_status(&mint, "failed").await;
+                let _ = crate::db::update_trade_status(&mint, "failed").await;
                 cleanup_monitoring_flags(&mint, false).await;
                 return;
             }
@@ -227,7 +229,7 @@ async fn verify_transaction_and_update_status(
                 Ok(Some(Err(e))) => {
                     error!("❌ TRANSACTION FAILED: {}, Error: {:?}", signature, e);
                     // Transaction was rejected by the network
-                    let _ = database::update_trade_status(&mint, "failed").await;
+                    let _ = crate::db::update_trade_status(&mint, "failed").await;
                     cleanup_monitoring_flags(&mint, false).await;
                     return;
                 },
@@ -259,7 +261,7 @@ async fn verify_transaction_and_update_status(
                             },
                             Ok(Some(Err(e))) => {
                                 error!("❌ TRANSACTION FAILED (via backup RPC): {}, Error: {:?}", signature, e);
-                                let _ = database::update_trade_status(&mint, "failed").await;
+                                let _ = crate::db::update_trade_status(&mint, "failed").await;
                                 cleanup_monitoring_flags(&mint, false).await;
                                 return;
                             },
@@ -274,7 +276,7 @@ async fn verify_transaction_and_update_status(
         
         if transaction_confirmed {
             // Update database to reflect confirmed purchase if transaction is confirmed
-            let _ = database::update_trade_status(&mint, "confirmed").await;
+            let _ = crate::db::update_trade_status(&mint, "confirmed").await;
             info!("✅ Transaction {} confirmed on-chain", signature);
         } else {
             warn!("⚠️ Transaction was not confirmed after {} attempts - checking wallet balance", 
@@ -300,7 +302,7 @@ async fn verify_transaction_and_update_status(
                     token_in_wallet = true;
                     
                     // Update database to reflect confirmed purchase
-                    match database::update_trade_status(&mint, "confirmed").await {
+                    match crate::db::update_trade_status(&mint, "confirmed").await {
                         Ok(_) => info!("✅ Updated token status to 'confirmed' in database"),
                         Err(e) => warn!("Failed to update token status: {}", e),
                     }
@@ -329,7 +331,7 @@ async fn verify_transaction_and_update_status(
                   mint, max_wallet_check_attempts);
             
             // Update database to reflect failed purchase
-            match database::update_trade_status(&mint, "failed").await {
+            match crate::db::update_trade_status(&mint, "failed").await {
                 Ok(_) => info!("Updated token status to 'failed' in database"),
                 Err(e) => warn!("Failed to update token status: {}", e),
             }

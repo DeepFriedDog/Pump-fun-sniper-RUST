@@ -760,12 +760,13 @@ async fn wait_for_transaction_confirmation(signature: &str) -> Result<(), anyhow
     }
 }
 
-/// Sell a token using pump.fun API
+/// Sell a token
 pub async fn sell_token(
     client: &Client,
+    private_key: &str,
     mint: &str,
     amount: &str,
-    private_key: &str,
+    fast_mode: bool,
 ) -> Result<ApiResponse, anyhow::Error> {
     // Log the action with correct info but without slippage since it's not needed
     info!("🔄 Selling {} of token {}", amount, mint);
@@ -826,7 +827,7 @@ pub async fn sell_token(
     
     // If the sell was successful, completely reset token detection to resume normal operation
     if api_response.status == "success" {
-        info!("✅ Sell transaction successful!");
+        info!("✅ SELL TOKEN SUCCESS: {} - {}x lamports", mint, amount);
         
         // Get the signature from the response
         if let Some(signature) = api_response.data.get("signature").and_then(|s| s.as_str()) {
@@ -836,8 +837,8 @@ pub async fn sell_token(
         
         // Regardless of success or failure, we want to reset the token detection state
         info!("🔓 UNLOCKING TOKEN DETECTION after successful sell");
-        std::env::remove_var("_STOP_WEBSOCKET_LISTENER");
         crate::token_detector::set_position_monitoring_active(false);
+        crate::token_detector::set_token_detection_active(true);
         
         // Check for auto-buy in .env to provide clear log message
         let auto_buy = std::env::var("AUTO_BUY")
@@ -874,8 +875,8 @@ pub async fn sell_token(
             
             // If token is already sold or not found, we can safely unlock
             info!("🔓 UNLOCKING TOKEN DETECTION since token appears to be already sold or not found");
-            std::env::remove_var("_STOP_WEBSOCKET_LISTENER");
             crate::token_detector::set_position_monitoring_active(false);
+            crate::token_detector::set_token_detection_active(true);
         }
     }
     

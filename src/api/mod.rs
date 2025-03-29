@@ -37,7 +37,7 @@ use tokio::sync::oneshot;
 // Global cached values
 lazy_static! {
     static ref CACHED_BLOCKHASH: Mutex<(String, u64)> = Mutex::new((String::new(), 0));
-    static ref WS_CONNECTION_POOL: Mutex<Vec<(tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<std::net::TcpStream>>, tokio_tungstenite::tungstenite::handshake::client::Response)>> = Mutex::new(Vec::new());
+    static ref WS_CONNECTION_POOL: Mutex<Vec<Option<(String, String)>>> = Mutex::new(Vec::with_capacity(3));
     pub static ref HTTP_CLIENT: Client = create_speed_optimized_client();
     static ref TRADER_NODE_WSS_URL: String = std::env::var("TRADER_NODE_WSS_URL")
         .unwrap_or_else(|_| "wss://solana-mainnet.core.chainstack.com/ws".to_string());
@@ -80,4 +80,29 @@ pub async fn get_bonding_curve_for_mint(mint: &str) -> Option<String> {
     }
     
     None
-} 
+}
+
+// Add a debugging function to dump environment variables
+pub fn dump_environment_variables() {
+    println!("========== ENVIRONMENT VARIABLES DUMP ==========");
+    println!("DEBUG_WEBSOCKET_MESSAGES: {}", std::env::var("DEBUG_WEBSOCKET_MESSAGES").unwrap_or_else(|_| "not set".to_string()));
+    println!("DEBUG_BONDING_CURVE_UPDATES: {}", std::env::var("DEBUG_BONDING_CURVE_UPDATES").unwrap_or_else(|_| "not set".to_string()));
+    println!("DISABLE_API_FALLBACK: {}", std::env::var("DISABLE_API_FALLBACK").unwrap_or_else(|_| "not set".to_string()));
+    println!("BONDING_CURVE_ADDRESS: {}", std::env::var("BONDING_CURVE_ADDRESS").unwrap_or_else(|_| "not set".to_string()));
+    println!("TOKEN_BONDING_CURVE: {}", std::env::var("TOKEN_BONDING_CURVE").unwrap_or_else(|_| "not set".to_string()));
+    println!("CHAINSTACK_WSS_ENDPOINT: {}", std::env::var("CHAINSTACK_WSS_ENDPOINT").unwrap_or_else(|_| "not set".to_string()));
+    println!("CHAINSTACK_USERNAME: {}", std::env::var("CHAINSTACK_USERNAME").unwrap_or_else(|_| "not set".to_string()));
+    println!("CHAINSTACK_PASSWORD: {}", match std::env::var("CHAINSTACK_PASSWORD") {
+        Ok(_) => "set (value hidden)",
+        Err(_) => "not set",
+    });
+    println!("PRIVATE_KEY: {}", match std::env::var("PRIVATE_KEY") {
+        Ok(_) => "set (value hidden)",
+        Err(_) => "not set",
+    });
+    println!("WALLET: {}", std::env::var("WALLET").unwrap_or_else(|_| "not set".to_string()));
+    println!("==============================================");
+}
+
+// Make absolutely sure that start_price_monitor is properly exported
+pub use price::start_price_monitor; 

@@ -720,6 +720,30 @@ pub async fn listen_for_new_tokens(wss_endpoint: String) -> Result<()> {
         info!("🟢 Token detection lock released. Resuming detection.");
     }
     
+    // Also check database for pending trades as an extra safety measure
+    match crate::db::count_pending_trades() {
+        Ok(count) => {
+            if count > 0 {
+                info!("🔒 Found {} pending trade(s) in database - Setting position monitoring active", count);
+                set_position_monitoring_active(true);
+                
+                // Wait until position monitoring is deactivated
+                while is_position_monitoring_active() {
+                    info!("Waiting for pending position to be sold before resuming token detection...");
+                    sleep(Duration::from_secs(5)).await;
+                }
+                
+                info!("🟢 Position monitoring released. Resuming detection.");
+            } else {
+                info!("✅ No pending trades found in database");
+            }
+        },
+        Err(e) => {
+            warn!("⚠️ Could not check pending trades: {}", e);
+            // Continue anyway, but add a warning
+        }
+    }
+    
     // Connect to the WebSocket
     match connect_to_websocket(&wss_endpoint).await {
         Ok(_) => {
@@ -897,6 +921,19 @@ async fn connect_to_websocket(wss_endpoint: &str) -> Result<()> {
             next_message = read.next() => {
                 match next_message {
                     Some(Ok(Message::Text(text))) => {
+                        // Check if token detection is paused before processing any new tokens
+                        if is_token_detection_paused() || is_position_monitoring_active() {
+                            debug!("Token detection is paused or position monitoring active - skipping WebSocket message");
+                            
+                            // For ping/pong handling, we still need to respond but not process further
+                            match &text {
+                                _ => {
+                                    // Just skip all message processing for now
+                                    continue;
+                                }
+                            }
+                        }
+                        
                         debug!("Received WebSocket text message");
                         // Process the message
                         if let Err(e) = process_message(&text, WEBSOCKET_MESSAGES.clone(), &mut write, &mut subscribed_bonding_curves).await {
@@ -2001,6 +2038,12 @@ async fn poll_new_tokens_endpoint(
 
 // Function to process a new token after detection - WebSocket or API polling
 fn process_new_token(token: DetectorTokenData) -> anyhow::Result<()> {
+    // CRITICAL: Check if position monitoring is active FIRST, before any processing
+    if is_position_monitoring_active() || is_token_detection_paused() {
+        info!("🛑 Ignoring new token {} - Position monitoring active or token detection paused", token.mint);
+        return Ok(());
+    }
+
     // Only process tokens with a "pump" suffix in the mint address
     if !token.mint.ends_with("pump") {
         debug!("Skipping non-pump.fun token: {}", token.mint);
@@ -2040,32 +2083,59 @@ fn process_new_token(token: DetectorTokenData) -> anyhow::Result<()> {
     Ok(())
 }
 
-// Static flag to track if we're actively monitoring a position
-// This is in addition to the _STOP_WEBSOCKET_LISTENER env var
-// for more reliable coordination
+// Static atomic flags for token detection and position monitoring
+static TOKEN_DETECTION_ACTIVE: AtomicBool = AtomicBool::new(true);
 static POSITION_MONITORING_ACTIVE: AtomicBool = AtomicBool::new(false);
 
-/// Check if token detection should be paused due to active position monitoring
-pub fn is_token_detection_paused() -> bool {
-    // Check both the env var and our atomic flag
-    let env_var_check = std::env::var("_STOP_WEBSOCKET_LISTENER")
-        .map(|v| v == "true")
-        .unwrap_or(false);
-        
-    let flag_check = POSITION_MONITORING_ACTIVE.load(Ordering::Relaxed);
-    
-    // If either is true, we should pause detection
-    env_var_check || flag_check
+/// Get whether token detection is active
+pub fn is_token_detection_active() -> bool {
+    TOKEN_DETECTION_ACTIVE.load(Ordering::SeqCst)
 }
 
-/// Set the position monitoring status
+/// Set whether token detection is active
+pub fn set_token_detection_active(active: bool) {
+    TOKEN_DETECTION_ACTIVE.store(active, Ordering::SeqCst);
+    
+    if active {
+        info!("🔓 Token detection activated");
+    } else {
+        info!("🔒 Token detection paused");
+    }
+}
+
+/// Check if token detection is paused
+pub fn is_token_detection_paused() -> bool {
+    !TOKEN_DETECTION_ACTIVE.load(Ordering::SeqCst)
+}
+
+/// Set whether position monitoring is active
 pub fn set_position_monitoring_active(active: bool) {
     POSITION_MONITORING_ACTIVE.store(active, Ordering::SeqCst);
     
-    // Also set the environment variable for backward compatibility
     if active {
-        std::env::set_var("_STOP_WEBSOCKET_LISTENER", "true");
+        info!("🔍 Position monitoring activated");
+        
+        // When position monitoring is activated, we should also pause token detection
+        // if MAX_POSITIONS is set to 1
+        if std::env::var("MAX_POSITIONS")
+            .unwrap_or_else(|_| "1".to_string())
+            .parse::<usize>()
+            .unwrap_or(1) == 1 
+        {
+            set_token_detection_active(false);
+            info!("🔒 Token detection automatically paused due to active position and MAX_POSITIONS=1");
+        }
     } else {
-        std::env::remove_var("_STOP_WEBSOCKET_LISTENER");
+        info!("🔍 Position monitoring deactivated");
+        
+        // When position monitoring is deactivated, we can resume token detection
+        // if it was paused due to position monitoring
+        set_token_detection_active(true);
+        info!("🔓 Token detection automatically resumed after position monitoring ended");
     }
+}
+
+/// Check if position monitoring is active
+pub fn is_position_monitoring_active() -> bool {
+    POSITION_MONITORING_ACTIVE.load(Ordering::SeqCst)
 }

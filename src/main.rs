@@ -134,12 +134,15 @@ async fn websocket_monitor_tokens() -> Result<()> {
     std::env::set_var("AUTO_BUY", auto_buy_from_config.clone());
     info!("AUTO_BUY set to: {}", auto_buy_from_config);
     
-    // Initialize the database to prevent "Database not initialized" errors
-    if let Err(e) = db::init_db(false).await {
-        warn!("Failed to initialize database: {}", e);
-        info!("Continuing without database support - position tracking will be limited");
-    } else {
-        info!("✅ Database initialized successfully");
+    // We don't need to initialize the database here again since we already did it in main()
+    // But we should verify that the database is actually working by checking pending trades
+    match db::count_pending_trades() {
+        Ok(count) => info!("✅ Database connection verified. Current pending trades: {}", count),
+        Err(e) => {
+            error!("❌ Database connection error: {}", e);
+            error!("Position tracking will not work without a database connection");
+            return Err(anyhow!("Database connection failed: {}", e));
+        }
     }
     
     // Get trading parameters from config.env
@@ -186,7 +189,7 @@ async fn extract_tokens() -> Result<()> {
     websocket_monitor_tokens().await
 }
 
-/// Process newly detected tokens from the WebSocket
+/// Process new tokens from websocket
 async fn process_new_tokens_from_websocket(
     client: &Arc<reqwest::Client>,
     token_data: &token_detector::DetectorTokenData,
@@ -198,32 +201,133 @@ async fn process_new_tokens_from_websocket(
     amount: f64,
     slippage: f64,
 ) -> Result<(), String> {
-    // Check if we're already at MAX_POSITIONS limit before any processing
+    // First, check if we're already at max positions - if so, skip buying
     let max_positions = std::env::var("MAX_POSITIONS")
         .unwrap_or_else(|_| "1".to_string())
-        .parse::<i64>()
+        .parse::<usize>()
         .unwrap_or(1);
+    
+    // If token detection is paused due to an active position, skip this token
+    if token_detector::is_token_detection_paused() {
+        info!("🔒 Token detection is paused due to an active position - skipping token {}", token_data.name);
         
-    // Do an early check for positions to avoid unnecessary processing
-    match db::count_pending_trades() {
-        Ok(pending_count) => {
-            if pending_count >= max_positions {
-                info!("⚠️ Maximum positions ({}) already reached, skipping new token: {}", 
-                      max_positions, token_data.name);
-                return Ok(());
-            }
+        // Convert DetectorTokenData to TokenData for the queue
+        let api_token_data = crate::api::TokenData {
+            status: "detected".to_string(),
+            mint: token_data.mint.clone(),
+            dev: token_data.user.clone(),
+            metadata: Some(format!("bonding_curve:{}", token_data.bonding_curve)),
+            name: Some(token_data.name.clone()),
+            symbol: Some(token_data.symbol.clone()),
+            timestamp: Some(chrono::Utc::now().timestamp()),
+            liquidity_status: None,
+            liquidity_amount: None,
+        };
+        
+        // Still add to queue for historical purposes but don't process
+        info!("📝 Adding token to queue for tracking but not processing due to paused detection");
+        if let Ok(mut token_queue) = crate::api::NEW_TOKEN_QUEUE.try_lock() {
+            token_queue.push_back(api_token_data.clone());
+            info!("Added token to queue. Current queue size: {}", token_queue.len());
         }
-        Err(e) => {
-            warn!("Could not check pending trades count: {}", e);
-            // Continue processing as we don't want to miss tokens due to DB errors
+        
+        if let Ok(mut api_queue) = crate::api::NEW_TOKEN_QUEUE.try_lock() {
+            api_queue.push_back(api_token_data.clone());
+            info!("Added token to API queue. Current API queue size: {}", api_queue.len());
         }
-    }
-
-    // Also check if token detection is currently locked
-    if std::env::var("_STOP_WEBSOCKET_LISTENER").map(|v| v == "true").unwrap_or(false) {
-        info!("🔒 Token detection is currently locked due to active trading. Skipping token: {}", 
-              token_data.name);
+        
         return Ok(());
+    }
+    
+    // Extract data
+    let name = &token_data.name;
+    let symbol = &token_data.symbol;
+    let mint = &token_data.mint;
+    let bonding_curve = &token_data.bonding_curve;
+    
+    info!("Detected token: {} ({}) - Mint: {}", name, symbol, mint);
+    info!("Bonding curve: {}", bonding_curve);
+    
+    // Check database for pending trades, but handle database errors gracefully
+    let at_max_positions = match db::count_pending_trades() {
+        Ok(count) => count >= max_positions as i64,
+        Err(e) => {
+            // If we can't check the database, use the token_detector state instead
+            warn!("Could not check pending trades count from database: {}", e);
+            warn!("Using token_detector state to determine if we're at max positions");
+            // If token detection is paused, assume we're at max positions
+            token_detector::is_position_monitoring_active()
+        }
+    };
+    
+    // Check if we're already at max positions
+    if at_max_positions {
+        info!("🔒 Already at maximum positions ({}) - skipping buy for {}", max_positions, name);
+        
+        // Convert DetectorTokenData to TokenData for the queue
+        let api_token_data = crate::api::TokenData {
+            status: "detected".to_string(),
+            mint: token_data.mint.clone(),
+            dev: token_data.user.clone(),
+            metadata: Some(format!("bonding_curve:{}", token_data.bonding_curve)),
+            name: Some(token_data.name.clone()),
+            symbol: Some(token_data.symbol.clone()),
+            timestamp: Some(chrono::Utc::now().timestamp()),
+            liquidity_status: None,
+            liquidity_amount: None,
+        };
+        
+        // Still add to queue for tracking
+        if let Ok(mut token_queue) = crate::api::NEW_TOKEN_QUEUE.try_lock() {
+            token_queue.push_back(api_token_data.clone());
+            info!("Added token to queue for tracking. Current queue size: {}", token_queue.len());
+        }
+        
+        if let Ok(mut api_queue) = crate::api::NEW_TOKEN_QUEUE.try_lock() {
+            api_queue.push_back(api_token_data.clone());
+            info!("Added token to API queue for tracking. Current API queue size: {}", api_queue.len());
+        }
+        
+        return Ok(());
+    }
+    
+    // Check if we need to filter by tag
+    if !snipe_by_tag.is_empty() {
+        // Check if the token symbol or name contains the tag
+        let tag_match = symbol.to_lowercase().contains(&snipe_by_tag.to_lowercase()) || 
+                        name.to_lowercase().contains(&snipe_by_tag.to_lowercase());
+        
+        if !tag_match {
+            info!("Token {} ({}) doesn't match tag filter: {} - skipping", name, symbol, snipe_by_tag);
+            
+            // Convert DetectorTokenData to TokenData for the queue
+            let api_token_data = crate::api::TokenData {
+                status: "detected".to_string(),
+                mint: token_data.mint.clone(),
+                dev: token_data.user.clone(),
+                metadata: Some(format!("bonding_curve:{}", token_data.bonding_curve)),
+                name: Some(token_data.name.clone()),
+                symbol: Some(token_data.symbol.clone()),
+                timestamp: Some(chrono::Utc::now().timestamp()),
+                liquidity_status: None,
+                liquidity_amount: None,
+            };
+            
+            // Still add to queue for tracking
+            if let Ok(mut token_queue) = crate::api::NEW_TOKEN_QUEUE.try_lock() {
+                token_queue.push_back(api_token_data.clone());
+                info!("Added token to queue for tracking. Current queue size: {}", token_queue.len());
+            }
+            
+            if let Ok(mut api_queue) = crate::api::NEW_TOKEN_QUEUE.try_lock() {
+                api_queue.push_back(api_token_data.clone());
+                info!("Added token to API queue for tracking. Current API queue size: {}", api_queue.len());
+            }
+            
+            return Ok(());
+        } else {
+            info!("✅ Token {} ({}) matched tag filter: {}", name, symbol, snipe_by_tag);
+        }
     }
 
     // Check if auto_buy is enabled
@@ -244,11 +348,7 @@ async fn process_new_tokens_from_websocket(
     std::env::set_var("_DETECTION_TIME", detection_time.to_string());
     
     // Extract data from TokenData
-    let mint = &token_data.mint;
-    let name = &token_data.name;
-    let symbol = &token_data.symbol;
     let user = &token_data.user; // Creator/developer address
-    let bonding_curve = &token_data.bonding_curve;
 
     // Skip the already processed check for fresh tokens
     let now = Instant::now();
@@ -278,30 +378,6 @@ async fn process_new_tokens_from_websocket(
     // Initial liquidity is set to 0.0, will be calculated by check_token_liquidity
     let liquidity = 0.0;
 
-    // Check if tag matches if a tag filter is specified
-    if !snipe_by_tag.trim().is_empty() {
-        let token_name = name.to_lowercase();
-        if !token_name.contains(&snipe_by_tag.to_lowercase()) {
-            info!(
-                "Token name doesn't match the tag filter '{}', skipping",
-                snipe_by_tag
-            );
-            return Ok(());
-        }
-    }
-
-    // Get minimum liquidity from environment
-    let min_liquidity_str = std::env::var("MIN_LIQUIDITY").unwrap_or_else(|_| "0".to_string());
-    let min_liquidity = min_liquidity_str.parse::<f64>().unwrap_or(0.0);
-
-    // PAUSE TOKEN DETECTION IMMEDIATELY before any buy operations to prevent race conditions
-    if auto_buy {
-        info!("🔒 PAUSING TOKEN DETECTION during transaction processing");
-        std::env::set_var("_STOP_WEBSOCKET_LISTENER", "true");
-        should_stop_listener = true;
-        token_detector::set_position_monitoring_active(true);
-    }
-
     // Check if the developer is in the approved list
     let is_approved_dev = if approved_devs_only {
         match checks::check_approved_devs(user).await {
@@ -319,7 +395,6 @@ async fn process_new_tokens_from_websocket(
                     info!("🔓 RESUMING TOKEN DETECTION after dev check failure");
                     std::env::remove_var("_STOP_WEBSOCKET_LISTENER");
                     token_detector::set_position_monitoring_active(false);
-                    should_stop_listener = false;
                 }
                 
                 false
@@ -408,7 +483,7 @@ async fn process_new_tokens_from_websocket(
     // For non-approved devs, check the liquidity if required
     if check_min_liquidity {
         // Use the token_detector to check liquidity - should be instantaneous due to cached values
-        match token_detector::check_token_liquidity(mint, bonding_curve, min_liquidity).await {
+        match token_detector::check_token_liquidity(mint, bonding_curve, 0.0).await {
             Ok((has_liquidity, balance)) => {
                 // We don't need to log here since check_token_liquidity now logs in the appropriate format
                 
@@ -798,7 +873,7 @@ async fn monitor_price_loop(
                           price_change, take_profit);
                           
                     // Execute sell transaction
-                    match api::sell_token(client, mint, "all", private_key).await {
+                    match api::sell_token(client, mint, "all", private_key, false).await {
                         Ok(result) => {
                             if result.status == "success" {
                                 info!("✅ SOLD TOKEN at take profit: {} - Transaction: {}", 
@@ -843,7 +918,7 @@ async fn monitor_price_loop(
                           drop_from_peak, stop_loss);
                           
                     // Execute sell transaction
-                    match api::sell_token(client, mint, "all", private_key).await {
+                    match api::sell_token(client, mint, "all", private_key, false).await {
                         Ok(result) => {
                             if result.status == "success" {
                                 info!("✅ SOLD TOKEN at stop loss: {} - Transaction: {}", 
@@ -910,289 +985,400 @@ async fn process_buy_result(
     mint: &str,
     start_time: Instant,
 ) -> std::result::Result<(), String> {
-    // Record buy time
+    info!("Processing successful buy result for {}", mint);
+    
+    // CRITICAL: Clear the token queue immediately to prevent processing more tokens
+    if let Ok(mut token_queue) = crate::api::NEW_TOKEN_QUEUE.try_lock() {
+        let size = token_queue.len();
+        if size > 0 {
+            token_queue.clear();
+            info!("🗑️ Cleared token queue ({} items) to prevent buying multiple tokens", size);
+        }
+    }
+    
+    // Pause token detection immediately after successful buy
+    // This prevents buying more tokens until this position is sold
+    token_detector::set_position_monitoring_active(true);
+    token_detector::set_token_detection_active(false);
+    info!("🔒 Token detection paused - no new tokens will be purchased until this position is sold");
+    
+    let max_positions = std::env::var("MAX_POSITIONS")
+        .unwrap_or_else(|_| "1".to_string())
+        .parse::<usize>()
+        .unwrap_or(1);
+    
+    info!("ℹ️ Maximum positions setting: {}", max_positions);
+    
+    // Get the price of the token for monitoring IMMEDIATELY
+    let price = match api::get_price(&**client, mint).await {
+        Ok(p) => {
+            info!("📊 Current price: {} SOL", p);
+            p
+        },
+        Err(e) => {
+            warn!("Failed to get price: {}", e);
+            // Use a default price if we can't get it, but don't block monitoring
+            0.0001 // Small default price to avoid division by zero issues
+        }
+    };
+    
+    // Record transaction time for database
+    let detection_time = std::env::var("_DETECTION_TIME")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0);
+    
     let buy_time = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64;
+    
+    // START PRICE MONITORING IMMEDIATELY - don't wait for any other operations
+    // If enabled, start price monitoring (take profit/stop loss)
+    let take_profit = std::env::var("TAKE_PROFIT")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(50.0);
+    
+    let stop_loss = std::env::var("STOP_LOSS")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(10.0);
+    
+    info!("📊 Take profit: {}%, Stop loss: {}%", take_profit, stop_loss);
+    
+    // Try to insert the trade into the database FIRST before starting monitoring
+    // This ensures proper position tracking
+    match db::insert_trade(
+        &mint.to_string(),
+        "1", // We don't track token amount yet
+        price,
+        0.0, // Liquidity not known at this point
+        detection_time,
+        buy_time
+    ) {
+        Ok(_) => info!("✅ Trade recorded in database successfully"),
+        Err(e) => warn!("⚠️ Failed to record trade in database: {}", e),
+    }
 
-    // Extract transaction signature from the response
-    let tx_signature = buy_result
-        .data
-        .get("transaction")
+    // Replace with:
+
+    // CRITICAL: Ensure token is properly recorded in database with ALL fields
+    info!("💾 Recording complete trade details in database");
+    
+    // Extract proper token name for the database record
+    let token_name = buy_result.data.get("name")
         .and_then(|v| v.as_str())
-        .or_else(|| buy_result.data.get("signature").and_then(|v| v.as_str()))
-        .unwrap_or("unknown");
-
-    info!("Transaction signature: {}", tx_signature);
+        .unwrap_or_else(|| {
+            // Try to get from data first
+            buy_result.data.get("tokenName")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unknown")
+        })
+        .to_string();
     
-    // Extract performance metrics if available
-    let block_to_block_ms = buy_result
-        .data
-        .get("block_to_block_ms")
-        .and_then(|v| v.as_i64())
-        .or_else(|| std::env::var("_BLOCK_TO_BLOCK_MS").ok().and_then(|v| v.parse::<i64>().ok()));
-        
-    let blocks_diff = buy_result
-        .data
-        .get("blocks_difference")
-        .and_then(|v| v.as_u64())
-        .or_else(|| std::env::var("_BLOCKS_DIFFERENCE").ok().and_then(|v| v.parse::<u64>().ok()));
+    // Calculate buy liquidity if available
+    let buy_liquidity = buy_result.data.get("liquidity")
+        .and_then(|v| v.as_f64())
+        .unwrap_or_else(|| {
+            // Try to get from environment variable
+            std::env::var("_LAST_TOKEN_LIQUIDITY")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(0.0)
+        });
     
-    if let (Some(block_to_block_ms), Some(blocks_diff)) = (block_to_block_ms, blocks_diff) {
-        info!("🏁 PERFORMANCE: {}ms ({} blocks) from mint to buy confirmation", 
-              block_to_block_ms, blocks_diff);
-    } else {
-        // Check if we have the transaction signatures to compute metrics
-        let mint_sig = std::env::var("LAST_MINT_SIGNATURE").unwrap_or_default();
-        
-        // Log detailed debug info about the mint signature
-        debug!("LAST_MINT_SIGNATURE environment variable: {}", 
-              if mint_sig.is_empty() { "not set" } else { &mint_sig });
-        
-        if !mint_sig.is_empty() && tx_signature != "unknown" {
-            info!("🔍 Computing performance metrics between mint tx {} and buy tx {}", 
-                  mint_sig, tx_signature);
-                  
-            // Calculate performance metrics in a non-blocking way
-            let mint_sig_clone = mint_sig.clone();
-            let tx_signature_clone = tx_signature.to_string();
+    // Log ALL database insertion parameters for debugging
+    info!("📊 DATABASE INSERTION - ALL FIELDS:");
+    info!("  Mint Address: {}", mint);
+    info!("  Token Name: {}", token_name);
+    info!("  Buy Price: {:.8} SOL", price);
+    info!("  Buy Liquidity: {:.8} SOL", buy_liquidity);
+    info!("  Detection Time: {}", detection_time);
+    info!("  Buy Time: {}", buy_time);
+    info!("  Initial Status: pending");
+    
+    // Insert the trade with comprehensive error handling
+    let db_result = db::insert_trade(
+        mint,           // Use mint directly
+        &token_name,    // Use actual token name
+        price,          // Buy price
+        buy_liquidity,  // Buy liquidity if known
+        detection_time, // When token was detected
+        buy_time        // When token was bought
+    );
+    
+    match db_result {
+        Ok(_) => {
+            info!("✅ DATABASE INSERT SUCCESSFUL for token {}", mint);
             
-            // Calculate immediately in the current task for reliability
-            match trading::performance::compute_performance_metrics(&mint_sig_clone, &tx_signature_clone).await {
-                Ok((block_diff, time_diff_ms)) => {
-                    info!("🚀 PERFORMANCE METRICS - Mint to Buy: {} ms ({} blocks)", time_diff_ms, block_diff);
+            // VERIFY the record was really created
+            match db::get_trade_by_mint(mint) {
+                Ok(Some(trade)) => {
+                    info!("✅ DATABASE VERIFICATION:");
+                    info!("  ID: {:?}", trade.id.unwrap_or(-1));
+                    info!("  Name: {}", trade.tokens);
+                    info!("  Status: {}", trade.status);
+                    info!("  Buy Price: {:.8}", trade.buy_price);
                     
-                    // Store the metrics in environment variables for other parts of the code
-                    std::env::set_var("_BLOCK_TO_BLOCK_MS", time_diff_ms.to_string());
-                    std::env::set_var("_BLOCKS_DIFFERENCE", block_diff.to_string());
-                    
-                    // Additional categorized feedback on performance
-                    let performance_category = if time_diff_ms < 1000 {
-                        "⚡ LIGHTNING FAST"
-                    } else if time_diff_ms < 2000 {
-                        "🔥 VERY FAST"
-                    } else if time_diff_ms < 5000 {
-                        "✅ GOOD"
-                    } else if time_diff_ms < 10000 {
-                        "⚠️ MODERATE"
+                    // Verify all fields exist and match expected values
+                    if trade.mint == mint.to_string() && 
+                       trade.status == "pending" &&
+                       (trade.buy_price - price).abs() < 0.00001 {
+                        info!("✅ All database fields verified");
                     } else {
-                        "🐢 SLOW"
-                    };
-                    info!("🏁 TRANSACTION SPEED: {} - {} ms ({} blocks)", performance_category, time_diff_ms, block_diff);
+                        warn!("⚠️ Some database fields don't match expected values");
+                    }
+                },
+                Ok(None) => {
+                    error!("❌ CRITICAL: Database record not found after successful insert!");
+                    
+                    // Emergency backup insertion with different parameters
+                    info!("🔄 Performing emergency database insertion");
+                    let emergency_time = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as i64;
+                    
+                    if let Err(e) = db::insert_trade(
+                        mint,
+                        &format!("EMERGENCY_{}", token_name),
+                        price,
+                        buy_liquidity,
+                        emergency_time - 1000,
+                        emergency_time
+                    ) {
+                        error!("❌ Emergency database insertion failed: {}", e);
+                    } else {
+                        info!("✅ Emergency database insertion succeeded");
+                    }
                 },
                 Err(e) => {
-                    error!("❌ Failed to compute performance metrics: {}", e);
-                    error!("Mint tx: {}, Buy tx: {}", mint_sig, tx_signature_clone);
-                }
-            }
-        } else {
-            warn!("⚠️ Cannot calculate performance metrics - missing mint transaction signature: {} or buy signature: {}", 
-                 mint_sig.is_empty(), tx_signature == "unknown");
-            
-            // Look for the mint signature in other places
-            if let Some(last_sig) = buy_result.data.get("last_mint_signature").and_then(|v| v.as_str()) {
-                info!("Found mint signature in API response: {}", last_sig);
-                std::env::set_var("LAST_MINT_SIGNATURE", last_sig);
-            }
-        }
-    }
-
-    // Get the token price and liquidity
-    let mut current_price = 0.0;
-    let mut liquidity = 0.0;
-
-    // Get the bonding curve for the token to check liquidity
-    let bonding_curve = match token_detector::get_bonding_curve_address(
-        &solana_program::pubkey::Pubkey::from_str(mint).unwrap_or_default(),
-    ) {
-        (bc, _) => bc.to_string(),
-    };
-
-    // Check liquidity
-    match token_detector::check_token_liquidity(mint, &bonding_curve, 0.0).await {
-        Ok((_, balance)) => {
-            liquidity = balance;
-            info!("Current token liquidity: {} SOL", liquidity);
-        }
-        Err(e) => {
-            warn!("Failed to get liquidity: {}", e);
-        }
-    }
-
-    // Get the token price
-    match api::get_price(&**client, mint).await {
-        Ok(price) => {
-            current_price = price;
-            info!("Token price: {} SOL", price);
-
-            // Store the trade in the database with detection time and liquidity
-            if let Err(e) = db::insert_trade(
-                mint, 
-                "tokens", 
-                price, 
-                liquidity, 
-                std::env::var("_DETECTION_TIME").ok().and_then(|dt| dt.parse::<i64>().ok()).unwrap_or(0), 
-                buy_time
-            ) {
-                warn!("Failed to insert trade into database: {}", e);
-            }
-
-            // Calculate and log the detection to buy time
-            if let Ok(detection_time_str) = std::env::var("_DETECTION_TIME") {
-                if let Ok(detection_time) = detection_time_str.parse::<i64>() {
-                    let buy_time_ms = buy_time;
-                    let elapsed_ms = buy_time_ms - detection_time;
-                    info!("⏱️ DETECTION TO BUY TIME: {}ms", elapsed_ms);
-                }
-            }
-
-            // Check if we need to stop other token processing
-            let auto_buy = std::env::var("AUTO_BUY")
-                .unwrap_or_else(|_| "false".to_string())
-                .to_lowercase() == "true";
-
-            // Check MAX_POSITIONS to see if we've reached the limit
-            let max_positions = std::env::var("MAX_POSITIONS")
-                .unwrap_or_else(|_| "1".to_string())
-                .parse::<i64>()
-                .unwrap_or(1);
-                
-            info!("Enforcing MAX_POSITIONS setting: {}", max_positions);
-                
-            match db::count_pending_trades() {
-                Ok(pending_count) => {
-                    if pending_count >= max_positions {
-                        info!("🔒 MAX_POSITIONS ({}) reached - not processing any more tokens until current positions are sold", max_positions);
-                        // Make sure token detection is paused
-                        token_detector::set_position_monitoring_active(true);
-                        
-                        // Clear any pending tokens from the queue
-                        if let Ok(mut api_queue) = crate::api::NEW_TOKEN_QUEUE.try_lock() {
-                            let previous_size = api_queue.len();
-                            if previous_size > 0 {
-                                api_queue.clear();
-                                info!("🗑️ Cleared token queue ({} items) since max positions reached", previous_size);
-                            }
-                        }
-                        
-                        // Sleep for a while before checking again
-                        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                    } else {
-                        info!("✅ Current positions: {}/{} - can process more tokens", pending_count, max_positions);
-                    }
-                }
-                Err(e) => {
-                    warn!("Could not check pending trades count: {}", e);
-                    // To be safe, assume we might be at max positions
-                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                }
-            }
-
-            // Start price monitoring if enabled
-            if std::env::var("MONITOR_PRICE").unwrap_or_else(|_| "true".to_string()) == "true" {
-                let take_profit = std::env::var("TAKE_PROFIT")
-                    .unwrap_or_else(|_| "100".to_string())
-                    .parse::<f64>()
-                    .unwrap_or(100.0);
-
-                let stop_loss = std::env::var("STOP_LOSS")
-                    .unwrap_or_else(|_| "50".to_string())
-                    .parse::<f64>()
-                    .unwrap_or(50.0);
-
-                info!(
-                    "🔄 Starting price monitor with take profit: {}%, stop loss: {}%",
-                    take_profit, stop_loss
-                );
-
-                // Clone values for the async block
-                let client_clone = client.clone();
-                let mint_clone = mint.to_string();
-                let wallet_clone = wallet.to_string();
-                let price_clone = price; // Clone the price for both monitoring functions
-                
-                // Enable auto-sell based on price targets
-                std::env::set_var("_ENABLE_AUTO_SELL", "true");
-                
-                // Make sure token detection is fully stopped
-                // This focuses resources on price monitoring
-                info!("🔒 Stopping token detection to focus on this position");
-                token_detector::set_position_monitoring_active(true);
-
-                // Start price monitoring in the CURRENT task for better reliability
-                info!("🔎 Starting immediate price monitoring for token {}", mint_clone);
-                
-                // Spawn a separate task to run both monitoring methods concurrently
-                tokio::spawn(async move {
-                    let (price_monitor_result, price_polling_result) = tokio::join!(
-                        async {
-                            match api::start_price_monitor(
-                                &client_clone,
-                                &mint_clone,
-                                &wallet_clone,
-                                price_clone,
-                                take_profit,
-                                stop_loss,
-                            ).await {
-                                Ok(_) => {
-                                    info!("✅ Price monitoring completed normally for {}", mint_clone);
-                                    Ok(())
-                                },
-                                Err(e) => {
-                                    error!("❌ Price monitoring error for {}: {}", mint_clone, e);
-                                    error!("Price monitoring parameters: price={}, take_profit={}%, stop_loss={}%", 
-                                           price_clone, take_profit, stop_loss);
-                                    Err(e)
-                                }
-                            }
-                        },
-                        async {
-                            match start_price_polling(&mint_clone, price_clone).await {
-                                Ok(_) => {
-                                    info!("✅ Price polling completed normally for {}", mint_clone);
-                                    Ok(())
-                                },
-                                Err(e) => {
-                                    error!("❌ Price polling error for {}: {}", mint_clone, e);
-                                    Err(e)
-                                }
-                            }
-                        }
-                    );
+                    error!("❌ Database verification error: {}", e);
                     
-                    // Log the results of both monitoring methods
-                    match (price_monitor_result, price_polling_result) {
-                        (Ok(_), Ok(_)) => {
-                            info!("✅ All price monitoring completed successfully for {}", mint_clone);
-                        },
-                        (Err(_), Ok(_)) => {
-                            info!("⚠️ Price monitoring failed but polling completed for {}", mint_clone);
-                        },
-                        (Ok(_), Err(_)) => {
-                            info!("⚠️ Price polling failed but monitoring completed for {}", mint_clone);
-                        },
-                        (Err(_), Err(_)) => {
-                            error!("❌ Both price monitoring methods failed for {}", mint_clone);
-                            // Only unlock the token detector when both monitoring methods fail
-                            token_detector::set_position_monitoring_active(false);
-                        }
+                    // Try inserting with simplified parameters as last resort
+                    if let Err(e2) = db::insert_trade(
+                        mint, 
+                        "VERIFICATION_FAILED", 
+                        price, 
+                        0.0, 
+                        detection_time, 
+                        buy_time
+                    ) {
+                        error!("❌ Final database insertion attempt failed: {}", e2);
                     }
-                });
-                
-                info!("📝 Price monitoring task started for {}", mint);
-            } else {
-                warn!("⚠️ Price monitoring is disabled in configuration");
+                }
             }
-        }
+        },
         Err(e) => {
-            warn!("Failed to get price: {}", e);
+            error!("❌ DATABASE INSERT FAILED: {}", e);
+            
+            // Last resort emergency insertion
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64;
+            
+            info!("🚨 Final attempt at database insertion");
+            
+            if let Err(e2) = db::insert_trade(
+                mint,
+                "EMERGENCY_FALLBACK", 
+                price, 
+                0.0,
+                now - 1000, 
+                now
+            ) {
+                error!("❌ All database insertion attempts failed: {}", e2);
+            }
         }
     }
 
-    // Log total processing time
-    let total_elapsed = start_time.elapsed();
-    info!("Total processing time: {:.3}s", total_elapsed.as_secs_f64());
+    if take_profit > 0.0 || stop_loss > 0.0 {
+        let client_clone = client.clone();
+        let mint_clone = mint.to_string();
+        let wallet_clone = wallet.to_string();
+        let price_clone = price; // Clone the price for both monitoring functions
+        
+        // Enable auto-sell based on price targets
+        std::env::set_var("_ENABLE_AUTO_SELL", "true");
+        
+        // Make sure token detection is fully stopped
+        // This focuses resources on price monitoring
+        info!("🔒 Stopping token detection to focus on this position");
+        token_detector::set_position_monitoring_active(true);
+        token_detector::set_token_detection_active(false);
+
+        // Extract transaction signature for metrics
+        let tx_signature = buy_result
+            .data
+            .get("transaction")
+            .and_then(|v| v.as_str())
+            .or_else(|| buy_result.data.get("signature").and_then(|v| v.as_str()))
+            .unwrap_or("unknown")
+            .to_string();
+            
+        // Check if we have the mint signature for performance metrics
+        let mint_sig = std::env::var("LAST_MINT_SIGNATURE").unwrap_or_default();
+        
+        // SPAWN PERFORMANCE METRICS CALCULATION IN BACKGROUND
+        // This ensures it won't block price monitoring
+        if !mint_sig.is_empty() && tx_signature != "unknown" {
+            let mint_sig_clone = mint_sig.clone();
+            let tx_sig_clone = tx_signature.clone();
+            tokio::spawn(async move {
+                info!("⏱️ BACKGROUND TASK: Computing performance metrics...");
+                match trading::performance::compute_performance_metrics(&mint_sig_clone, &tx_sig_clone).await {
+                    Ok((block_diff, time_diff_ms)) => {
+                        info!("🚀 PERFORMANCE METRICS - Mint to Buy: {} ms ({} blocks)", time_diff_ms, block_diff);
+                        
+                        // Store the metrics in environment variables
+                        std::env::set_var("_BLOCK_TO_BLOCK_MS", time_diff_ms.to_string());
+                        std::env::set_var("_BLOCKS_DIFFERENCE", block_diff.to_string());
+                        
+                        // Provide feedback on performance
+                        let performance_category = if time_diff_ms < 1000 {
+                            "⚡ LIGHTNING FAST"
+                        } else if time_diff_ms < 2000 {
+                            "🔥 VERY FAST"
+                        } else if time_diff_ms < 5000 {
+                            "✅ GOOD"
+                        } else if time_diff_ms < 10000 {
+                            "⚠️ MODERATE"
+                        } else {
+                            "🐢 SLOW"
+                        };
+                        info!("🏁 TRANSACTION SPEED: {} - {} ms ({} blocks)", 
+                              performance_category, time_diff_ms, block_diff);
+                    },
+                    Err(e) => {
+                        warn!("⚠️ Failed to compute performance metrics: {}", e);
+                    }
+                }
+            });
+        }
+        
+        // ***START PRICE MONITORING IMMEDIATELY INLINE***
+        // Instead of spawning a task, do it directly to ensure it starts
+        info!("⚡️ Starting price monitoring directly - no waiting for separate task");
+        info!("📊 Starting price monitoring for token: {}", mint);
+        
+        // Dump environment variables for debugging
+        info!("📋 Dumping environment variables before price monitoring");
+        api::dump_environment_variables();
+        
+        // Set environment variables with more visible logs
+        info!("🔧 Setting environment variables for price monitoring");
+        
+        // Critical WebSocket debugging flags
+        std::env::set_var("DEBUG_WEBSOCKET_MESSAGES", "true");
+        info!("  ✅ Set DEBUG_WEBSOCKET_MESSAGES=true");
+        std::env::set_var("DEBUG_BONDING_CURVE_UPDATES", "true");
+        info!("  ✅ Set DEBUG_BONDING_CURVE_UPDATES=true");
+        
+        // Sometimes API fallback is helpful for monitoring, enable it
+        std::env::set_var("DISABLE_API_FALLBACK", "false");
+        info!("  ✅ Set DISABLE_API_FALLBACK=false");
+        
+        // Enable comprehensive logging for debugging WebSocket and price monitoring
+        std::env::set_var("RUST_LOG", "info,pumpfun_sniper::api::websocket=trace,pumpfun_sniper::api::price=trace");
+        info!("  ✅ Set RUST_LOG=info,pumpfun_sniper::api::websocket=trace,pumpfun_sniper::api::price=trace");
+        
+        // Set Chainstack endpoint for monitoring
+        if let Ok(endpoint) = std::env::var("CHAINSTACK_TRADER_RPC_URL") {
+            std::env::set_var("CHAINSTACK_RPC_URL", &endpoint);
+            info!("  ✅ Set CHAINSTACK_RPC_URL={}", endpoint);
+        }
+        
+        // Set WebSocket URL for monitoring
+        if let Ok(ws_url) = std::env::var("CHAINSTACK_WS_URL") {
+            std::env::set_var("WS_URL", &ws_url);
+            info!("  ✅ Set WS_URL={}", ws_url);
+        } else {
+            let default_ws = "wss://nd-812-544-501.p2pify.com/662b0855df450e8105a91580d31085ee";
+            std::env::set_var("WS_URL", default_ws);
+            info!("  ✅ Set WS_URL={} (default)", default_ws);
+        }
+        
+        // Configure WebSocket authentication if needed
+        if let Ok(ws_user) = std::env::var("CHAINSTACK_WS_USER") {
+            std::env::set_var("WS_AUTH_USER", &ws_user);
+            info!("  ✅ Set WS_AUTH_USER={}", ws_user);
+        }
+        if let Ok(ws_pass) = std::env::var("CHAINSTACK_WS_PASS") {
+            std::env::set_var("WS_AUTH_PASS", &ws_pass);
+            info!("  ✅ Set WS_AUTH_PASS=**********");
+        }
+        
+        tokio::spawn(async move {
+            info!("🔍 Starting detached price monitoring task for {}", mint_clone);
+            
+            // Properly get bonding curve address first
+            let bonding_curve = match api::get_bonding_curve_for_mint(&mint_clone).await {
+                Some(bc) => {
+                    info!("✅ Found bonding curve for monitoring: {}", bc);
+                    bc
+                },
+                None => {
+                    // Derive it using the token detector as fallback
+                    let mint_pubkey = match solana_sdk::pubkey::Pubkey::from_str(&mint_clone) {
+                        Ok(pubkey) => pubkey,
+                        Err(e) => {
+                            error!("❌ Failed to parse mint pubkey: {}", e);
+                            return;
+                        }
+                    };
+                    
+                    let (bc, _) = token_detector::get_bonding_curve_address(&mint_pubkey);
+                    info!("✅ Derived bonding curve for monitoring: {}", bc);
+                    bc.to_string()
+                }
+            };
+            
+            // Store bonding curve for token
+            info!("🔧 Setting bonding curve environment variables");
+            std::env::set_var(format!("BONDING_CURVE_{}", mint_clone), &bonding_curve);
+            info!("  ✅ Set BONDING_CURVE_{}={}", mint_clone, bonding_curve);
+            std::env::set_var("TOKEN_BONDING_CURVE", &bonding_curve);
+            info!("  ✅ Set TOKEN_BONDING_CURVE={}", bonding_curve);
+            std::env::set_var("BONDING_CURVE_ADDRESS", &bonding_curve);
+            info!("  ✅ Set BONDING_CURVE_ADDRESS={}", bonding_curve);
+            
+            info!("💹 Starting price monitoring with bonding curve: {}", bonding_curve);
+            
+            // Dump environment variables after setting all values
+            info!("📋 Final environment variables before monitoring starts:");
+            api::dump_environment_variables();
+            
+            match api::start_price_monitor(
+                &client_clone,
+                &mint_clone,
+                &wallet_clone,
+                price_clone,
+                take_profit,
+                stop_loss,
+            ).await {
+                Ok(_) => {
+                    info!("✅ Price monitoring completed normally for {}", mint_clone);
+                    // Make sure token detection is unpaused when price monitoring completes
+                    token_detector::set_position_monitoring_active(false);
+                },
+                Err(e) => {
+                    error!("❌ Price monitoring error for {}: {}", mint_clone, e);
+                    error!("Price monitoring parameters: price={}, take_profit={}%, stop_loss={}%, bonding_curve={}", 
+                           price_clone, take_profit, stop_loss, bonding_curve);
+                    // Make sure token detection is unpaused even if monitoring fails
+                    token_detector::set_position_monitoring_active(false);
+                }
+            }
+        });
+        info!("📝 Detached price monitoring for {} - program continues", mint);
+        
+    } else {
+        warn!("⚠️ Price monitoring is disabled in configuration");
+    }
+
+    info!("Total processing time: {:.3}s", start_time.elapsed().as_secs_f64());
 
     Ok(())
 }
@@ -1612,12 +1798,9 @@ async fn process_token_queue(
                                 // Spawn a separate task to avoid blocking the queue processing
                                 let signature_clone = signature.clone();
                                 tokio::spawn(async move {
-                                    // Add extra delay before computing metrics to ensure transaction is indexed
-                                    // Increase from 5 to 10 seconds to allow for finalization
-                                    info!("⏱️ Waiting 10 seconds before calculating performance metrics...");
-                                    tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                                    info!("🔍 Computing performance metrics for mint tx: {} and buy tx: {}", mint_sig, signature_clone);
                                     
-                                    info!("🔍 Now calculating performance for mint tx: {} and buy tx: {}", mint_sig, signature_clone);
+                                    // Remove the waiting - calculate immediately
                                     match trading::performance::compute_performance_metrics(&mint_sig, &signature_clone).await {
                                         Ok((block_diff, time_diff_ms)) => {
                                             info!("🚀 PERFORMANCE METRICS - Mint to Buy: {} ms ({} blocks)", time_diff_ms, block_diff);
@@ -1638,7 +1821,6 @@ async fn process_token_queue(
                                         },
                                         Err(e) => {
                                             warn!("Failed to compute performance metrics: {}", e);
-                                            warn!("Mint tx: {}, Buy tx: {}", mint_sig, signature_clone);
                                         }
                                     }
                                 });
@@ -1672,14 +1854,14 @@ async fn process_token_queue(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Load environment variables from the config.env file
+    // Parse command-line arguments
+    let args: Vec<String> = std::env::args().collect();
+    
+    // Load environment variables from .env file
     dotenv::from_filename("config.env").ok();
 
-    // Initialize logger with appropriate level based on --quiet flag
-    let args: Vec<String> = std::env::args().collect();
+    // Set up logging first
     let quiet_mode = args.contains(&"--quiet".to_string()) || args.contains(&"-q".to_string());
-    
-    // Set up the appropriate log level
     if quiet_mode {
         setup_logger(log::LevelFilter::Warn)?;
     } else {
@@ -1688,15 +1870,30 @@ async fn main() -> Result<()> {
     
     // Print banner and version info
     print_banner();
-    
-    // Initialize database with option to reset pending trades
+
+    // Initialize database BEFORE anything else and ensure it completes successfully
+    info!("🔄 Initializing database...");
     match db::init_db(true).await {
         Ok(_) => info!("✅ Database initialized successfully"),
         Err(e) => {
-            error!("❌ Failed to initialize database: {}", e);
-            return Err(e.into());
+            error!("❌ CRITICAL ERROR: Failed to initialize database: {}", e);
+            error!("Database initialization is required for operation");
+            error!("Please make sure the database file is accessible and not corrupted");
+            return Err(anyhow::anyhow!("Database initialization failed: {}", e));
         }
     }
+    
+    // Verify database connection works by performing a simple operation
+    match db::count_pending_trades() {
+        Ok(count) => info!("✅ Database connection verified with {} pending trades", count),
+        Err(e) => {
+            error!("❌ CRITICAL ERROR: Database connection failed after initialization: {}", e);
+            error!("Please check the database file permissions and schema");
+            return Err(anyhow::anyhow!("Database connection failed after initialization: {}", e));
+        }
+    }
+    
+    // Command-line argument parsing - moved after database initialization
     
     // Check if we need to run the ATA fix test
     if args.contains(&"--test-ata-fix".to_string()) {

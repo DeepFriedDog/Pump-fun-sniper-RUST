@@ -16,18 +16,19 @@ pub async fn get_transaction_block_info(signature: &str) -> Result<(u64, i64)> {
     let rpc_url = std::env::var("RPC_URL")
         .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
     
-    // Get the commitment level from environment, defaulting to processed for faster results
+    // IMPORTANT: Always use confirmed or finalized commitment since many RPC endpoints
+    // don't support processed for transaction lookup
     let commitment_str = std::env::var("COMMITMENT_LEVEL")
-        .unwrap_or_else(|_| "processed".to_string());
+        .unwrap_or_else(|_| "confirmed".to_string());
     
     let commitment = match commitment_str.to_lowercase().as_str() {
-        "processed" => CommitmentConfig::processed(),
+        "processed" => CommitmentConfig::confirmed(), // Override to confirmed even if processed is requested
         "confirmed" => CommitmentConfig::confirmed(),
         "finalized" => CommitmentConfig::finalized(),
-        _ => CommitmentConfig::processed(), // Default to processed if unrecognized
+        _ => CommitmentConfig::confirmed(), // Default to confirmed (not processed) for compatibility
     };
     
-    info!("Using {} commitment for performance metrics", commitment_str);
+    info!("Using {} commitment for performance metrics", "confirmed");
     
     let client = RpcClient::new_with_commitment(rpc_url, commitment);
 
@@ -89,19 +90,21 @@ pub async fn get_transaction_block_info(signature: &str) -> Result<(u64, i64)> {
     }
 }
 
-/// Computes performance metrics between a mint and buy transaction.
-/// Returns a tuple: (block difference, time difference in milliseconds).
-/// Returns an error if either transaction failed or doesn't exist.
-pub async fn compute_performance_metrics(mint_sig: &str, buy_sig: &str) -> Result<(u64, i64)> {
-    debug!("Computing performance metrics between mint {} and buy {}", mint_sig, buy_sig);
+/// Compute performance metrics between two transactions (mint and buy)
+pub async fn compute_performance_metrics(
+    mint_signature: &str,
+    buy_signature: &str,
+) -> Result<(u64, i64), String> {
+    // Log that we're starting calculation
+    info!("Using confirmed commitment for performance metrics");
     
-    // Add an initial delay to allow the transaction to be processed
-    tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+    // Create a client for RPC calls with a commitment level that works for both transactions
+    let client = reqwest::Client::new();
     
     // Get mint transaction block info
-    let mint_result = get_transaction_block_info(mint_sig).await;
+    let mint_result = get_transaction_block_info(mint_signature).await;
     // Get buy transaction block info
-    let buy_result = get_transaction_block_info(buy_sig).await;
+    let buy_result = get_transaction_block_info(buy_signature).await;
     
     match (mint_result, buy_result) {
         (Ok((mint_slot, mint_time)), Ok((buy_slot, buy_time))) => {
@@ -115,11 +118,11 @@ pub async fn compute_performance_metrics(mint_sig: &str, buy_sig: &str) -> Resul
         },
         (Err(e), _) => {
             warn!("Failed to get mint transaction info: {}", e);
-            Err(anyhow!("Failed to get mint transaction info: {}", e))
+            Err(e.to_string())
         },
         (_, Err(e)) => {
             warn!("Failed to get buy transaction info: {}", e);
-            Err(anyhow!("Failed to get buy transaction info: {}", e))
+            Err(e.to_string())
         }
     }
 } 

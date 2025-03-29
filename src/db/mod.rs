@@ -89,23 +89,16 @@ pub async fn init_db(reset_pending: bool) -> Result<()> {
         info!("All pending trades have been reset to 'sold'.");
     }
 
-    // Add this call right before the "Database initialization complete!" log message
-    // Around where check_db_schema is called
-    match get_db_connection() {
-        Ok(conn) => {
-            if let Err(e) = fix_column_types(&conn).await {
-                warn!("Failed to fix column types: {}", e);
-            } else {
-                info!("Column types verified/fixed successfully");
-            }
-        },
-        Err(e) => {
-            warn!("Cannot fix column types: {}", e);
-        }
+    // Fix column types directly without calling get_db_connection
+    if let Err(e) = fix_column_types_direct(&conn).await {
+        warn!("Failed to fix column types: {}", e);
+    } else {
+        info!("Column types verified/fixed successfully");
     }
 
     info!("Database initialization complete!");
 
+    // Set the global connection only after everything is ready
     unsafe {
         INIT.call_once(|| {
             DB_CONNECTION = Some(Arc::new(Mutex::new(conn)));
@@ -195,15 +188,137 @@ fn migrate_db(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Fix column type issues in the trades table - direct version that doesn't use get_db_connection
+async fn fix_column_types_direct(conn: &Connection) -> Result<(), anyhow::Error> {
+    info!("Fixing column types in trades table...");
+    
+    // Check each column's type to ensure it matches expected type
+    let columns = conn.prepare("PRAGMA table_info(trades)")?
+        .query_map([], |row| {
+            let name: String = row.get(1)?;
+            let type_name: String = row.get(2)?;
+            Ok((name, type_name))
+        })?
+        .collect::<Result<Vec<(String, String)>, _>>()?;
+    
+    // Check if any columns have incorrect types
+    let mut needs_fix = false;
+    for (name, type_name) in &columns {
+        match name.as_str() {
+            "buy_price" | "current_price" | "sell_price" | "buy_liquidity" | "sell_liquidity" => {
+                if type_name != "REAL" {
+                    info!("Column '{}' has incorrect type: {} (should be REAL)", name, type_name);
+                    needs_fix = true;
+                }
+            },
+            "id" | "detection_time" | "buy_time" => {
+                if type_name != "INTEGER" {
+                    info!("Column '{}' has incorrect type: {} (should be INTEGER)", name, type_name);
+                    needs_fix = true;
+                }
+            },
+            _ => {} // Other columns are TEXT, which is fine
+        }
+    }
+    
+    if needs_fix {
+        info!("Creating new table with correct column types...");
+        
+        // Create a new table with correct column types
+        conn.execute(
+            "CREATE TABLE trades_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                mint TEXT NOT NULL,
+                tokens TEXT NOT NULL,
+                buy_price REAL,
+                current_price REAL,
+                sell_price REAL,
+                buy_liquidity REAL DEFAULT 0,
+                sell_liquidity REAL DEFAULT 0,
+                status TEXT CHECK(status IN ('pending', 'sold')),
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                detection_time INTEGER DEFAULT 0,
+                buy_time INTEGER DEFAULT 0,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )",
+            [],
+        )?;
+        
+        // Copy data from the old table to the new one with correct types
+        conn.execute(
+            "INSERT INTO trades_new(
+                id, mint, tokens, buy_price, current_price, sell_price, 
+                buy_liquidity, sell_liquidity, status, created_at, 
+                detection_time, buy_time, updated_at
+            )
+            SELECT 
+                id, mint, tokens, 
+                CAST(buy_price AS REAL), 
+                CAST(current_price AS REAL), 
+                CAST(sell_price AS REAL),
+                CAST(buy_liquidity AS REAL), 
+                CAST(sell_liquidity AS REAL), 
+                status, created_at, 
+                CAST(detection_time AS INTEGER), 
+                CAST(buy_time AS INTEGER), 
+                updated_at
+            FROM trades",
+            [],
+        )?;
+        
+        // Drop the old table and rename the new one
+        conn.execute("DROP TABLE trades", [])?;
+        conn.execute("ALTER TABLE trades_new RENAME TO trades", [])?;
+        
+        info!("Database table structure fixed successfully with correct column types!");
+    } else {
+        info!("All columns have correct types, no fixes needed.");
+    }
+    
+    Ok(())
+}
+
 /// Get a safe reference to the database connection
 pub fn get_db_connection() -> Result<Arc<Mutex<Connection>>> {
     unsafe {
         if let Some(conn) = &DB_CONNECTION {
             Ok(Arc::clone(conn))
         } else {
-            Err(anyhow::anyhow!(
-                "Database not initialized. Call init_db() first."
-            ))
+            // Attempt auto-initialization if connection is not available
+            let err_msg = "Database not initialized. Call init_db() first.";
+            warn!("{} Attempting automatic initialization...", err_msg);
+            
+            // Check if we're already in a tokio runtime to avoid nesting runtimes
+            if tokio::runtime::Handle::try_current().is_ok() {
+                // We're already in a runtime, use the current runtime
+                warn!("Already in a tokio runtime. Cannot initialize database automatically from within another async context.");
+                return Err(anyhow::anyhow!("Database not initialized and cannot auto-initialize from within another async context"));
+            }
+            
+            // Create a runtime for async initialization
+            match tokio::runtime::Runtime::new() {
+                Ok(rt) => {
+                    match rt.block_on(init_db(false)) {
+                        Ok(_) => {
+                            info!("🔄 Auto-initialized database successfully");
+                            // Now the connection should be available
+                            if let Some(conn) = &DB_CONNECTION {
+                                return Ok(Arc::clone(conn));
+                            } else {
+                                return Err(anyhow::anyhow!("Database still not initialized after auto-init attempt"));
+                            }
+                        },
+                        Err(e) => {
+                            error!("❌ Failed to auto-initialize database: {}", e);
+                            return Err(anyhow::anyhow!("Failed to auto-initialize database: {}", e));
+                        }
+                    }
+                },
+                Err(e) => {
+                    error!("❌ Failed to create runtime for database initialization: {}", e);
+                    return Err(anyhow::anyhow!("Failed to create runtime for database initialization: {}", e));
+                }
+            }
         }
     }
 }
@@ -344,22 +459,9 @@ pub fn update_trade_sold(id: i64, sell_price: f64, sell_liquidity: f64) -> Resul
 
 /// Count the number of pending trades
 pub fn count_pending_trades() -> Result<i64> {
-    // Get the database connection, or initialize if not ready
-    let conn = match get_db_connection() {
-        Ok(conn) => conn,
-        Err(e) => {
-            // If the connection is not initialized, try to initialize it
-            if format!("{}", e).contains("Database not initialized") {
-                info!("Initializing database because it wasn't initialized yet");
-                let rt = tokio::runtime::Runtime::new()?;
-                rt.block_on(init_db(false))?;
-                get_db_connection()?
-            } else {
-                return Err(e);
-            }
-        }
-    };
-
+    // Get the database connection
+    let conn = get_db_connection()?;
+    
     let db_conn = conn.lock().unwrap();
     let count: i64 = db_conn.query_row(
         "SELECT COUNT(*) FROM trades WHERE status = 'pending'",
@@ -390,30 +492,37 @@ pub fn clear_pending_trades() -> Result<usize> {
 
 /// Update a trade as sold by mint address
 pub fn update_trade_sold_by_mint(mint: &str, sell_price: f64, sell_liquidity: f64, reason: String, current_price: f64) -> Result<()> {
-    let conn = Connection::open(DB_PATH)?;
+    let db = get_db_connection()?;
+    let conn = db.lock().unwrap();
     
-    // First, find the trade ID by mint
-    let mut stmt = conn.prepare("SELECT id FROM trades WHERE mint = ? AND sold = 0 LIMIT 1")?;
+    // First, find the trade ID by mint where status is pending
+    let mut stmt = conn.prepare("SELECT id FROM trades WHERE mint = ? AND status = 'pending' LIMIT 1")?;
     let mut rows = stmt.query(params![mint])?;
     
     if let Some(row) = rows.next()? {
         let id: i64 = row.get(0)?;
         
-        // Now update the trade as sold
+        // Now update the trade as sold with sell price and liquidity
         conn.execute(
-            "UPDATE trades SET sold = 1, sell_price = ?, sell_liquidity = ?, sell_time = ?, sell_reason = ? WHERE id = ?",
+            "UPDATE trades 
+            SET status = 'sold', 
+                sell_price = ?, 
+                sell_liquidity = ?, 
+                current_price = ?,
+                updated_at = datetime('now','localtime')
+            WHERE id = ?",
             params![
                 sell_price,
                 sell_liquidity,
-                chrono::Utc::now().to_rfc3339(),
-                reason,
+                current_price,
                 id
             ],
         )?;
         
-        info!("Updated trade {} as sold with price: {}", id, sell_price);
+        info!("Updated trade {} as sold with price: {} SOL, reason: {}", id, sell_price, reason);
         Ok(())
     } else {
+        warn!("No pending trade found with mint {}", mint);
         Err(rusqlite::Error::QueryReturnedNoRows.into())
     }
 }
@@ -474,68 +583,4 @@ pub async fn update_trade_status(mint: &str, status: &str) -> Result<()> {
             Err(anyhow::anyhow!("Failed to update trade status: {}", e))
         }
     }
-}
-
-/// Fix column type issues in the trades table
-pub async fn fix_column_types(conn: &Arc<Mutex<Connection>>) -> Result<(), anyhow::Error> {
-    let conn_guard = conn.lock().unwrap();
-    
-    info!("Fixing column types in trades table...");
-    
-    // Check if buy_liquidity column exists and if it's the wrong type
-    let column_info = conn_guard.query_row(
-        "PRAGMA table_info(trades)",
-        [],
-        |row| {
-            let name: String = row.get(1)?;
-            let type_name: String = row.get(2)?;
-            Ok((name, type_name))
-        }
-    );
-    
-    if let Ok((name, type_name)) = column_info {
-        if name == "buy_liquidity" && type_name != "REAL" {
-            info!("Fixing buy_liquidity column type from {} to REAL...", type_name);
-            
-            // Create a new table with correct column types
-            conn_guard.execute(
-                "
-                CREATE TABLE trades_new (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    mint TEXT NOT NULL,
-                    name TEXT,
-                    amount REAL,
-                    status TEXT,
-                    signature TEXT,
-                    liquidity REAL,
-                    price REAL,
-                    trade_status TEXT,
-                    detection_to_buy_ms TEXT,
-                    buy_liquidity REAL,
-                    created_at DATETIME,
-                    updated_at DATETIME
-                )
-                ",
-                [],
-            )?;
-            
-            // Copy data from the old table to the new one
-            conn_guard.execute(
-                "
-                INSERT INTO trades_new(id, mint, name, amount, status, signature, liquidity, price, trade_status, detection_to_buy_ms, buy_liquidity, created_at, updated_at)
-                SELECT id, mint, name, amount, status, signature, liquidity, price, trade_status, detection_to_buy_ms, CAST(buy_liquidity AS REAL), created_at, updated_at
-                FROM trades
-                ",
-                [],
-            )?;
-            
-            // Drop the old table and rename the new one
-            conn_guard.execute("DROP TABLE trades", [])?;
-            conn_guard.execute("ALTER TABLE trades_new RENAME TO trades", [])?;
-            
-            info!("Column buy_liquidity type fixed successfully!");
-        }
-    }
-    
-    Ok(())
 }

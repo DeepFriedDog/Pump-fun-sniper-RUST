@@ -70,7 +70,7 @@ pub struct PriceResponse {
 }
 
 /// Token details response
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct TokenData {
     pub status: String,
     pub mint: String,
