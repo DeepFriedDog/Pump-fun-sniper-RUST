@@ -690,8 +690,26 @@ pub async fn listen_for_new_tokens(wss_endpoint: String) -> Result<()> {
                     warn!("⚠️ WebSocket throttling detected! Token detection will be delayed.");
                     warn!("⚠️ Consider using a different RPC endpoint for faster detection.");
                     
+                    // NEW CODE: Check if we should use the SolanaAPIs fallback
+                    let use_fallback = std::env::var("USE_SOLANA_APIS_FALLBACK")
+                        .map(|v| v.to_lowercase() == "true")
+                        .unwrap_or(false);
+                        
+                    if use_fallback {
+                        info!("🔄 Activating SolanaAPIs fallback due to WebSocket throttling");
+                        
+                        // Start the API polling in a separate task
+                        tokio::spawn(async {
+                            match poll_for_new_tokens().await {
+                                Ok(_) => info!("✅ SolanaAPIs fallback polling completed"),
+                                Err(e) => error!("❌ SolanaAPIs fallback polling failed: {}", e),
+                            }
+                        });
+                    } else {
+                        info!("⚠️ SolanaAPIs fallback is disabled. Set USE_SOLANA_APIS_FALLBACK=true to enable");
+                    }
+                    
                     // Continue with regular connection despite throttling
-                    // We won't stop execution but will log the warning
                     info!("Continuing with throttled connection...");
                 } else {
                     info!("✅ No throttling detected! Using WebSocket connection for token detection.");
@@ -1727,11 +1745,19 @@ pub async fn poll_for_new_tokens() -> Result<()> {
     info!("Starting fallback polling mechanism for token detection");
     
     // Get API key
-    let api_key = match std::env::var("SOLANAAPIS_KEY") {
-        Ok(key) => key,
+    let api_key = match std::env::var("SOLANA_API_KEY").or_else(|_| std::env::var("SOLANAAPIS_KEY")) {
+        Ok(key) => {
+            let masked_key = if key.len() > 8 {
+                format!("{}...{}", &key[0..4], &key[key.len()-4..])
+            } else {
+                "***".to_string()
+            };
+            info!("📝 Using SolanaAPIs key: {}", masked_key);
+            key
+        },
         Err(_) => {
             POLLING_ACTIVE.store(false, Ordering::SeqCst);
-            return Err(anyhow!("SOLANAAPIS_KEY environment variable not set"));
+            return Err(anyhow!("SOLANA_API_KEY environment variable not set"));
         }
     };
     
@@ -1770,7 +1796,24 @@ pub async fn poll_for_new_tokens() -> Result<()> {
             info!("🟢 Token detection lock released. Resuming API polling.");
         }
         
-        // ... rest of the function
+        // Make the actual API request
+        match poll_new_tokens_endpoint(&client, &processed_tokens, &api_key, &recent_tx_cache).await {
+            Ok((found_token, detection_delay)) => {
+                if found_token {
+                    info!("✅ Successfully processed new token from API (detection delay: {}ms)", detection_delay);
+                } else {
+                    debug!("No new tokens found in this polling cycle");
+                }
+            },
+            Err(e) => {
+                warn!("⚠️ Error polling new tokens API: {}", e);
+                // On error, wait a bit longer before retrying
+                sleep(Duration::from_millis(poll_interval * 2)).await;
+            }
+        }
+        
+        // Wait for the next polling interval
+        sleep(Duration::from_millis(poll_interval)).await;
     }
 }
 

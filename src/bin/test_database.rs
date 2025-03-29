@@ -12,7 +12,7 @@ async fn main() -> Result<()> {
 
     // Step 1: Initialize database and reset any pending trades
     info!("Step 1: Initializing database and resetting pending trades");
-    if let Err(e) = db::init_db(true).await {
+    if let Err(e) = db::init_db(false) {
         error!("Failed to initialize database: {}", e);
         return Err(e);
     }
@@ -31,7 +31,7 @@ async fn main() -> Result<()> {
     // Step 3: Insert a test trade
     info!("Step 3: Inserting test trade");
     let test_mint = format!("TEST_MINT_{}", get_current_timestamp_ms());
-    let test_tokens = "1000.0";
+    let test_tokens = "Test Token";
     let buy_price = 0.01;
     let buy_liquidity = 5.0;
     let detection_time = get_current_timestamp_ms() - 1000; // 1 second ago
@@ -43,7 +43,8 @@ async fn main() -> Result<()> {
         buy_price,
         buy_liquidity,
         detection_time,
-        buy_time
+        buy_time,
+        None
     )?;
     info!("✅ Test trade inserted with mint: {}", test_mint);
     
@@ -116,7 +117,8 @@ async fn main() -> Result<()> {
         buy_price,
         buy_liquidity,
         detection_time,
-        buy_time
+        buy_time,
+        None
     )?;
     info!("Created second test trade with mint: {}", test_mint2);
     
@@ -154,7 +156,8 @@ async fn main() -> Result<()> {
             buy_price,
             buy_liquidity,
             detection_time,
-            buy_time
+            buy_time,
+            None
         )?;
         info!("Created concurrent test trade #{} with mint: {}", i, test_mint);
     }

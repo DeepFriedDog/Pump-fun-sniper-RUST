@@ -126,7 +126,7 @@ async fn main() -> Result<()> {
     
     // Initialize database
     info!("🛠️ Initializing database...");
-    if let Err(e) = db::init_db(false).await {
+    if let Err(e) = db::init_db(false) {
         error!("Failed to initialize database: {}", e);
         return Err(e);
     }

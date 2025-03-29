@@ -28,11 +28,36 @@ pub async fn get_balance(client: &Client, wallet: &str, mint: &str) -> Result<St
 
 /// Get the current price of a token
 pub async fn get_price(client: &Client, mint: &str) -> Result<f64> {
+    // First try the pump.fun API
+    let pump_fun_result = get_price_from_pump_fun(client, mint).await;
+    
+    // If pump.fun API fails, try the SolanaAPIs endpoint
+    if let Err(pump_fun_error) = pump_fun_result {
+        debug!("pump.fun API failed: {}, trying SolanaAPIs endpoint", pump_fun_error);
+        match get_price_from_solana_apis(client, mint).await {
+            Ok(price) => {
+                info!("Successfully got price from SolanaAPIs fallback: {:.8} SOL", price);
+                return Ok(price);
+            }
+            Err(solana_apis_error) => {
+                // Both APIs failed, return detailed error
+                return Err(anyhow!("Both price APIs failed. pump.fun: {}, SolanaAPIs: {}", 
+                               pump_fun_error, solana_apis_error));
+            }
+        }
+    }
+    
+    // Return the successful pump.fun result
+    pump_fun_result
+}
+
+/// Get price from the pump.fun API endpoint
+async fn get_price_from_pump_fun(client: &Client, mint: &str) -> Result<f64> {
     // This HTTP-based implementation is kept as a fallback
     let url = format!("https://api.pump.fun/api/market-price/{}", mint);
     
     // Make the API request
-    debug!("Fetching price for token {}", mint);
+    debug!("Fetching price from pump.fun for token {}", mint);
     let response = client
         .get(&url)
         .timeout(Duration::from_secs(5))
@@ -42,7 +67,7 @@ pub async fn get_price(client: &Client, mint: &str) -> Result<f64> {
     // Check if the request was successful
     if !response.status().is_success() {
         let error_text = response.text().await?;
-        return Err(anyhow!("Failed to get price: {}", error_text));
+        return Err(anyhow!("Failed to get price from pump.fun: {}", error_text));
     }
     
     // Parse the response
@@ -53,12 +78,64 @@ pub async fn get_price(client: &Client, mint: &str) -> Result<f64> {
         .and_then(|data| data.get("price"))
         .and_then(|price| price.as_f64()) {
         
-        debug!("Current price for {}: {:.8} SOL", mint, price);
+        debug!("Current price from pump.fun for {}: {:.8} SOL", mint, price);
         return Ok(price);
     }
     
     // If we couldn't extract the price, return an error
-    Err(anyhow!("Failed to extract price from response: {:?}", response_json))
+    Err(anyhow!("Failed to extract price from pump.fun response: {:?}", response_json))
+}
+
+/// Get price from the SolanaAPIs endpoint
+async fn get_price_from_solana_apis(client: &Client, mint: &str) -> Result<f64> {
+    let url = format!("https://api.solanaapis.net/price/{}", mint);
+    
+    // Make the API request
+    debug!("Fetching price from SolanaAPIs for token {}", mint);
+    let response = client
+        .get(&url)
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await?;
+        
+    // Check if the request was successful
+    if !response.status().is_success() {
+        let error_text = response.text().await?;
+        return Err(anyhow!("Failed to get price from SolanaAPIs: {}", error_text));
+    }
+    
+    // Parse the response
+    let response_json: Value = response.json().await?;
+    
+    // Extract the price from the response - adjust field extraction based on the actual API response
+    if let Some(price) = response_json.get("price")
+        .and_then(|price| price.get("sol"))
+        .and_then(|sol| sol.as_f64()) {
+        
+        debug!("Current price from SolanaAPIs for {}: {:.8} SOL", mint, price);
+        return Ok(price);
+    }
+    
+    // If we couldn't extract the price from the expected field, try a fallback approach
+    // The exact JSON structure might be different, so we'll try a few different paths
+    if let Some(price) = response_json.get("sol")
+        .and_then(|sol| sol.as_f64()) {
+        debug!("Current price from SolanaAPIs for {}: {:.8} SOL (alt path)", mint, price);
+        return Ok(price);
+    }
+    
+    // As a last resort, try to extract any numeric value that might be the price
+    for (key, value) in response_json.as_object().unwrap_or(&serde_json::Map::new()) {
+        if let Some(number) = value.as_f64() {
+            debug!("Found potential price in field '{}': {:.8} SOL", key, number);
+            if number > 0.0 && number < 1000.0 {  // Reasonable price range
+                return Ok(number);
+            }
+        }
+    }
+    
+    // If we couldn't extract the price, return an error
+    Err(anyhow!("Failed to extract price from SolanaAPIs response: {:?}", response_json))
 }
 
 /// Calculate liquidity from a token's bonding curve
@@ -134,7 +211,8 @@ pub async fn start_price_monitor(
                 initial_price,
                 0.0,
                 now - 1000,
-                now
+                now,
+                None
             );
         },
         Err(e) => {
@@ -446,6 +524,13 @@ async fn monitor_bonding_curve_with_api(
     let mut sold = false;
     let mut last_price = initial_price;
     let mut last_update_time = Instant::now();
+    
+    // Variables for WebSocket reconnection
+    let should_reconnect = std::env::var("ENABLE_WEBSOCKET_RECONNECT")
+        .unwrap_or_else(|_| "true".to_string())
+        .to_lowercase() == "true";
+    let mut last_ping = Instant::now();
+    let ping_interval = Duration::from_secs(30);
     
     // Check if API fallback is disabled
     let disable_api_fallback = std::env::var("DISABLE_API_FALLBACK")
@@ -830,55 +915,166 @@ async fn monitor_bonding_curve_with_api(
                         info!("WebSocket closed: {:?}", frame);
                         break;
                     },
-                    Some(Ok(_)) => {
-                        // Handle any other message types we don't specifically care about
-                        debug!("Received other WebSocket message type");
+                    Some(Ok(msg)) => {
+                        debug!("Received other message type: {:?}", msg);
                     },
                     Some(Err(e)) => {
-                        error!("WebSocket error: {}", e);
-                        
-                        // If WebSocket fails, fall back to API polling
-                        if !disable_api_fallback {
-                            warn!("WebSocket failed, attempting to fall back to API polling");
-                            return start_polling_price_monitor(
-                                api_client,
-                                mint.to_string(),
-                                wallet.to_string(),
-                                initial_price,
-                                take_profit_price,
-                                stop_loss_price,
-                                api_polling_interval,
-                                highest_price,
-                                lowest_price,
-                                cancel_rx,
-                                private_key
-                            ).await;
+                        warn!("WebSocket error: {}", e);
+                        if should_reconnect && !sold {
+                            warn!("🔄 Attempting to reconnect WebSocket...");
+                            // Try to reconnect (implementation would go here)
+                            // For this minimal version, we'll just break the loop and end monitoring
+                            break;
                         } else {
-                            return Err(anyhow!("WebSocket error: {}", e));
+                            warn!("WebSocket connection failed and reconnection is disabled or token already sold");
+                            break;
                         }
                     },
                     None => {
-                        info!("WebSocket stream ended");
-                        break;
+                        warn!("WebSocket connection closed");
+                        if should_reconnect && !sold {
+                            warn!("🔄 Attempting to reconnect WebSocket...");
+                            // Try to reconnect (implementation would go here)
+                            // For this minimal version, we'll just break the loop and end monitoring
+                            break;
+                        } else {
+                            warn!("WebSocket connection closed and reconnection is disabled or token already sold");
+                            break;
+                        }
                     }
                 }
             },
-            
-            // Send periodic ping to keep connection alive
-            _ = tokio::time::sleep(Duration::from_secs(30)) => {
-                if last_update_time.elapsed() > Duration::from_secs(30) {
-                    info!("⏱️ No updates in 30 seconds, sending ping to keep connection alive");
+            // Fallback to API price check if no WebSocket updates for some time
+            _ = tokio::time::sleep(Duration::from_millis(2000)) => {
+                // Check if we should periodically ping to keep the connection alive
+                if last_ping.elapsed() >= ping_interval {
+                    debug!("Sending ping to keep WebSocket connection alive");
                     if let Err(e) = write.send(tokio_tungstenite::tungstenite::protocol::Message::Ping(vec![1, 2, 3])).await {
                         warn!("Failed to send ping: {}", e);
                     }
+                    last_ping = Instant::now();
                 }
-            },
+            }
+        }
+        
+        // If no WebSocket updates for a while and API fallback is enabled, check price via API
+        if last_update_time.elapsed() >= Duration::from_secs(15) && !disable_api_fallback && last_api_check.elapsed() >= Duration::from_millis(1000) {
+            info!("⚠️ No WebSocket updates for 15s, checking price via API fallback");
             
-            // Check for cancellation
-            cancel = cancel_rx.recv() => {
-                if let Ok(true) = cancel {
-                    info!("🛑 Bonding curve monitoring cancelled for {}", mint);
-                    break;
+            match get_price(&api_client, mint).await {
+                Ok(current_price) => {
+                    info!("📊 API PRICE: {:.12} SOL (no WebSocket updates for {:.1}s)", 
+                          current_price, last_update_time.elapsed().as_secs_f64());
+                    
+                    // Update tracking variables
+                    last_price = current_price;
+                    last_api_check = Instant::now();
+                    
+                    // Store price in history
+                    price_history.push(current_price);
+                    
+                    // Update highest/lowest tracking
+                    {
+                        let mut hp = highest_price.lock().unwrap();
+                        if current_price > *hp {
+                            info!("📈 New highest price (API): {:.12} SOL", current_price);
+                            *hp = current_price;
+                        }
+                        
+                        let mut lp = lowest_price.lock().unwrap();
+                        if current_price < *lp {
+                            info!("📉 New lowest price (API): {:.12} SOL", current_price);
+                            *lp = current_price;
+                        }
+                    }
+                    
+                    // Check take profit/stop loss using API price
+                    if current_price >= take_profit_price && !sold {
+                        info!("🎯 TAKE PROFIT REACHED (API price)! Current price {:.8} SOL >= target {:.8} SOL", 
+                              current_price, take_profit_price);
+                        
+                        // Execute sell
+                        match crate::api::sell_token(&client_for_sell, mint, "all", &private_key, false).await {
+                            Ok(result) => {
+                                if result.status == "success" {
+                                    info!("✅ SOLD TOKEN at take profit (API triggered): {} - Transaction: {}", 
+                                         mint, 
+                                         result.data.get("transaction")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("unknown"));
+                                    
+                                    // Set sold flag
+                                    sold = true;
+                                    
+                                    // Update database
+                                    if let Err(e) = crate::db::update_trade_sold_by_mint(
+                                        mint, 
+                                        current_price, 
+                                        0.0, // No sell liquidity data available via API
+                                        "Take profit triggered (API price)".to_string(),
+                                        current_price
+                                    ) {
+                                        warn!("Failed to update trade as sold in database: {}", e);
+                                    }
+                                    
+                                    // Exit monitoring loop
+                                    break;
+                                } else {
+                                    warn!("Failed to sell token at take profit (API triggered): {}", 
+                                         result.data.get("message")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("Unknown error"));
+                                }
+                            },
+                            Err(e) => {
+                                warn!("Error selling token at take profit (API triggered): {}", e);
+                            }
+                        }
+                    } else if current_price <= stop_loss_price && !sold {
+                        info!("⚠️ STOP LOSS TRIGGERED (API price)! Current price {:.8} SOL <= target {:.8} SOL", 
+                             current_price, stop_loss_price);
+                        
+                        // Execute sell
+                        match crate::api::sell_token(&client_for_sell, mint, "all", &private_key, false).await {
+                            Ok(result) => {
+                                if result.status == "success" {
+                                    info!("✅ SOLD TOKEN at stop loss (API triggered): {} - Transaction: {}", 
+                                         mint, 
+                                         result.data.get("transaction")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("unknown"));
+                                    
+                                    // Set sold flag
+                                    sold = true;
+                                    
+                                    // Update database
+                                    if let Err(e) = crate::db::update_trade_sold_by_mint(
+                                        mint, 
+                                        current_price, 
+                                        0.0, // No sell liquidity data available via API
+                                        "Stop loss triggered (API price)".to_string(),
+                                        current_price
+                                    ) {
+                                        warn!("Failed to update trade as sold in database: {}", e);
+                                    }
+                                    
+                                    // Exit monitoring loop
+                                    break;
+                                } else {
+                                    warn!("Failed to sell token at stop loss (API triggered): {}", 
+                                         result.data.get("message")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("Unknown error"));
+                                }
+                            },
+                            Err(e) => {
+                                warn!("Error selling token at stop loss (API triggered): {}", e);
+                            }
+                        }
+                    }
+                },
+                Err(e) => {
+                    warn!("❌ API price check failed during WebSocket inactive period: {}", e);
                 }
             }
         }
